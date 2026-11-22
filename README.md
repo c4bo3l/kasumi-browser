@@ -6,11 +6,13 @@ Kasumi Browser is built from the ground up to eliminate browser bloat while main
 
 Repository: [github.com/c4bo3l/kasumi-browser](https://github.com/c4bo3l/kasumi-browser)
 
+Release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md)
+
 ---
 
 ## ✅ What Has Been Done
 
-Current version: **0.1.2**. Every batch of changes bumps the version in `Cargo.toml`, `src/bin/bundle.rs`, and `Cargo.lock` as required by `AGENTS.md`.
+Current version: **0.1.3**. Every batch of changes bumps the version in `Cargo.toml`, `src/bin/bundle.rs`, and `Cargo.lock` as required by `AGENTS.md`.
 
 - Renamed the project from LiteBrowser to **Kasumi Browser** everywhere: package, binary, CEF helper, bundle ID, window title, database path, and docs.
 - Implemented the CEF subprocess fork trap and `mimalloc` global allocator.
@@ -28,6 +30,7 @@ Current version: **0.1.2**. Every batch of changes bumps the version in `Cargo.t
 - Fixed Retina layout: `ContentRect` is logical/DIP-based, macOS respects the flipped winit `NSView`, and Windows/X11 convert to physical pixels.
 - Added release packaging and code-signing documentation.
 - Added `.gitignore` to keep `target/`, local CEF files, machine-specific Cargo config, logs, and OS/editor files out of the repository.
+- Added `RELEASE_NOTES.md` as the canonical record of shipped changes.
 - Published the source as a public GitHub repository.
 - Verified with `cargo check --bins`, `cargo test --bin kasumi-browser`, `cargo fmt --check`, and repeated interactive macOS test runs with clean shutdown.
 
