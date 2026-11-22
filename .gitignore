@@ -1,0 +1,18 @@
+# Build artifacts
+/target/
+
+# Local CEF distribution and extracted frameworks
+/.cef/
+
+# Machine-specific Cargo configuration (use .cargo/config.toml.example instead)
+/.cargo/config.toml
+
+# OS/editor files
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Logs and local diagnostics
+*.log

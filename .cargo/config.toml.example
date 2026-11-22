@@ -1,0 +1,10 @@
+# Copy this file to .cargo/config.toml and adjust paths for your machine.
+# The real .cargo/config.toml is intentionally gitignored because it contains
+# machine-specific Xcode and CEF paths.
+
+[env]
+DEVELOPER_DIR = "/Applications/Xcode.app/Contents/Developer"
+
+# Leave CEF_PATH unset to let cef-rs auto-fetch the matching CEF binary.
+# Set it only when using a local CEF distribution.
+# CEF_PATH = "/path/to/cef_distribution"
