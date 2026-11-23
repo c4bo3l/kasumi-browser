@@ -4,6 +4,22 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
+## v0.4.1 — 2026-11-23
+
+### Changed
+
+- Consolidated the README’s “will be added later” items into **Future Development** and identified pinned tabs as the next feature because they deliver immediate value and provide the foundation for per-workspace pinned lists.
+- Bumped the project, macOS bundle, About-menu version, docs, and lockfile from `0.4.0` to `0.4.1`.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser`
+- No runtime behavior changed in this documentation release.
+
+---
+
 ## v0.4.0 — 2026-11-23
 
 ### Added
