@@ -1,0 +1,48 @@
+name: PR checks
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Checks (macOS 15 Intel)
+    # macos-13 was retired by GitHub on 2025-12-04 and leaves jobs queued forever.
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache CEF binaries
+        uses: actions/cache@v4
+        with:
+          path: .cef
+          key: ${{ runner.os }}-cef-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cef-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check binaries
+        run: cargo check --bins
+
+      - name: Run unit tests
+        run: cargo test --bin kasumi-browser

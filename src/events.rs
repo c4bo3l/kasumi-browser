@@ -33,6 +33,28 @@ pub enum BrowserEvent {
     NewWindow {
         url: String,
     },
+    /// F12 was pressed while the CEF web view had focus.
+    OpenDevTools {
+        tab_id: u64,
+    },
+    /// Context menu "View page source" was selected.
+    ViewSource {
+        tab_id: u64,
+        url: String,
+    },
+    /// CEF discovered one or more favicon URLs for a page.
+    FaviconUrlChanged {
+        tab_id: u64,
+        urls: Vec<String>,
+    },
+    /// A favicon image finished downloading on CEF's UI thread.
+    FaviconLoaded {
+        tab_id: u64,
+        url: String,
+        rgba: std::sync::Arc<[u8]>,
+        width: u32,
+        height: u32,
+    },
     BrowserCreated {
         tab_id: u64,
         browser: cef::Browser,
@@ -78,6 +100,34 @@ impl std::fmt::Debug for BrowserEvent {
                 .field("tab_id", tab_id)
                 .finish(),
             Self::NewWindow { url } => f.debug_struct("NewWindow").field("url", url).finish(),
+            Self::OpenDevTools { tab_id } => f
+                .debug_struct("OpenDevTools")
+                .field("tab_id", tab_id)
+                .finish(),
+            Self::ViewSource { tab_id, url } => f
+                .debug_struct("ViewSource")
+                .field("tab_id", tab_id)
+                .field("url", url)
+                .finish(),
+            Self::FaviconUrlChanged { tab_id, urls } => f
+                .debug_struct("FaviconUrlChanged")
+                .field("tab_id", tab_id)
+                .field("urls", urls)
+                .finish(),
+            Self::FaviconLoaded {
+                tab_id,
+                url,
+                rgba,
+                width,
+                height,
+            } => f
+                .debug_struct("FaviconLoaded")
+                .field("tab_id", tab_id)
+                .field("url", url)
+                .field("bytes", &rgba.len())
+                .field("width", width)
+                .field("height", height)
+                .finish(),
             Self::BrowserCreated { tab_id, .. } => f
                 .debug_struct("BrowserCreated")
                 .field("tab_id", tab_id)

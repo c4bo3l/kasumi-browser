@@ -27,7 +27,11 @@ pub struct ContentRect {
 impl ContentRect {
     /// Compute the logical content rect from the full window physical size.
     pub fn from_window(physical_width: u32, physical_height: u32, scale_factor: f64) -> Self {
-        let scale = scale_factor.max(f64::EPSILON);
+        let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
+            scale_factor
+        } else {
+            1.0
+        };
         let chrome_height = CHROME_HEIGHT as u32;
         let logical_width = (physical_width as f64 / scale).round() as u32;
         let logical_height = (physical_height as f64 / scale).round() as u32;
@@ -58,6 +62,8 @@ impl ContentRect {
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "macos")]
 mod mac {
+    use std::ffi::c_void;
+
     use super::ContentRect;
     use objc2::runtime::AnyObject;
     use objc2_app_kit::NSView;
@@ -107,6 +113,20 @@ mod mac {
             return;
         }
         let child = unsafe { &*cef_ns_view.cast::<NSView>() };
+        child.setHidden(true);
+    }
+
+    /// Detach the CEF `NSView` from the winit content view. This completes the
+    /// native view teardown that CEF requires after `DoClose` returns true.
+    ///
+    /// # Safety
+    /// `cef_ns_view` must be a valid live `NSView *`.
+    pub unsafe fn detach_view(cef_ns_view: *mut c_void) {
+        if cef_ns_view.is_null() {
+            return;
+        }
+        let child = unsafe { &*cef_ns_view.cast::<NSView>() };
+        unsafe { child.removeFromSuperview() };
         child.setHidden(true);
     }
 
@@ -182,6 +202,19 @@ mod win {
             ShowWindow(cef_hwnd, SW_HIDE);
         }
     }
+
+    /// Destroy the child `HWND` to complete CEF's native browser teardown.
+    ///
+    /// # Safety
+    /// `cef_hwnd` must be a valid live CEF child window handle.
+    pub unsafe fn detach_view(cef_hwnd: *mut std::ffi::c_void) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow;
+        if !cef_hwnd.is_null() {
+            unsafe {
+                DestroyWindow(cef_hwnd);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -244,16 +277,68 @@ mod linux {
         conn.flush()?;
         Ok(())
     }
+
+    /// X11 teardown needs the connection handle, which is owned by the main
+    /// loop. Hide/resize are sufficient here; closing the browser still works.
+    pub fn detach_view(_cef_xid: *mut std::ffi::c_void) {
+        tracing::debug!("detach_view is a no-op on X11");
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Public re-exports — platform-agnostic surface for the rest of the codebase
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "macos")]
-pub use mac::{hide_view, resize_view, show_view};
+pub use mac::{detach_view, hide_view, resize_view, show_view};
 
 #[cfg(windows)]
-pub use win::{hide_view, resize_view, show_view};
+pub use win::{detach_view, hide_view, resize_view, show_view};
 
 #[cfg(target_os = "linux")]
-pub use linux::{hide_view, resize_view, show_view};
+pub use linux::{detach_view, hide_view, resize_view, show_view};
+
+#[cfg(test)]
+mod tests {
+    use super::ContentRect;
+    use crate::config::CHROME_HEIGHT;
+
+    #[test]
+    fn content_rect_is_logical_and_starts_below_chrome() {
+        let rect = ContentRect::from_window(2560, 1600, 2.0);
+        assert_eq!(rect.x, 0);
+        assert_eq!(rect.y, CHROME_HEIGHT as u32);
+        assert_eq!(rect.width, 1280);
+        assert_eq!(rect.height, 724);
+        assert_eq!(rect.scale_factor, 2.0);
+        assert_eq!(rect.to_physical(), (0, 152, 2560, 1448));
+    }
+
+    #[test]
+    fn content_rect_saturates_when_window_is_shorter_than_chrome() {
+        let rect = ContentRect::from_window(800, 50, 1.0);
+        assert_eq!(rect.y, CHROME_HEIGHT as u32);
+        assert_eq!(rect.height, 0);
+    }
+
+    #[test]
+    fn content_rect_handles_zero_and_invalid_scale_factors() {
+        let zero = ContentRect::from_window(800, 600, 0.0);
+        assert_eq!(zero.width, 800);
+        assert_eq!(zero.scale_factor, 1.0);
+
+        let invalid = ContentRect::from_window(800, 600, f64::NAN);
+        assert_eq!(invalid.width, 800);
+        assert_eq!(invalid.scale_factor, 1.0);
+
+        let empty = ContentRect::from_window(0, 0, 1.0);
+        assert_eq!(empty.width, 0);
+        assert_eq!(empty.height, 0);
+    }
+
+    #[test]
+    fn content_rect_rounds_fractional_logical_sizes() {
+        let rect = ContentRect::from_window(1500, 900, 1.5);
+        assert_eq!(rect.width, 1000);
+        assert_eq!(rect.height, 524);
+    }
+}

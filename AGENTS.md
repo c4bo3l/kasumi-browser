@@ -42,10 +42,13 @@ Every single commit must honor three non-negotiable engineering goals:
 - **Keep dependencies lean:** Do not add heavy async web frameworks, ORMs, or redundant crates beyond what is specified in `Cargo.toml`.
 
 ### 2.3 Versioning Discipline (MANDATORY)
-- **Every batch of changes MUST bump the version.** Update `version` in `Cargo.toml`, the `semver::Version` passed to `BundleInfo` in `src/bin/bundle.rs`, and let `cargo check` refresh `Cargo.lock`.
+- **A version bump is released when a pull request is merged into `main`.** Do not make direct version-only commits to `main`; land changes through a pull request instead.
+- Every PR that changes shipped source, docs, packaging, or CI behavior MUST include the version bump in its branch so CI validates the exact release state. The version becomes official at merge time; do not bump again after the merge.
+- Update `version` in `Cargo.toml`, the `semver::Version` passed to `BundleInfo` in `src/bin/bundle.rs`, the canonical `Cargo.toml` snippet in this file, `README.md`, `RELEASE_NOTES.md`, and let `cargo check` refresh `Cargo.lock`.
 - Use SemVer: patch for fixes, minor for backward-compatible features, major for breaking changes.
-- The commit message for the batch MUST mention the new version (for example, `v0.1.1: fix macOS CEF layout`).
-- Documentation changes that are part of the same batch are included in the same version bump.
+- The PR title and merge commit MUST mention the new version (for example, `v0.1.1: fix macOS CEF layout`).
+- Documentation changes that are part of the same PR are included in the same version bump.
+- Every PR MUST pass `.github/workflows/pr.yml` before merge, including the unit tests.
 
 ---
 
@@ -56,7 +59,7 @@ Use these exact crate versions and release profile settings:
 ```toml
 [package]
 name = "kasumi-browser"
-version = "0.1.5"
+version = "0.1.9"
 edition = "2021"
 
 [dependencies]

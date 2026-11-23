@@ -175,6 +175,72 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Apply one persisted command. Kept synchronous and side-effect-free outside
+/// SQLite so the worker loop and unit tests exercise identical behavior.
+fn apply_command(conn: &mut Connection, cmd: DbCommand) {
+    match cmd {
+        DbCommand::RecordVisit { url, title } => {
+            let now = now_epoch_secs();
+            let res = conn.execute(
+                "INSERT INTO history (url, title, visit_count, last_visited)
+                 VALUES (?1, ?2, 1, ?3)
+                 ON CONFLICT(url) DO UPDATE SET
+                     visit_count = visit_count + 1,
+                     last_visited = ?3,
+                     title = CASE WHEN ?2 != '' THEN ?2 ELSE title END",
+                params![url, title, now],
+            );
+            if let Err(e) = res {
+                tracing::warn!("Failed to record history visit: {}", e);
+            }
+        }
+        DbCommand::SaveSession { tabs } => {
+            let tx = match conn.transaction() {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("Failed to begin session save transaction: {}", e);
+                    return;
+                }
+            };
+
+            let _ = tx.execute("DELETE FROM session_tabs", []);
+
+            for (idx, tab) in tabs.iter().enumerate() {
+                let _ = tx.execute(
+                    "INSERT INTO session_tabs (tab_index, url, title, is_active, is_hibernated)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        idx as i64,
+                        tab.url,
+                        tab.title,
+                        if tab.is_active { 1 } else { 0 },
+                        if tab.is_hibernated { 1 } else { 0 },
+                    ],
+                );
+            }
+
+            if let Err(e) = tx.commit() {
+                tracing::warn!("Failed to commit session save transaction: {}", e);
+            }
+        }
+        DbCommand::AddBookmark { url, title, folder } => {
+            let now = now_epoch_secs();
+            let res = conn.execute(
+                "INSERT INTO bookmarks (url, title, folder, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(url) DO UPDATE SET title = ?2, folder = ?3",
+                params![url, title, folder, now],
+            );
+            if let Err(e) = res {
+                tracing::warn!("Failed to add bookmark: {}", e);
+            }
+        }
+        DbCommand::FlushWal => {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
+    }
+}
+
 fn run_worker_loop(db_path: PathBuf, mut rx: UnboundedReceiver<DbCommand>) {
     let mut conn = match StorageManager::init_db(&db_path) {
         Ok(c) => c,
@@ -187,69 +253,209 @@ fn run_worker_loop(db_path: PathBuf, mut rx: UnboundedReceiver<DbCommand>) {
     tracing::info!("SQLite storage worker started at {:?}", db_path);
 
     while let Some(cmd) = rx.blocking_recv() {
-        match cmd {
-            DbCommand::RecordVisit { url, title } => {
-                let now = now_epoch_secs();
-                let res = conn.execute(
-                    "INSERT INTO history (url, title, visit_count, last_visited)
-                     VALUES (?1, ?2, 1, ?3)
-                     ON CONFLICT(url) DO UPDATE SET
-                         visit_count = visit_count + 1,
-                         last_visited = ?3,
-                         title = CASE WHEN ?2 != '' THEN ?2 ELSE title END",
-                    params![url, title, now],
-                );
-                if let Err(e) = res {
-                    tracing::warn!("Failed to record history visit: {}", e);
-                }
-            }
-            DbCommand::SaveSession { tabs } => {
-                let tx = match conn.transaction() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!("Failed to begin session save transaction: {}", e);
-                        continue;
-                    }
-                };
-
-                let _ = tx.execute("DELETE FROM session_tabs", []);
-
-                for (idx, tab) in tabs.iter().enumerate() {
-                    let _ = tx.execute(
-                        "INSERT INTO session_tabs (tab_index, url, title, is_active, is_hibernated)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![
-                            idx as i64,
-                            tab.url,
-                            tab.title,
-                            if tab.is_active { 1 } else { 0 },
-                            if tab.is_hibernated { 1 } else { 0 },
-                        ],
-                    );
-                }
-
-                if let Err(e) = tx.commit() {
-                    tracing::warn!("Failed to commit session save transaction: {}", e);
-                }
-            }
-            DbCommand::AddBookmark { url, title, folder } => {
-                let now = now_epoch_secs();
-                let res = conn.execute(
-                    "INSERT INTO bookmarks (url, title, folder, created_at)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(url) DO UPDATE SET title = ?2, folder = ?3",
-                    params![url, title, folder, now],
-                );
-                if let Err(e) = res {
-                    tracing::warn!("Failed to add bookmark: {}", e);
-                }
-            }
-            DbCommand::FlushWal => {
-                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-            }
-        }
+        apply_command(&mut conn, cmd);
     }
 
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     tracing::info!("SQLite storage worker shut down cleanly");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_command, DbCommand, SessionTabSnapshot, StorageManager};
+    use rusqlite::params;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_db_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "kasumi-db-test-{label}-{}-{nanos}.db",
+            std::process::id()
+        ))
+    }
+
+    fn remove_test_db(path: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(candidate));
+        }
+    }
+
+    fn fresh_db(label: &str) -> (PathBuf, rusqlite::Connection) {
+        let path = test_db_path(label);
+        let conn = StorageManager::init_db(&path).expect("test database should initialize");
+        (path, conn)
+    }
+
+    #[test]
+    fn init_db_creates_schema_in_wal_mode() {
+        let (path, conn) = fresh_db("schema");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode query");
+        assert_eq!(mode, "wal");
+
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .expect("sqlite_master query")
+            .query_map([], |row| row.get(0))
+            .expect("table rows")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(tables, vec!["bookmarks", "history", "session_tabs"]);
+
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn session_saves_and_loads_flags_in_order() {
+        let (path, mut conn) = fresh_db("session");
+        assert!(StorageManager::load_session(&path)
+            .expect("empty load")
+            .is_empty());
+
+        apply_command(
+            &mut conn,
+            DbCommand::SaveSession {
+                tabs: vec![
+                    SessionTabSnapshot {
+                        url: "https://active.example".to_string(),
+                        title: "Active".to_string(),
+                        is_active: true,
+                        is_hibernated: false,
+                    },
+                    SessionTabSnapshot {
+                        url: "view-source:https://example.com".to_string(),
+                        title: "Source".to_string(),
+                        is_active: false,
+                        is_hibernated: true,
+                    },
+                ],
+            },
+        );
+
+        let snapshots = StorageManager::load_session(&path).expect("saved session load");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].url, "https://active.example");
+        assert!(snapshots[0].is_active);
+        assert!(!snapshots[0].is_hibernated);
+        assert_eq!(snapshots[1].url, "view-source:https://example.com");
+        assert!(!snapshots[1].is_active);
+        assert!(snapshots[1].is_hibernated);
+
+        apply_command(
+            &mut conn,
+            DbCommand::SaveSession {
+                tabs: vec![SessionTabSnapshot {
+                    url: "https://only.example".to_string(),
+                    title: "Only".to_string(),
+                    is_active: true,
+                    is_hibernated: false,
+                }],
+            },
+        );
+        let replaced = StorageManager::load_session(&path).expect("replaced session load");
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].url, "https://only.example");
+
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn visits_increment_count_and_preserve_title_when_blank() {
+        let (path, mut conn) = fresh_db("visits");
+
+        apply_command(
+            &mut conn,
+            DbCommand::RecordVisit {
+                url: "https://example.com/a".to_string(),
+                title: "Example A".to_string(),
+            },
+        );
+        apply_command(
+            &mut conn,
+            DbCommand::RecordVisit {
+                url: "https://example.com/a".to_string(),
+                title: String::new(),
+            },
+        );
+        apply_command(
+            &mut conn,
+            DbCommand::RecordVisit {
+                url: "https://example.com/b".to_string(),
+                title: "Example B".to_string(),
+            },
+        );
+
+        let items = StorageManager::query_history_prefix(&path, "https://example.com", 10)
+            .expect("history");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].url, "https://example.com/a");
+        assert_eq!(items[0].visit_count, 2);
+        assert_eq!(items[0].title, "Example A");
+
+        let limited =
+            StorageManager::query_history_prefix(&path, "https://example.com", 1).expect("limit");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].url, "https://example.com/a");
+
+        let miss = StorageManager::query_history_prefix(&path, "https://missing", 10)
+            .expect("missing prefix");
+        assert!(miss.is_empty());
+
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn bookmarks_upsert_by_url() {
+        let (path, mut conn) = fresh_db("bookmarks");
+
+        apply_command(
+            &mut conn,
+            DbCommand::AddBookmark {
+                url: "https://example.com".to_string(),
+                title: "First".to_string(),
+                folder: "Toolbar".to_string(),
+            },
+        );
+        apply_command(
+            &mut conn,
+            DbCommand::AddBookmark {
+                url: "https://example.com".to_string(),
+                title: "Updated".to_string(),
+                folder: "Reading".to_string(),
+            },
+        );
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bookmarks", [], |row| row.get(0))
+            .expect("bookmark count");
+        assert_eq!(count, 1);
+
+        let (title, folder): (String, String) = conn
+            .query_row(
+                "SELECT title, folder FROM bookmarks WHERE url = ?1",
+                params!["https://example.com"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("bookmark row");
+        assert_eq!(title, "Updated");
+        assert_eq!(folder, "Reading");
+
+        apply_command(&mut conn, DbCommand::FlushWal);
+        drop(conn);
+        remove_test_db(&path);
+    }
 }

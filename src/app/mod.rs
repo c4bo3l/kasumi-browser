@@ -11,12 +11,9 @@ wrap_app! {
             process_type: Option<&CefString>,
             command_line: Option<&mut CommandLine>,
         ) {
-            // Verify process_type is empty/None (main browser process only)
-            let is_main_process = process_type
-                .map(|pt| pt.to_string().is_empty())
-                .unwrap_or(true);
-
-            if is_main_process {
+            // Verify process_type is empty/None (main browser process only).
+            let process_type = process_type.map(|pt| pt.to_string());
+            if flags::is_main_browser_process(process_type.as_deref()) {
                 if let Some(cmd) = command_line {
                     flags::configure_command_line(cmd);
                 }

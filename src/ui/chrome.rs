@@ -11,9 +11,13 @@
 
 #![allow(dead_code)]
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use egui::{Align, Color32, Frame, Layout, Rounding, Stroke, TextEdit};
+use egui::{
+    pos2, vec2, Align, Color32, Frame, Layout, Response, RichText, Rounding, Sense, Stroke,
+    TextEdit, TextureOptions, Ui,
+};
 use egui_wgpu::ScreenDescriptor;
 
 use crate::config::{CHROME_HEIGHT, DEFAULT_SEARCH_URL_PREFIX, TAB_BAR_HEIGHT};
@@ -24,7 +28,6 @@ use crate::events::UiAction;
 // ---------------------------------------------------------------------------
 
 /// Snapshot of a single tab's metadata used by the chrome renderer.
-/// (Cheap to clone — lives only for the duration of a render call.)
 #[derive(Debug, Clone, PartialEq)]
 pub enum TabDisplayState {
     Active,
@@ -32,15 +35,26 @@ pub enum TabDisplayState {
     Hibernated,
 }
 
+/// Decoded favicon pixels delivered from the CEF favicon download callback.
+#[derive(Debug, Clone)]
+pub struct Favicon {
+    pub url: String,
+    pub rgba: Arc<[u8]>,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct TabInfo {
     pub id: u64,
+    pub url: String,
     pub title: String,
     pub is_loading: bool,
     pub display_state: TabDisplayState,
     pub blocked_requests: u32,
     pub can_go_back: bool,
     pub can_go_forward: bool,
+    pub favicon: Option<Favicon>,
 }
 
 /// All mutable UI state consumed by `ChromeRenderer::render()` each frame.
@@ -49,6 +63,12 @@ pub struct ChromeState {
     pub active_tab_id: Option<u64>,
     /// Text currently shown in the omnibox input field.
     pub omnibox_text: String,
+    /// True while the user is editing the omnibox; prevents event-driven clobbering.
+    pub omnibox_focused: bool,
+    /// Tab whose URL was last copied into the omnibox.
+    pub last_synced_tab_id: Option<u64>,
+    /// URL that was last copied into the omnibox.
+    pub last_synced_url: String,
     /// Whether the active tab is currently loading.
     pub is_loading: bool,
     /// RAM used by this process in megabytes (updated by sysinfo watchdog).
@@ -61,6 +81,9 @@ impl Default for ChromeState {
             tabs: Vec::new(),
             active_tab_id: None,
             omnibox_text: String::new(),
+            omnibox_focused: false,
+            last_synced_tab_id: None,
+            last_synced_url: String::new(),
             is_loading: false,
             ram_mb: 0,
         }
@@ -81,8 +104,8 @@ pub struct ChromeRenderer {
     egui_ctx: egui::Context,
     /// Tracks raw input state across frames.
     egui_state: egui_winit::State,
-    /// Whether the omnibox is currently focused (so Ctrl+L can grab it).
-    omnibox_focused: bool,
+    /// Cached egui textures keyed by favicon URL.
+    favicon_textures: HashMap<String, egui::TextureHandle>,
     /// Max texture dimension for this adapter; used to clamp surface size.
     max_texture_dim: u32,
 }
@@ -111,8 +134,6 @@ impl ChromeRenderer {
             .unwrap_or(caps.formats[0]);
 
         // Clamp surface dimensions to the adapter's max texture size.
-        // On Intel Iris (this machine) the Metal backend reports max 2048,
-        // while Retina physical pixels are 2560×1600 — so we must clamp.
         let max_tex = adapter.limits().max_texture_dimension_2d;
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -128,8 +149,12 @@ impl ChromeRenderer {
 
         let renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
         let egui_ctx = egui::Context::default();
+        // Tooltips must appear immediately; the default delay makes the chrome
+        // controls look unlabeled during quick hovers.
+        egui_ctx.style_mut(|style| {
+            style.interaction.tooltip_delay = 0.0;
+        });
 
-        // egui_winit::State handles input translation.
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -147,13 +172,12 @@ impl ChromeRenderer {
             renderer,
             egui_ctx,
             egui_state,
-            omnibox_focused: false,
+            favicon_textures: HashMap::new(),
             max_texture_dim: max_tex,
         }
     }
 
     /// Forward a winit `WindowEvent` to egui for input processing.
-    /// Returns `true` if egui consumed the event (caller should not forward to CEF).
     pub fn on_window_event(
         &mut self,
         window: &winit::window::Window,
@@ -174,8 +198,6 @@ impl ChromeRenderer {
     }
 
     /// Render one frame of chrome UI.  Returns the list of actions the user triggered.
-    ///
-    /// `state` is consumed/mutated (omnibox text may be updated by typing).
     pub fn render(
         &mut self,
         window: &winit::window::Window,
@@ -184,24 +206,31 @@ impl ChromeRenderer {
     ) -> Vec<UiAction> {
         let mut actions: Vec<UiAction> = Vec::new();
 
-        // --- Gather raw input from winit ---
-        let raw_input = self.egui_state.take_egui_input(window);
+        self.sync_favicon_textures(state);
 
-        // --- Focus omnibox on Ctrl+L ---
+        let mut raw_input = self.egui_state.take_egui_input(window);
+
         if ctrl_l_pressed {
-            self.omnibox_focused = true;
+            state.omnibox_focused = true;
+            // Let the focused TextEdit process a synthetic Cmd/Ctrl+A so the
+            // whole current URL is selected, matching browser omnibox behavior.
+            raw_input.events.push(egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: Some(egui::Key::A),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            });
         }
 
-        // --- Run egui UI ---
         let egui_ctx = self.egui_ctx.clone();
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            Self::build_ui(ctx, state, &mut actions, ctrl_l_pressed);
+            self.build_ui(ctx, state, &mut actions, ctrl_l_pressed);
         });
 
         self.egui_state
             .handle_platform_output(window, full_output.platform_output.clone());
 
-        // --- Render egui to wgpu ---
         let output_frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(e) => {
@@ -222,7 +251,6 @@ impl ChromeRenderer {
             .egui_ctx
             .tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
 
-        // Update buffers
         for (id, delta) in &full_output.textures_delta.set {
             self.renderer
                 .update_texture(&self.device, &self.queue, *id, delta);
@@ -275,52 +303,72 @@ impl ChromeRenderer {
         actions
     }
 
+    /// Install any newly downloaded favicon bitmaps into the egui texture cache.
+    fn sync_favicon_textures(&mut self, state: &ChromeState) {
+        let mut live_urls = HashSet::new();
+
+        for tab in &state.tabs {
+            let Some(favicon) = &tab.favicon else {
+                continue;
+            };
+            if favicon.width == 0 || favicon.height == 0 || favicon.rgba.is_empty() {
+                continue;
+            }
+
+            live_urls.insert(favicon.url.clone());
+            if self.favicon_textures.contains_key(&favicon.url) {
+                continue;
+            }
+
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [favicon.width as usize, favicon.height as usize],
+                &favicon.rgba[..],
+            );
+            let texture =
+                self.egui_ctx
+                    .load_texture(favicon.url.clone(), image, TextureOptions::LINEAR);
+            self.favicon_textures.insert(favicon.url.clone(), texture);
+        }
+
+        self.favicon_textures
+            .retain(|url, _| live_urls.contains(url));
+    }
+
     // -----------------------------------------------------------------------
     // UI construction
     // -----------------------------------------------------------------------
 
     fn build_ui(
+        &self,
         ctx: &egui::Context,
         state: &mut ChromeState,
         actions: &mut Vec<UiAction>,
         ctrl_l_pressed: bool,
     ) {
-        let scale = ctx.pixels_per_point();
         let tab_height = TAB_BAR_HEIGHT;
         let _chrome_height = CHROME_HEIGHT;
 
         // ── Tab Strip ───────────────────────────────────────────────────────
         egui::TopBottomPanel::top("tab_strip")
             .exact_height(tab_height)
-            .frame(Frame::none().fill(Color32::from_rgb(40, 40, 40)))
+            .frame(Frame::none().fill(Color32::from_rgb(30, 31, 35)))
             .show(ctx, |ui| {
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.add_space(4.0);
+                    ui.add_space(5.0);
 
                     egui::ScrollArea::horizontal()
                         .id_salt("tab_scroll")
                         .show(ui, |ui| {
                             for tab in &state.tabs {
                                 let is_active = state.active_tab_id == Some(tab.id);
-
-                                // Tab background
-                                let tab_bg = if is_active {
-                                    Color32::from_rgb(60, 60, 60)
-                                } else {
-                                    Color32::from_rgb(45, 45, 45)
-                                };
-
                                 let tab_id = tab.id;
+
                                 let title = if tab.title.is_empty() {
                                     "New Tab".to_string()
-                                } else if tab.title.chars().count() > 24 {
-                                    let truncated: String = tab.title.chars().take(24).collect();
-                                    format!("{}…", truncated)
                                 } else {
-                                    tab.title.clone()
+                                    truncate_title(&tab.title, 24)
                                 };
 
-                                // Build label with state badges
                                 let label_text = if tab.is_loading {
                                     format!("⟳ {}", title)
                                 } else if tab.display_state == TabDisplayState::Hibernated {
@@ -329,120 +377,158 @@ impl ChromeRenderer {
                                     title.clone()
                                 };
 
-                                Frame::none()
-                                    .fill(tab_bg)
-                                    .rounding(Rounding::same(4.0))
+                                let fill = if is_active {
+                                    Color32::from_rgb(64, 66, 72)
+                                } else {
+                                    Color32::from_rgb(44, 45, 50)
+                                };
+                                let stroke = if is_active {
+                                    Stroke::new(1.0_f32, Color32::from_rgb(88, 140, 220))
+                                } else {
+                                    Stroke::new(0.5_f32, Color32::from_rgb(62, 63, 68))
+                                };
+
+                                let frame_resp = Frame::none()
+                                    .fill(fill)
+                                    .rounding(Rounding::same(6.0))
+                                    .stroke(stroke)
                                     .inner_margin(egui::Margin::symmetric(8.0, 0.0))
                                     .show(ui, |ui| {
                                         ui.set_max_height(tab_height - 4.0);
                                         ui.with_layout(
                                             Layout::left_to_right(Align::Center),
                                             |ui| {
+                                                self.paint_favicon(ui, tab);
+
                                                 let tab_btn = ui.add(
                                                     egui::Label::new(
-                                                        egui::RichText::new(&label_text)
-                                                            .color(Color32::WHITE)
+                                                        RichText::new(&label_text)
+                                                            .color(Color32::from_rgb(235, 235, 238))
                                                             .size(13.0),
                                                     )
-                                                    .sense(egui::Sense::click()),
+                                                    .sense(Sense::click()),
                                                 );
                                                 if tab_btn.clicked() {
                                                     actions.push(UiAction::SelectTab { tab_id });
                                                 }
+                                                Self::chrome_tooltip(
+                                                    ui,
+                                                    &tab_btn,
+                                                    format!("{}\n{}", tab.title, tab.url),
+                                                );
 
-                                                // Close button
+                                                ui.add_space(4.0);
+
                                                 let close = ui.add(
                                                     egui::Label::new(
-                                                        egui::RichText::new(" ×")
-                                                            .color(Color32::GRAY)
-                                                            .size(14.0),
+                                                        RichText::new("×")
+                                                            .color(Color32::from_rgb(150, 150, 155))
+                                                            .size(15.0),
                                                     )
-                                                    .sense(egui::Sense::click()),
+                                                    .sense(Sense::click()),
                                                 );
+                                                if close.hovered() {
+                                                    ui.painter().rect_filled(
+                                                        close.rect,
+                                                        Rounding::same(4.0_f32),
+                                                        Color32::from_rgba_unmultiplied(
+                                                            255, 255, 255, 28,
+                                                        ),
+                                                    );
+                                                }
                                                 if close.clicked() {
                                                     actions.push(UiAction::CloseTab { tab_id });
                                                 }
+                                                Self::chrome_tooltip(
+                                                    ui,
+                                                    &close,
+                                                    "Close tab (middle-click anywhere on tab)",
+                                                );
                                             },
                                         );
                                     });
 
-                                ui.add_space(2.0);
+                                let tab_hit = ui.interact(
+                                    frame_resp.response.rect,
+                                    egui::Id::new(("tab_middle_click", tab_id)),
+                                    Sense::click(),
+                                );
+                                if tab_hit.middle_clicked() {
+                                    actions.push(UiAction::CloseTab { tab_id });
+                                }
+
+                                if frame_resp.response.hovered() && !is_active {
+                                    ui.painter().rect_filled(
+                                        frame_resp.response.rect,
+                                        Rounding::same(6.0_f32),
+                                        Color32::from_rgba_unmultiplied(255, 255, 255, 12),
+                                    );
+                                }
+
+                                if is_active {
+                                    let rect = frame_resp.response.rect;
+                                    ui.painter().line_segment(
+                                        [
+                                            pos2(rect.left() + 7.0, rect.top() + 1.0),
+                                            pos2(rect.right() - 7.0, rect.top() + 1.0),
+                                        ],
+                                        Stroke::new(2.0_f32, Color32::from_rgb(120, 175, 255)),
+                                    );
+                                }
+
+                                ui.add_space(3.0);
                             }
                         });
 
-                    // New tab button
                     let new_tab = ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(" + ").color(Color32::WHITE).size(16.0),
-                        )
-                        .sense(egui::Sense::click()),
+                        egui::Label::new(RichText::new("+").color(Color32::WHITE).size(17.0))
+                            .sense(Sense::click()),
                     );
                     if new_tab.clicked() {
                         actions.push(UiAction::NewTab { url: None });
                     }
-                    let _ = scale; // suppress unused warning
+                    Self::chrome_tooltip(ui, &new_tab, "New tab (Cmd/Ctrl+T)");
                 });
             });
 
         // ── Toolbar (nav + omnibox + badges) ───────────────────────────────
         egui::TopBottomPanel::top("toolbar")
-            .exact_height(TAB_BAR_HEIGHT) // second 38 px
-            .frame(Frame::none().fill(Color32::from_rgb(32, 32, 32)))
+            .exact_height(TAB_BAR_HEIGHT)
+            .frame(Frame::none().fill(Color32::from_rgb(34, 35, 39)))
             .show(ctx, |ui| {
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     ui.add_space(6.0);
 
-                    // ← Back
-                    let can_back = state
+                    let active_tab = state
                         .tabs
                         .iter()
-                        .find(|t| Some(t.id) == state.active_tab_id)
-                        .map(|t| t.can_go_back)
-                        .unwrap_or(false);
-                    let back_btn = ui.add_enabled(
-                        can_back,
-                        egui::Button::new(
-                            egui::RichText::new("←").color(Color32::WHITE).size(16.0),
-                        )
-                        .stroke(Stroke::NONE),
-                    );
-                    if back_btn.clicked() {
+                        .find(|t| Some(t.id) == state.active_tab_id);
+                    let can_back = active_tab.map(|t| t.can_go_back).unwrap_or(false);
+                    let can_fwd = active_tab.map(|t| t.can_go_forward).unwrap_or(false);
+
+                    let back = Self::nav_button(ui, can_back, true, "Back (Cmd/Ctrl+←)");
+                    if back.clicked() && can_back {
                         if let Some(id) = state.active_tab_id {
                             actions.push(UiAction::GoBack { tab_id: id });
                         }
                     }
 
-                    // → Forward
-                    let can_fwd = state
-                        .tabs
-                        .iter()
-                        .find(|t| Some(t.id) == state.active_tab_id)
-                        .map(|t| t.can_go_forward)
-                        .unwrap_or(false);
-                    let fwd_btn = ui.add_enabled(
-                        can_fwd,
-                        egui::Button::new(
-                            egui::RichText::new("→").color(Color32::WHITE).size(16.0),
-                        )
-                        .stroke(Stroke::NONE),
-                    );
-                    if fwd_btn.clicked() {
+                    let forward = Self::nav_button(ui, can_fwd, false, "Forward (Cmd/Ctrl+→)");
+                    if forward.clicked() && can_fwd {
                         if let Some(id) = state.active_tab_id {
                             actions.push(UiAction::GoForward { tab_id: id });
                         }
                     }
 
-                    // ↻ Reload / ✕ Stop
-                    let (reload_label, is_loading_now) = if state.is_loading {
-                        ("✕", true)
+                    let (reload_label, is_loading_now, reload_tooltip) = if state.is_loading {
+                        ("✕", true, "Stop loading (Esc)")
                     } else {
-                        ("↻", false)
+                        ("↻", false, "Reload (Cmd/Ctrl+R)")
                     };
-                    let reload_btn = ui.add(
+                    let reload_btn = ui.add_sized(
+                        vec2(28.0, 28.0),
                         egui::Button::new(
-                            egui::RichText::new(reload_label)
-                                .color(Color32::WHITE)
-                                .size(16.0),
+                            RichText::new(reload_label).color(Color32::WHITE).size(16.0),
                         )
                         .stroke(Stroke::NONE),
                     );
@@ -458,79 +544,198 @@ impl ChromeRenderer {
                             }
                         }
                     }
+                    Self::chrome_tooltip(ui, &reload_btn, reload_tooltip);
 
                     ui.add_space(4.0);
 
-                    // ── Omnibox ──────────────────────────────────────────
+                    let omnibox_width = (ui.available_width() - 160.0).max(160.0);
+                    let omnibox_id = egui::Id::new("kasumi_omnibox");
+                    if ctrl_l_pressed {
+                        // Set focus before the widget processes this frame's
+                        // synthetic select-all event.
+                        ctx.memory_mut(|mem| mem.request_focus(omnibox_id));
+                    }
                     let omnibox_resp = ui.add(
                         TextEdit::singleline(&mut state.omnibox_text)
-                            .desired_width(ui.available_width() - 160.0)
+                            .id(omnibox_id)
+                            .desired_width(omnibox_width)
                             .hint_text("Search or enter address…")
                             .text_color(Color32::WHITE)
                             .frame(true),
                     );
 
-                    // Focus omnibox on Ctrl+L
-                    if ctrl_l_pressed {
-                        omnibox_resp.request_focus();
-                    }
+                    state.omnibox_focused = omnibox_resp.has_focus();
+                    Self::chrome_tooltip(ui, &omnibox_resp, "Search or enter address (Cmd/Ctrl+L)");
 
-                    // Navigate on Enter
                     if omnibox_resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                         let url = resolve_omnibox(&state.omnibox_text);
                         if let Some(id) = state.active_tab_id {
                             actions.push(UiAction::Navigate { tab_id: id, url });
                         }
+                        state.omnibox_focused = false;
                     }
 
                     ui.add_space(4.0);
 
-                    // 🛡 Blocked count badge
-                    let blocked: u32 = state
-                        .tabs
-                        .iter()
-                        .find(|t| Some(t.id) == state.active_tab_id)
-                        .map(|t| t.blocked_requests)
-                        .unwrap_or(0);
-                    ui.label(
-                        egui::RichText::new(format!("🛡 {}", blocked))
+                    let blocked: u32 = active_tab.map(|t| t.blocked_requests).unwrap_or(0);
+                    let shield = ui.label(
+                        RichText::new(format!("🛡 {}", blocked))
                             .color(Color32::from_rgb(80, 200, 120))
                             .size(12.0),
                     );
+                    Self::chrome_tooltip(ui, &shield, format!("Blocked requests: {}", blocked));
 
                     ui.add_space(4.0);
 
-                    // 💤 Hibernate all background tabs
-                    let hibernate_btn = ui.add(
-                        egui::Button::new(
-                            egui::RichText::new("💤").color(Color32::WHITE).size(14.0),
-                        )
-                        .stroke(Stroke::NONE),
+                    let hibernate_btn = ui.add_sized(
+                        vec2(28.0, 28.0),
+                        egui::Button::new(RichText::new("💤").color(Color32::WHITE).size(14.0))
+                            .stroke(Stroke::NONE),
                     );
                     if hibernate_btn.clicked() {
                         actions.push(UiAction::HibernateAllBackground);
                     }
+                    Self::chrome_tooltip(
+                        ui,
+                        &hibernate_btn,
+                        "Hibernate all background tabs (Alt+H)",
+                    );
 
                     ui.add_space(4.0);
 
-                    // RAM readout
-                    ui.label(
-                        egui::RichText::new(format!("RAM: {} MB", state.ram_mb))
+                    let ram = ui.label(
+                        RichText::new(format!("RAM: {} MB", state.ram_mb))
                             .color(Color32::GRAY)
                             .size(11.0),
                     );
+                    Self::chrome_tooltip(ui, &ram, "Browser-process RAM usage");
 
                     ui.add_space(4.0);
                 });
             });
 
-        // Fill the rest of the window with a transparent (zero-height) central panel
-        // so egui doesn't complain about missing central panel.
+        // Fill the rest of the window with a transparent (zero-height) central panel.
         egui::CentralPanel::default()
             .frame(Frame::none().fill(Color32::TRANSPARENT))
-            .show(ctx, |_ui| {
-                // CEF renders here via native child window — egui does nothing.
-            });
+            .show(ctx, |_ui| {});
+    }
+
+    /// Draw a native chevron icon so Back/Forward never depend on font glyphs.
+    fn nav_button(ui: &mut Ui, enabled: bool, point_left: bool, tooltip: &str) -> Response {
+        let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
+        if !ui.is_rect_visible(rect) {
+            Self::chrome_tooltip(ui, &response, tooltip);
+            return response;
+        }
+
+        let painter = ui.painter();
+        if response.hovered() {
+            painter.rect_filled(rect, Rounding::same(6.0), Color32::from_rgb(68, 69, 75));
+        }
+
+        let color = if enabled {
+            Color32::from_rgb(235, 235, 238)
+        } else {
+            Color32::from_rgb(105, 106, 112)
+        };
+        let center = rect.center();
+        let tip_x = if point_left {
+            center.x - 4.0
+        } else {
+            center.x + 4.0
+        };
+        let base_x = if point_left {
+            center.x + 3.0
+        } else {
+            center.x - 3.0
+        };
+        let stroke = Stroke::new(1.8_f32, color);
+        painter.line_segment(
+            [pos2(tip_x, center.y), pos2(base_x, center.y - 5.5)],
+            stroke,
+        );
+        painter.line_segment(
+            [pos2(tip_x, center.y), pos2(base_x, center.y + 5.5)],
+            stroke,
+        );
+
+        Self::chrome_tooltip(ui, &response, tooltip);
+        response
+    }
+
+    /// Draw a tooltip inside the 76 px native chrome region.
+    ///
+    /// CEF's child view sits above the wgpu surface at y >= 76, so egui's
+    /// default pointer-following tooltip is hidden behind the page. Anchoring
+    /// at y = 0 keeps the tooltip visible in the tab strip instead.
+    fn chrome_tooltip(ui: &Ui, response: &Response, text: impl Into<egui::WidgetText>) {
+        if !response.hovered() {
+            return;
+        }
+
+        let pointer_x = ui
+            .input(|input| input.pointer.hover_pos().map(|pos| pos.x))
+            .unwrap_or_else(|| response.rect.center().x);
+        let right = ui.ctx().screen_rect().right();
+        let x = tooltip_anchor_x(pointer_x, right, response.rect.center().x);
+
+        egui::containers::show_tooltip_at(
+            ui.ctx(),
+            ui.layer_id(),
+            response.id,
+            pos2(x, 0.0),
+            |tooltip| {
+                tooltip.label(text.into());
+            },
+        );
+    }
+
+    /// Draw a cached favicon, or a neutral fallback dot if none is available.
+    fn paint_favicon(&self, ui: &mut Ui, tab: &TabInfo) {
+        let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+        if !ui.is_rect_visible(rect) {
+            return;
+        }
+
+        if let Some(favicon) = &tab.favicon {
+            if let Some(texture) = self.favicon_textures.get(&favicon.url) {
+                let uv = egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                ui.painter().image(texture.id(), rect, uv, Color32::WHITE);
+                return;
+            }
+        }
+
+        ui.painter()
+            .circle_filled(rect.center(), 4.0, Color32::from_rgb(120, 130, 145));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure chrome helpers (unit-tested)
+// ---------------------------------------------------------------------------
+
+/// Clamp a tooltip anchor into the visible screen horizontally.
+///
+/// Tooltips are anchored at `y = 0` to stay above the CEF child view. The
+/// fallback is used when egui has no pointer position (keyboard focus).
+pub fn tooltip_anchor_x(pointer_x: f32, right: f32, fallback_x: f32) -> f32 {
+    let x = if pointer_x.is_finite() {
+        pointer_x
+    } else {
+        fallback_x
+    };
+    x.clamp(4.0, (right - 4.0).max(4.0))
+}
+
+/// Truncate a tab title by Unicode scalar value, not bytes, so non-ASCII
+/// titles never panic or split a multi-byte character.
+pub fn truncate_title(title: &str, max_chars: usize) -> String {
+    let mut chars = title.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
     }
 }
 
@@ -545,33 +750,128 @@ pub fn resolve_omnibox(input: &str) -> String {
         return crate::config::DEFAULT_HOME_URL.to_string();
     }
 
-    // 1. Valid URL (includes scheme)?
+    // CEF's view-source: pseudo-scheme is not a normal URL for `url::Url`,
+    // but it must survive omnibox input unchanged. URL schemes are
+    // case-insensitive.
+    if trimmed
+        .get(..12)
+        .map(|prefix| prefix.eq_ignore_ascii_case("view-source:"))
+        .unwrap_or(false)
+    {
+        return trimmed.to_string();
+    }
+
     if url::Url::parse(trimmed).is_ok() {
         return trimmed.to_string();
     }
 
-    // 2. No spaces and contains a dot → assume bare domain / path
     if !trimmed.contains(' ') && trimmed.contains('.') {
         return format!("https://{}", trimmed);
     }
 
-    // 3. Encode as DuckDuckGo search
     let encoded = url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect::<String>();
     format!("{}{}", DEFAULT_SEARCH_URL_PREFIX, encoded)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_omnibox;
+    use super::{resolve_omnibox, tooltip_anchor_x, truncate_title};
+    use crate::config::{DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX};
 
     #[test]
-    fn test_resolve_omnibox() {
+    fn resolve_omnibox_passes_through_absolute_urls() {
         assert_eq!(resolve_omnibox("https://github.com"), "https://github.com");
+        assert_eq!(resolve_omnibox("http://example.com"), "http://example.com");
+        assert_eq!(resolve_omnibox("ftp://example.com"), "ftp://example.com");
+        assert_eq!(resolve_omnibox("file:///tmp/a"), "file:///tmp/a");
+        assert_eq!(
+            resolve_omnibox("data:text/plain,hello"),
+            "data:text/plain,hello"
+        );
+    }
+
+    #[test]
+    fn resolve_omnibox_prepends_https_to_bare_domains() {
         assert_eq!(
             resolve_omnibox("github.com/rust-lang"),
             "https://github.com/rust-lang"
         );
-        assert!(resolve_omnibox("hello world").contains("duckduckgo.com"));
-        assert!(resolve_omnibox("rust async").contains("duckduckgo.com"));
+        assert_eq!(resolve_omnibox("example.com"), "https://example.com");
+        assert_eq!(
+            resolve_omnibox("1.2.3.4:8080/path"),
+            "https://1.2.3.4:8080/path"
+        );
+    }
+
+    #[test]
+    fn resolve_omnibox_searches_non_url_text() {
+        assert_eq!(
+            resolve_omnibox("hello world"),
+            format!("{DEFAULT_SEARCH_URL_PREFIX}hello+world")
+        );
+        assert_eq!(
+            resolve_omnibox("rust async"),
+            format!("{DEFAULT_SEARCH_URL_PREFIX}rust+async")
+        );
+        // `Url::parse` accepts `localhost:3000` as a custom scheme, so the
+        // documented parse-first rule passes it through unchanged.
+        assert_eq!(resolve_omnibox("localhost:3000"), "localhost:3000");
+        assert!(resolve_omnibox("example.com path").contains("duckduckgo.com"));
+    }
+
+    #[test]
+    fn resolve_omnibox_encodes_search_query_characters() {
+        let resolved = resolve_omnibox("rust & webgpu");
+        assert_eq!(
+            resolved,
+            format!("{DEFAULT_SEARCH_URL_PREFIX}rust+%26+webgpu")
+        );
+
+        let unicode = resolve_omnibox("café");
+        assert!(unicode.starts_with(DEFAULT_SEARCH_URL_PREFIX));
+        assert!(unicode.contains("%C3%A9"));
+    }
+
+    #[test]
+    fn resolve_omnibox_handles_empty_and_whitespace_input() {
+        assert_eq!(resolve_omnibox(""), DEFAULT_HOME_URL);
+        assert_eq!(resolve_omnibox("   \t\n"), DEFAULT_HOME_URL);
+    }
+
+    #[test]
+    fn resolve_omnibox_preserves_view_source_scheme_case_insensitively() {
+        assert_eq!(
+            resolve_omnibox("view-source:https://example.com"),
+            "view-source:https://example.com"
+        );
+        assert_eq!(
+            resolve_omnibox("  VIEW-SOURCE:https://example.com  "),
+            "VIEW-SOURCE:https://example.com"
+        );
+        assert_eq!(resolve_omnibox("view-source:"), "view-source:");
+    }
+
+    #[test]
+    fn tooltip_anchor_stays_inside_the_screen() {
+        assert_eq!(tooltip_anchor_x(100.0, 1280.0, 50.0), 100.0);
+        assert_eq!(tooltip_anchor_x(-20.0, 1280.0, 50.0), 4.0);
+        assert_eq!(tooltip_anchor_x(2000.0, 1280.0, 50.0), 1276.0);
+        assert_eq!(tooltip_anchor_x(f32::NAN, 1280.0, 50.0), 50.0);
+        assert_eq!(tooltip_anchor_x(20.0, 6.0, 50.0), 4.0);
+    }
+
+    #[test]
+    fn truncate_title_counts_unicode_scalar_values() {
+        assert_eq!(truncate_title("short", 24), "short");
+        assert_eq!(
+            truncate_title("123456789012345678901234", 24),
+            "123456789012345678901234"
+        );
+        assert_eq!(
+            truncate_title("1234567890123456789012345", 24),
+            "123456789012345678901234…"
+        );
+        assert_eq!(truncate_title("日本語タイトル", 4), "日本語タ…");
+        assert_eq!(truncate_title("abc", 0), "…");
     }
 }

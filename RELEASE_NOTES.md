@@ -4,6 +4,96 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
+## v0.1.9 — 2026-11-23
+
+### Fixed
+
+- Tooltips are now anchored inside the native chrome region so they are no longer hidden behind the CEF page view.
+- Middle-clicking anywhere on a tab now closes it.
+- Closing a tab now completes the CEF browser teardown, so media such as YouTube audio stops immediately instead of continuing in the background.
+- Favicons now prefer conventional `favicon.ico` URLs, fall back to `<origin>/favicon.ico` when CEF reports no icon links, and reject later decorative icon candidates that do not match the site tab icon.
+
+### Changed
+
+- Bumped the project and macOS bundle version from `0.1.8` to `0.1.9`.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser` — 36 tests, including omnibox edge cases, tooltip anchoring, CEF/switch invariants, adblock request mapping and blocking, favicon validation, hibernation thresholds, shortcut modifiers, and SQLite session/history/bookmark behavior.
+- `cargo build --release`
+- Manual macOS run confirmed that closing a YouTube tab stops audio immediately.
+
+---
+
+## v0.1.8 — 2026-11-23
+
+### Fixed
+
+- Tooltips now appear immediately by removing egui's default hover delay.
+- `Cmd/Ctrl+L` now works even when the omnibox already has keyboard focus, and selects the full URL.
+- Favicon selection now accepts only the first successful icon per navigation, preventing later `apple-touch-icon`/large PNG candidates from overwriting the site's real tab icon.
+
+### Changed
+
+- Bumped the project and macOS bundle version from `0.1.7` to `0.1.8`.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser`
+- Manual macOS run pending after this verification batch.
+
+---
+
+## v0.1.7 — 2026-11-23
+
+### Fixed
+
+- The omnibox now follows the active tab's committed URL after link clicks, Back/Forward, and tab switches. It stops overwriting text while focused, and Cmd/Ctrl+L focuses and selects the whole URL.
+- Back and Forward controls are drawn as native arrow shapes instead of relying on font glyphs, with dimmed-but-visible disabled states.
+- Tooltips now cover tabs, close buttons, new tab, Back, Forward, Reload/Stop, the shield badge, Hibernate All, RAM readout, and the omnibox.
+- F12 now opens DevTools when the web view has focus via a CEF `KeyboardHandler`; the winit shortcut remains as a fallback, and repeated presses no longer spawn duplicate windows.
+- Right-click → View Page Source now opens a visible `view-source:` tab and reuses an existing source tab if present.
+
+### Added
+
+- End-to-end favicon pipeline: CEF favicon URL callbacks now trigger main-thread image downloads, decode to RGBA, and render in the tab strip with a neutral fallback.
+- Modernized the tab strip with rounded surfaces, active accent line, hover states, and favicon slots while keeping the 38 px tab-strip / 76 px chrome geometry.
+- Added an omnibox unit test for `view-source:` URLs.
+
+### Changed
+
+- Bumped the project and macOS bundle version from `0.1.6` to `0.1.7`.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser`
+
+---
+
+## v0.1.6 — 2026-11-23
+
+### Added
+
+- Added `.github/workflows/pr.yml` for pull requests targeting `main`. It checks formatting, runs `cargo check --bins`, and runs the unit tests with `cargo test --bin kasumi-browser` on the supported `macos-15-intel` runner.
+- Added Cargo and CEF caches to the PR workflow to keep CI runs fast.
+
+### Changed
+
+- Change the versioning policy so a version bump is released when a PR is merged into `main`; PRs include the bump so CI validates the exact release state.
+- Bumped the project and macOS bundle version from `0.1.5` to `0.1.6`.
+
+### Notes
+
+- All future changes should land through pull requests and pass the PR workflow before merge.
+
+---
+
 ## v0.1.5 — 2026-11-23
 
 ### Added

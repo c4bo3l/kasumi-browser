@@ -271,6 +271,12 @@ impl KasumiBrowserHandler {
     }
 }
 
+/// Cmd on macOS, Ctrl elsewhere. Keeping this decision in one place makes the
+/// shortcut behavior easy to test without constructing a winit event loop.
+fn is_primary_shortcut_modifier(modifiers: ModifiersState) -> bool {
+    modifiers.control_key() || modifiers.super_key()
+}
+
 impl ApplicationHandler for KasumiBrowserHandler {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -346,7 +352,7 @@ impl ApplicationHandler for KasumiBrowserHandler {
         event: WindowEvent,
     ) {
         // Let egui consume keyboard/mouse input first
-        let consumed =
+        let _consumed =
             if let (Some(window), Some(chrome)) = (self.window.as_ref(), self.chrome.as_mut()) {
                 chrome.on_window_event(window, &event)
             } else {
@@ -366,8 +372,8 @@ impl ApplicationHandler for KasumiBrowserHandler {
                         ..
                     },
                 ..
-            } if !consumed => {
-                let ctrl = self.modifiers.control_key() || self.modifiers.super_key();
+            } => {
+                let ctrl = is_primary_shortcut_modifier(self.modifiers);
                 let alt = self.modifiers.alt_key();
                 let shift = self.modifiers.shift_key();
 
@@ -747,4 +753,25 @@ fn main() {
     cef::shutdown();
 
     tracing::info!("Kasumi Browser exiting cleanly");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_primary_shortcut_modifier;
+    use winit::keyboard::ModifiersState;
+
+    #[test]
+    fn shortcuts_accept_ctrl_or_cmd_without_conflicting_modifiers() {
+        assert!(!is_primary_shortcut_modifier(ModifiersState::empty()));
+        assert!(is_primary_shortcut_modifier(ModifiersState::CONTROL));
+        assert!(is_primary_shortcut_modifier(ModifiersState::SUPER));
+        assert!(is_primary_shortcut_modifier(
+            ModifiersState::CONTROL | ModifiersState::SHIFT
+        ));
+        assert!(is_primary_shortcut_modifier(
+            ModifiersState::SUPER | ModifiersState::ALT
+        ));
+        assert!(!is_primary_shortcut_modifier(ModifiersState::SHIFT));
+        assert!(!is_primary_shortcut_modifier(ModifiersState::ALT));
+    }
 }
