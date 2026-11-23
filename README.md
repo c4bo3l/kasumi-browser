@@ -8,11 +8,13 @@ Repository: [github.com/c4bo3l/kasumi-browser](https://github.com/c4bo3l/kasumi-
 
 Release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
+Pending UI/navigation bugfix handoff: [BUGFIX_TASKS.md](BUGFIX_TASKS.md)
+
 ---
 
 ## ✅ What Has Been Done
 
-Current version: **0.1.3**. Every batch of changes bumps the version in `Cargo.toml`, `src/bin/bundle.rs`, and `Cargo.lock` as required by `AGENTS.md`.
+Current version: **0.1.4**. Every batch of changes bumps the version in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, and `Cargo.lock` as required by `AGENTS.md`.
 
 - Renamed the project from LiteBrowser to **Kasumi Browser** everywhere: package, binary, CEF helper, bundle ID, window title, database path, and docs.
 - Implemented the CEF subprocess fork trap and `mimalloc` global allocator.
@@ -247,6 +249,7 @@ sha256sum kasumi-browser.tar.gz > kasumi-browser.tar.gz.sha256
 - **Theme awareness:** not implemented yet; the chrome currently uses a fixed dark style and does not follow the OS light/dark setting.
 - **Windows and Linux testing:** native child-view code exists for `HWND` and `X11`, but full interactive verification is still needed on those platforms.
 - **More unit tests:** expand coverage beyond omnibox resolution to tab state transitions, hibernation thresholds, adblock resource-type mapping, storage commands, and UI actions.
+- **Chrome UX/navigation fixes:** see [BUGFIX_TASKS.md](BUGFIX_TASKS.md) for the tracked tooltips, tab styling, omnibox sync, DevTools, view-source, and favicon work.
 
 ---
 

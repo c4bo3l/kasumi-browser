@@ -4,6 +4,24 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
+## v0.1.4 — 2026-11-23
+
+### Added
+
+- Added `BUGFIX_TASKS.md` as the handoff for reported chrome/navigation issues: unclear toolbar buttons, tab styling, tooltips, stale omnibox URL, F12 DevTools, view-source, and missing favicons.
+- Documented current findings, likely root causes, exact files to inspect, implementation leads, and acceptance criteria for each bug.
+- Linked the bugfix handoff from `README.md` and the future-development list.
+
+### Changed
+
+- Bumped the project and macOS bundle version from `0.1.3` to `0.1.4`.
+
+### Notes
+
+- This is a documentation-only batch. The runtime fixes are intentionally left for the next versioned batch.
+
+---
+
 ## v0.1.3 — 2026-11-23
 
 ### Added
