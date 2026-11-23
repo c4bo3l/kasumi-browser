@@ -35,6 +35,13 @@ pub enum BrowserEvent {
     NewWindow {
         url: String,
     },
+    /// Chromium asked to open a link in another tab (middle-click, Ctrl+click,
+    /// or a popup disposition). The source navigation is cancelled and the main
+    /// UI thread opens a native Kasumi tab instead.
+    OpenUrlFromTab {
+        url: String,
+        background: bool,
+    },
     /// A browser shortcut was pressed while the CEF web view had focus. It is
     /// forwarded here because child web views do not propagate key events to
     /// the native winit parent window.
@@ -116,6 +123,11 @@ impl std::fmt::Debug for BrowserEvent {
                 .field("tab_id", tab_id)
                 .finish(),
             Self::NewWindow { url } => f.debug_struct("NewWindow").field("url", url).finish(),
+            Self::OpenUrlFromTab { url, background } => f
+                .debug_struct("OpenUrlFromTab")
+                .field("url", url)
+                .field("background", background)
+                .finish(),
             Self::BrowserShortcut { tab_id, shortcut } => f
                 .debug_struct("BrowserShortcut")
                 .field("tab_id", tab_id)

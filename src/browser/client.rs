@@ -31,9 +31,11 @@ wrap_life_span_handler! {
                     // finish closing, otherwise the browser stays alive and
                     // page media keeps playing.
                     let view_handle = host.window_handle();
-                    if !view_handle.is_null() {
+                    if !crate::ui::platform_view::cef_handle_is_null(view_handle) {
                         unsafe {
-                            crate::ui::platform_view::detach_view(view_handle.cast());
+                            crate::ui::platform_view::detach_view(
+                                crate::ui::platform_view::cef_handle_as_ptr(view_handle),
+                            );
                         }
                     }
                     host.try_close_browser()
@@ -59,7 +61,7 @@ wrap_life_span_handler! {
             _popup_id: i32,
             target_url: Option<&CefStringUtf16>,
             _target_frame_name: Option<&CefStringUtf16>,
-            _target_disposition: WindowOpenDisposition,
+            target_disposition: WindowOpenDisposition,
             _user_gesture: i32,
             _popup_features: Option<&PopupFeatures>,
             _window_info: Option<&mut WindowInfo>,
@@ -77,14 +79,15 @@ wrap_life_span_handler! {
                 // DevTools and view-source windows are part of the browser
                 // itself; routing them through the normal new-tab popup path
                 // makes them invisible or useless in this shell.
-                let is_internal_view = url_str.starts_with("devtools://")
-                    || url_str.starts_with("chrome-devtools://")
-                    || url_str.starts_with("view-source:");
-                if is_internal_view {
+                if is_internal_view_url(&url_str) {
                     return 0;
                 }
 
-                let _ = self.event_sender.send(BrowserEvent::NewWindow { url: url_str });
+                let background = new_tab_disposition(target_disposition).unwrap_or(false);
+                let _ = self.event_sender.send(BrowserEvent::OpenUrlFromTab {
+                    url: url_str,
+                    background,
+                });
             }
             1 // Cancel ordinary popup windows; open them as Kasumi tabs instead.
         }
@@ -197,6 +200,28 @@ const VK_OEM_COMMA: i32 = 0xBC;
 const VK_OEM_PERIOD: i32 = 0xBE;
 const VK_F12: i32 = 0x7B;
 
+/// URLs rendered by Chromium's own tool windows. These must stay in CEF-owned
+/// popups instead of becoming ordinary Kasumi tabs.
+pub(crate) fn is_internal_view_url(url: &str) -> bool {
+    url.starts_with("devtools://")
+        || url.starts_with("chrome-devtools://")
+        || url.starts_with("view-source:")
+}
+
+/// Translate a Chromium link-activation disposition into a Kasumi tab request.
+///
+/// `Some(true)` means a new background tab, `Some(false)` a new foreground
+/// tab, and `None` leaves the navigation in the source tab to CEF.
+pub(crate) fn new_tab_disposition(disposition: WindowOpenDisposition) -> Option<bool> {
+    match disposition {
+        WindowOpenDisposition::NEW_BACKGROUND_TAB => Some(true),
+        WindowOpenDisposition::NEW_FOREGROUND_TAB
+        | WindowOpenDisposition::NEW_POPUP
+        | WindowOpenDisposition::NEW_WINDOW => Some(false),
+        _ => None,
+    }
+}
+
 /// Classify a key event forwarded from the CEF web view.
 ///
 /// Native child views do not deliver key events to the winit parent, so the
@@ -277,6 +302,28 @@ fn browser_shortcut_from_char(
     }
 }
 
+fn handle_pre_key_event(
+    tab_id: u64,
+    event_sender: &Sender<BrowserEvent>,
+    event: Option<&KeyEvent>,
+) -> i32 {
+    let Some(event) = event else {
+        return 0;
+    };
+    let is_key_down =
+        event.type_ == KeyEventType::KEYDOWN || event.type_ == KeyEventType::RAWKEYDOWN;
+    let shortcut = browser_shortcut(is_key_down, event.windows_key_code, event.modifiers)
+        .or_else(|| {
+            browser_shortcut_from_char(is_key_down, event.unmodified_character, event.modifiers)
+        })
+        .or_else(|| browser_shortcut_from_char(is_key_down, event.character, event.modifiers));
+    if let Some(shortcut) = shortcut {
+        let _ = event_sender.send(BrowserEvent::BrowserShortcut { tab_id, shortcut });
+        return 1;
+    }
+    0
+}
+
 wrap_keyboard_handler! {
     pub struct TabKeyboardHandler {
         tab_id: u64,
@@ -284,6 +331,7 @@ wrap_keyboard_handler! {
     }
 
     impl KeyboardHandler {
+        #[cfg(target_os = "macos")]
         fn on_pre_key_event(
             &self,
             _browser: Option<&mut Browser>,
@@ -291,33 +339,29 @@ wrap_keyboard_handler! {
             _os_event: *mut u8,
             _is_keyboard_shortcut: Option<&mut ::std::os::raw::c_int>,
         ) -> i32 {
-            if let Some(event) = event {
-                let is_key_down = event.type_ == KeyEventType::KEYDOWN
-                    || event.type_ == KeyEventType::RAWKEYDOWN;
-                let shortcut = browser_shortcut(is_key_down, event.windows_key_code, event.modifiers)
-                    .or_else(|| {
-                        browser_shortcut_from_char(
-                            is_key_down,
-                            event.unmodified_character,
-                            event.modifiers,
-                        )
-                    })
-                    .or_else(|| {
-                        browser_shortcut_from_char(
-                            is_key_down,
-                            event.character,
-                            event.modifiers,
-                        )
-                    });
-                if let Some(shortcut) = shortcut {
-                    let _ = self.event_sender.send(BrowserEvent::BrowserShortcut {
-                        tab_id: self.tab_id,
-                        shortcut,
-                    });
-                    return 1;
-                }
-            }
-            0
+            handle_pre_key_event(self.tab_id, &self.event_sender, event)
+        }
+
+        #[cfg(windows)]
+        fn on_pre_key_event(
+            &self,
+            _browser: Option<&mut Browser>,
+            event: Option<&KeyEvent>,
+            _os_event: Option<&mut cef::sys::MSG>,
+            _is_keyboard_shortcut: Option<&mut ::std::os::raw::c_int>,
+        ) -> i32 {
+            handle_pre_key_event(self.tab_id, &self.event_sender, event)
+        }
+
+        #[cfg(target_os = "linux")]
+        fn on_pre_key_event(
+            &self,
+            _browser: Option<&mut Browser>,
+            event: Option<&KeyEvent>,
+            _os_event: Option<&mut cef::sys::XEvent>,
+            _is_keyboard_shortcut: Option<&mut ::std::os::raw::c_int>,
+        ) -> i32 {
+            handle_pre_key_event(self.tab_id, &self.event_sender, event)
         }
     }
 }
@@ -422,8 +466,53 @@ pub fn create_tab_client(
 
 #[cfg(test)]
 mod tests {
-    use super::{browser_shortcut, browser_shortcut_from_char};
+    use super::new_tab_disposition;
+    use super::{browser_shortcut, browser_shortcut_from_char, is_internal_view_url};
     use crate::events::BrowserShortcut;
+    use cef::WindowOpenDisposition;
+
+    #[test]
+    fn middle_click_disposition_opens_a_background_tab() {
+        assert_eq!(
+            new_tab_disposition(WindowOpenDisposition::NEW_BACKGROUND_TAB),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn explicit_new_window_dispositions_open_foreground_tabs() {
+        for disposition in [
+            WindowOpenDisposition::NEW_FOREGROUND_TAB,
+            WindowOpenDisposition::NEW_POPUP,
+            WindowOpenDisposition::NEW_WINDOW,
+        ] {
+            assert_eq!(new_tab_disposition(disposition), Some(false));
+        }
+    }
+
+    #[test]
+    fn ordinary_navigations_stay_in_the_source_tab() {
+        for disposition in [
+            WindowOpenDisposition::UNKNOWN,
+            WindowOpenDisposition::CURRENT_TAB,
+            WindowOpenDisposition::SINGLETON_TAB,
+            WindowOpenDisposition::SWITCH_TO_TAB,
+        ] {
+            assert_eq!(new_tab_disposition(disposition), None);
+        }
+    }
+
+    #[test]
+    fn chromium_tool_views_are_not_routed_to_kasumi_tabs() {
+        for url in [
+            "devtools://devtools/bundled/inspector.html",
+            "chrome-devtools://devtools/bundled/inspector.html",
+            "view-source:https://example.com/",
+        ] {
+            assert!(is_internal_view_url(url), "{url} should stay in CEF");
+        }
+        assert!(!is_internal_view_url("https://example.com/"));
+    }
 
     #[test]
     fn web_view_forwards_all_shell_shortcuts() {

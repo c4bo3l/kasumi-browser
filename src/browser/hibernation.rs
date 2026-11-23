@@ -206,6 +206,24 @@ pub fn next_navigation_retry_delay(attempt: usize) -> Option<Duration> {
     INITIAL_NAVIGATION_RETRY_DELAYS.get(attempt).copied()
 }
 
+/// Why a browser spawn was queued. Active-only spawns come from focusing a tab;
+/// background spawns come from middle-clicking a link and must load even while
+/// another tab owns the visible child view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserSpawnMode {
+    ActiveOnly,
+    Background,
+}
+
+impl BrowserSpawnMode {
+    fn allows(self, is_active: bool) -> bool {
+        match self {
+            Self::ActiveOnly => is_active,
+            Self::Background => true,
+        }
+    }
+}
+
 /// Pure hibernation decision used by the watchdog. The active tab is never
 /// eligible, and only idle background tabs past the timeout are hibernated.
 pub fn should_hibernate_tab(
@@ -299,7 +317,7 @@ pub struct TabManager {
     // external message pump re-enters the run loop on macOS, so creating a
     // browser directly from a key/redraw event can intermittently lose the
     // initial navigation. `tick()` drains this queue from `about_to_wait`.
-    pending_browser_spawns: VecDeque<(u64, String)>,
+    pending_browser_spawns: VecDeque<(u64, String, BrowserSpawnMode)>,
 
     // Retry state for browsers that have not committed their initial URL.
     pending_navigation_checks: HashMap<u64, PendingNavigationCheck>,
@@ -506,6 +524,21 @@ impl TabManager {
         self.insert_tab(url, None, None, make_active, false)
     }
 
+    /// Open a link in a background tab and start loading it immediately.
+    /// Unlike restored tabs, the browser is live; unlike the active tab, its
+    /// native child view stays hidden until the user selects it.
+    pub fn create_background_tab(&mut self, url: String) -> u64 {
+        let id = self.insert_tab(Some(url.clone()), None, None, false, false);
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            tab.state = TabState::Background {
+                since: Instant::now(),
+            };
+        }
+        self.queue_browser_spawn(id, url, BrowserSpawnMode::Background);
+        self.sync_session();
+        id
+    }
+
     /// Insert a tab with an optional restored title, position, and pin state.
     fn insert_tab(
         &mut self,
@@ -578,9 +611,9 @@ impl TabManager {
                 if let Some(ref browser) = old_tab.browser {
                     if let Some(host) = browser.host() {
                         let view_handle = host.window_handle();
-                        if !view_handle.is_null() {
-                            if let Err(e) = unsafe { platform_view::hide_view(view_handle.cast()) }
-                            {
+                        if !platform_view::cef_handle_is_null(view_handle) {
+                            let view_ptr = platform_view::cef_handle_as_ptr(view_handle);
+                            if let Err(e) = unsafe { platform_view::hide_view(view_ptr) } {
                                 tracing::warn!("Could not hide old tab view: {e}");
                             }
                         }
@@ -610,7 +643,7 @@ impl TabManager {
             // Wake or spawn CEF browser instance. The actual CEF call is
             // deferred to `tick()` so it never runs inside a winit window
             // event callback (see `pending_browser_spawns`).
-            self.queue_browser_spawn(id, target_url);
+            self.queue_browser_spawn(id, target_url, BrowserSpawnMode::ActiveOnly);
         } else {
             // Browser already running — make its view visible and resized
             self.show_active_tab_view();
@@ -712,23 +745,25 @@ impl TabManager {
     }
 
     /// Queue a browser creation request for the next `about_to_wait` tick.
-    fn queue_browser_spawn(&mut self, tab_id: u64, url: String) {
+    fn queue_browser_spawn(&mut self, tab_id: u64, url: String, mode: BrowserSpawnMode) {
         if self
             .pending_browser_spawns
             .iter()
-            .any(|(id, _)| *id == tab_id)
+            .any(|(id, _, _)| *id == tab_id)
         {
             return;
         }
-        tracing::info!("Queued browser spawn for tab {tab_id} ({url})");
-        self.pending_browser_spawns.push_back((tab_id, url));
+        tracing::info!("Queued {mode:?} browser spawn for tab {tab_id} ({url})");
+        self.pending_browser_spawns.push_back((tab_id, url, mode));
     }
 
     /// Create queued browsers on the UI thread, outside winit window events.
     fn drain_browser_spawns(&mut self) {
-        while let Some((tab_id, url)) = self.pending_browser_spawns.pop_front() {
+        while let Some((tab_id, url, mode)) = self.pending_browser_spawns.pop_front() {
             let still_needed = self.tabs.iter().any(|tab| {
-                tab.id == tab_id && tab.browser.is_none() && Some(tab_id) == self.active_tab_id
+                tab.id == tab_id
+                    && tab.browser.is_none()
+                    && mode.allows(Some(tab_id) == self.active_tab_id)
             });
             if !still_needed {
                 tracing::info!("Skipping stale browser spawn for tab {tab_id}");
@@ -743,7 +778,7 @@ impl TabManager {
                     attempt: 0,
                 },
             );
-            self.spawn_browser(tab_id, &url);
+            self.spawn_browser(tab_id, &url, mode == BrowserSpawnMode::Background);
         }
     }
 
@@ -805,24 +840,45 @@ impl TabManager {
         }
     }
 
-    /// Spawns a CEF browser for a specific tab ID.
-    fn spawn_browser(&self, tab_id: u64, url: &str) {
+    /// Spawns a CEF browser for a specific tab ID. `hidden` keeps a
+    /// middle-clicked background tab from flashing over the active page.
+    fn spawn_browser(&self, tab_id: u64, url: &str, hidden: bool) {
         let mut client = client::create_tab_client(
             tab_id,
             self.event_sender.clone(),
             self.adblock_engine.clone(),
             Arc::clone(&self.adblock_enabled),
         );
-        let mut window_info = cef::WindowInfo::default();
-
-        window_info.windowless_rendering_enabled = 0;
-        window_info.parent_view = self.parent_window_view;
-        window_info.bounds = cef::Rect {
+        let bounds = cef::Rect {
             x: self.content_rect.x as i32,
             y: self.content_rect.y as i32,
             width: self.content_rect.width as i32,
             height: self.content_rect.height as i32,
         };
+        // CEF exposes different parent fields and handle types per platform.
+        // `set_as_child` writes `parent_window` on Windows/Linux and
+        // `parent_view` on macOS; Linux uses an XID instead of a pointer.
+        let parent_handle = platform_view::ptr_as_cef_handle(self.parent_window_view);
+        let mut window_info = cef::WindowInfo::default().set_as_child(parent_handle, &bounds);
+        window_info.windowless_rendering_enabled = 0;
+
+        #[cfg(target_os = "macos")]
+        {
+            window_info.hidden = if hidden { 1 } else { 0 };
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if hidden {
+                use windows_sys::Win32::UI::WindowsAndMessaging::WS_VISIBLE;
+                window_info.style &= !WS_VISIBLE;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // CEF's Linux WindowInfo has no hidden flag. The BrowserCreated
+            // handler unmaps the X11 child before it can become visible.
+            let _ = hidden;
+        }
 
         let cef_url = cef::CefString::from(url);
         let browser_settings = cef::BrowserSettings::default();
@@ -872,8 +928,12 @@ impl TabManager {
         }
     }
 
-    /// Show DevTools once per browser. Repeated F12 presses focus the existing
-    /// window instead of creating a new one.
+    /// Open or focus DevTools for a tab.
+    ///
+    /// CEF focuses an existing DevTools window when `show_dev_tools` is called
+    /// again, so the `has_dev_tools` result is only used for logging. Returning
+    /// early when it is true leaves a resized/reordered DevTools window stuck
+    /// behind the main window with no way to bring it forward.
     fn show_dev_tools(&self, tab_id: u64) {
         let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
             return;
@@ -882,10 +942,7 @@ impl TabManager {
             return;
         };
 
-        if host.has_dev_tools() != 0 {
-            return;
-        }
-
+        let was_open = host.has_dev_tools() != 0;
         let mut window_info = cef::WindowInfo::default();
         window_info.windowless_rendering_enabled = 0;
         window_info.bounds = cef::Rect {
@@ -895,6 +952,11 @@ impl TabManager {
             height: 720,
         };
         host.show_dev_tools(Some(&window_info), None, None, None);
+        tracing::info!(
+            "{} DevTools for tab {}",
+            if was_open { "Focused" } else { "Opened" },
+            tab_id
+        );
     }
 
     /// Position and show the active tab's native view.
@@ -909,15 +971,12 @@ impl TabManager {
             return;
         };
         let view_handle = host.window_handle();
-        if view_handle.is_null() || self.parent_window_view.is_null() {
+        if platform_view::cef_handle_is_null(view_handle) || self.parent_window_view.is_null() {
             return;
         }
+        let view_ptr = platform_view::cef_handle_as_ptr(view_handle);
         if let Err(e) = unsafe {
-            platform_view::show_view(
-                self.parent_window_view.cast(),
-                view_handle.cast(),
-                self.content_rect,
-            )
+            platform_view::show_view(self.parent_window_view.cast(), view_ptr, self.content_rect)
         } {
             tracing::warn!("Could not show active tab view: {e}");
         }
@@ -935,11 +994,11 @@ impl TabManager {
             return;
         };
         let view_handle = host.window_handle();
-        if view_handle.is_null() {
+        if platform_view::cef_handle_is_null(view_handle) {
             return;
         }
-        if let Err(e) = unsafe { platform_view::resize_view(view_handle.cast(), self.content_rect) }
-        {
+        let view_ptr = platform_view::cef_handle_as_ptr(view_handle);
+        if let Err(e) = unsafe { platform_view::resize_view(view_ptr, self.content_rect) } {
             tracing::warn!("Could not resize active tab view: {e}");
         }
     }
@@ -969,6 +1028,24 @@ impl TabManager {
                 }
                 if self.active_tab_id == Some(tab_id) {
                     self.show_active_tab_view();
+                } else {
+                    // A middle-clicked tab loads in the background. Hide its
+                    // native view until `focus_tab` makes it active.
+                    let view_handle = self
+                        .tabs
+                        .iter()
+                        .find(|t| t.id == tab_id)
+                        .and_then(|tab| tab.browser.as_ref())
+                        .and_then(|browser| browser.host())
+                        .map(|host| host.window_handle());
+                    if let Some(view_handle) = view_handle {
+                        if !platform_view::cef_handle_is_null(view_handle) {
+                            let view_ptr = platform_view::cef_handle_as_ptr(view_handle);
+                            if let Err(e) = unsafe { platform_view::hide_view(view_ptr) } {
+                                tracing::warn!("Could not hide background tab view: {e}");
+                            }
+                        }
+                    }
                 }
                 if let Some(urls) = self.pending_favicon_urls.remove(&tab_id) {
                     if !urls.is_empty() {
@@ -1168,6 +1245,16 @@ impl TabManager {
             }
             BrowserEvent::NewWindow { url } => {
                 self.create_tab(Some(url), true);
+            }
+            BrowserEvent::OpenUrlFromTab { url, background } => {
+                if url.is_empty() {
+                    return;
+                }
+                if background {
+                    self.create_background_tab(url);
+                } else {
+                    self.create_tab(Some(url), true);
+                }
             }
         }
     }
@@ -1414,10 +1501,19 @@ mod tests {
         closed_tab_from, fallback_favicon_url, idle_timeout_for_pressure, insertion_index,
         is_blank_navigation_url, is_critical_pressure, needs_initial_navigation,
         next_navigation_retry_delay, pinned_insert_index, preferred_favicon_url, ram_pressure,
-        restore_insert_index, should_hibernate_tab, should_sync_omnibox, Tab, TabState,
+        restore_insert_index, should_hibernate_tab, should_sync_omnibox, BrowserSpawnMode, Tab,
+        TabState,
     };
     use crate::config::{TAB_IDLE_TIMEOUT_NORMAL, TAB_IDLE_TIMEOUT_PRESSURE};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn background_browser_spawns_run_while_another_tab_is_active() {
+        assert!(BrowserSpawnMode::Background.allows(false));
+        assert!(BrowserSpawnMode::Background.allows(true));
+        assert!(!BrowserSpawnMode::ActiveOnly.allows(false));
+        assert!(BrowserSpawnMode::ActiveOnly.allows(true));
+    }
 
     #[test]
     fn ram_pressure_handles_normal_and_zero_total_memory() {

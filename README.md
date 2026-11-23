@@ -14,7 +14,7 @@ Release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ## ✅ What Has Been Done
 
-Current version: **0.5.0**. A version bump is released when a PR is merged into `main`; PRs include the bump in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, `README.md`, `RELEASE_NOTES.md`, and `Cargo.lock` so CI checks the exact release state, as required by `AGENTS.md`.
+Current version: **0.5.1**. A version bump is released when a PR is merged into `main`; PRs include the bump in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, `README.md`, `RELEASE_NOTES.md`, and `Cargo.lock` so CI checks the exact release state, as required by `AGENTS.md`.
 
 - Renamed the project from LiteBrowser to **Kasumi Browser** everywhere: package, binary, CEF helper, bundle ID, window title, database path, and docs.
 - Implemented the CEF subprocess fork trap and `mimalloc` global allocator.
@@ -46,8 +46,10 @@ Current version: **0.5.0**. A version bump is released when a PR is merged into 
 - The selected search provider now also controls the new-tab landing page, and the command palette replaces the seeded active URL when you start typing, so changing to Google/Bing does not leave DuckDuckGo in the search or new-tab path. The palette now offers explicit **Search in this tab** and **Search in a new tab** choices for queries (and **Open in this tab** / **Open in a new tab** for addresses), with those actions listed before tab matches.
 - Loading tabs now show an animated native spinner in the favicon slot instead of a static favicon; the spinner disappears as soon as the page finishes loading.
 - Fixed the original chrome UX/navigation feedback items: Back/Forward icon states, omnibox URL synchronization, F12 DevTools, view-source navigation, favicons, and hover tooltips.
-- Added 96 unit tests covering omnibox resolution, search-provider selection and homepages, rail/palette/menu/settings geometry and state, explicit this-tab/new-tab palette actions, pinned-tab ordering and menu/palette commands, loading-spinner rotation geometry, context-menu actions, closed-tab metadata, initial-navigation recovery, tooltip pointer-exit handling, collapsed-only tooltip behavior, web-view shortcut forwarding (including UTF-16 character fallback), the macOS NSEvent shortcut monitor, secondary-display overlay positioning, deferred palette text selection, light/dark palette contrast and theme override, hibernation thresholds, adblock mapping, preference persistence, storage (including legacy session migration), and CEF switch invariants.
-- Verified with `cargo fmt --all -- --check`, `cargo check --bins`, `cargo test --bin kasumi-browser` (96 tests), and `cargo build --release`. Interactive macOS verification is performed before each release push.
+- Fixed DevTools refocusing after a window resize: the DevTools menu/F12 now calls `show_dev_tools` even when CEF reports an existing DevTools browser, which brings the existing window forward instead of doing nothing.
+- Fixed middle-click and Ctrl+click link activation: CEF now cancels the source-tab navigation and opens a real Kasumi tab, with middle-click loading in the background and Ctrl+click in the foreground. Background tabs use CEF's cross-platform parent-window setup: macOS starts the `NSView` hidden, Windows clears `WS_VISIBLE`, and Linux unmaps the X11 child as soon as it is created. CEF window handles now convert between pointer and XID forms through one helper on every platform.
+- Added 103 unit tests covering omnibox resolution, search-provider selection and homepages, rail/palette/menu/settings geometry and state, explicit this-tab/new-tab palette actions, pinned-tab ordering and menu/palette commands, loading-spinner rotation geometry, context-menu actions, middle-click/Ctrl+click tab disposition mapping, closed-tab metadata, initial-navigation recovery, tooltip pointer-exit handling, collapsed-only tooltip behavior, web-view shortcut forwarding (including UTF-16 character fallback), the macOS NSEvent shortcut monitor, secondary-display overlay positioning, deferred palette text selection, light/dark palette contrast and theme override, hibernation thresholds and background-spawn rules, adblock mapping, preference persistence, storage (including legacy session migration), and CEF switch invariants.
+- Verified with `cargo fmt --all -- --check`, `cargo check --bins`, `cargo test --bin kasumi-browser` (103 tests), and `cargo build --release`. PR CI now runs the same checks and unit tests on macOS 15 Intel, Windows, and Linux; interactive macOS verification is performed before each release push.
 - Removed the obsolete `BUGFIX_TASKS.md` handoff; its completed items are recorded in `RELEASE_NOTES.md`.
 
 ---
@@ -289,6 +291,7 @@ sha256sum kasumi-browser.tar.gz > kasumi-browser.tar.gz.sha256
 - **More integration tests:** unit coverage is in place for omnibox resolution, rail/palette/menu/settings state, closed-tab restoration metadata, tooltips, hibernation thresholds, adblock mapping, preference persistence, storage, and CEF switches; automated end-to-end browser tests are still future work.
 - **Packaged-app verification:** macOS, Windows, and Linux release artifacts still need interactive testing after signing/bundling.
 - **Release CI and signed artifact publishing:** extend the existing PR checks to signed release builds and published artifacts.
+- **Auto-update via GitHub Releases:** check the latest published release, download and verify the signed platform artifact, and install it from a native update prompt with a fallback to the releases page.
 
 ---
 
