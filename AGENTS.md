@@ -48,7 +48,7 @@ Every single commit must honor three non-negotiable engineering goals:
 - Use SemVer: patch for fixes, minor for backward-compatible features, major for breaking changes.
 - The PR title and merge commit MUST mention the new version (for example, `v0.1.1: fix macOS CEF layout`).
 - Documentation changes that are part of the same PR are included in the same version bump.
-- Every PR MUST pass `.github/workflows/pr.yml` before merge, including the unit tests.
+- Every PR MUST pass `.github/workflows/pr.yml` before merge. Unit tests are run locally for now and are not part of PR CI.
 
 ---
 

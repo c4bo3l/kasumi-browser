@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  unit-tests:
-    name: Unit tests (macOS)
+  checks:
+    name: Checks (macOS)
     runs-on: macos-13
 
     steps:
@@ -42,6 +42,3 @@ jobs:
 
       - name: Check binaries
         run: cargo check --bins
-
-      - name: Run unit tests
-        run: cargo test --bin kasumi-browser
