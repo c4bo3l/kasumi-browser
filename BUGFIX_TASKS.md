@@ -1,6 +1,6 @@
 # Kasumi Browser — UI / Navigation Bugfix Handoff
 
-**Version:** v0.1.4  
+**Version:** v0.1.5  
 **Date:** 2026-11-23  
 **Status:** Documentation-only batch. No runtime fixes are implemented yet; this file is the handoff for the next agent.
 
@@ -57,6 +57,48 @@ Treat this together with the tooltip task:
 - Hovering each toolbar button shows a plain-language tooltip.
 - A new user can identify Back, Forward, Reload/Stop, and Hibernate without reading source.
 - Disabled Back/Forward buttons still show their tooltip when hovered.
+
+---
+
+## 1a. Back and Forward buttons show no icon
+
+### Reported symptom
+
+The two navigation buttons before Reload appear blank; the expected `←` / `→` icons are not visible.
+
+### Current code
+
+`src/ui/chrome.rs` renders the controls as Unicode glyphs inside frameless buttons:
+
+- Back: `RichText::new("←").size(16.0)` inside `Button::new(...).stroke(Stroke::NONE)`
+- Forward: `RichText::new("→").size(16.0)` inside the same frameless style
+
+The buttons are wrapped in `ui.add_enabled(can_back, ...)` / `ui.add_enabled(can_fwd, ...)`, where the enabled flags come from `BrowserEvent::LoadingStateChange`.
+
+### Likely causes
+
+1. The bundled `egui` font atlas may not contain the Unicode arrow glyphs at the requested style/size, so the text paints nothing.
+2. `Stroke::NONE` removes the button frame, leaving no fallback shape if the glyph is missing.
+3. `add_enabled(false)` dims the glyph heavily; if `can_go_back` / `can_go_forward` are not being set correctly, the buttons look empty rather than disabled.
+4. Glyph rendering can vary between platforms because no explicit font family is configured.
+
+### Fix
+
+Make the icons independent of font glyph availability:
+
+- Preferred: draw the arrow shapes directly with `egui::Painter` inside a sized clickable area (a short horizontal line plus two diagonal head lines for each direction), using `ui.painter().line_segment(...)`.
+- Alternative: generate a tiny `ColorImage` / `TextureHandle` arrow icon once and render it with `egui::Image`. This stays fully native and adds no font dependency.
+- Keep hit areas at least `24×24` logical points even if the drawn icon is smaller.
+- Restore a subtle button frame or background on hover so an icon failure never looks like empty space.
+- Verify `LoadingStateChange` is arriving by logging or inspecting `TabInfo.can_go_back` / `can_go_forward`; disabled state should be visually distinct but still show the arrow.
+- Do not rely on emoji arrows. Keep tooltips from task 1 so meaning is clear even if an icon is unavailable.
+
+### Acceptance criteria
+
+- Back and Forward icons are visibly rendered on macOS, Windows, and Linux.
+- Enabled and disabled states are visually distinct; disabled arrows are dimmed, not invisible.
+- Icons do not disappear at 1x or 2x DPI.
+- No new font file or WebUI dependency is introduced.
 
 ---
 
@@ -325,11 +367,12 @@ End-to-end implementation plan:
 ## Suggested implementation order
 
 1. Omnibox URL sync (highest user impact, isolated state bug).
-2. Tooltips + toolbar button explanation.
-3. Tab strip visual polish (and favicon slot placeholder).
-4. Favicon pipeline (touches events, clients, state, renderer).
-5. F12 DevTools handler.
-6. View-source context menu handling.
+2. Back/Forward icon rendering (small, isolated `ChromeRenderer` fix).
+3. Tooltips + toolbar button explanation.
+4. Tab strip visual polish (and favicon slot placeholder).
+5. Favicon pipeline (touches events, clients, state, renderer).
+6. F12 DevTools handler.
+7. View-source context menu handling.
 
 After each item, run the verification commands below. Do not combine unrelated fixes into one batch.
 
@@ -351,7 +394,7 @@ cargo run --bin kasumi-browser
 ```
 
 - Navigate with omnibox, then click an in-page link; omnibox updates.
-- Use Back/Forward; omnibox and enabled state update.
+- Use Back/Forward; icons are visible, omnibox and enabled state update.
 - Hover every chrome control; tooltips appear.
 - Switch tabs; each tab shows correct title, URL, favicon, and state badge.
 - Press F12 with focus in the page and with focus in the omnibox.
@@ -370,7 +413,7 @@ open target/bundle/KasumiBrowser.app
 
 ## Versioning for the next batch
 
-The next agent should start by bumping to **v0.1.5** (this handoff batch is v0.1.4):
+The next agent should start by bumping to **v0.1.6** (this handoff batch is v0.1.5):
 
 - `Cargo.toml`
 - `src/bin/bundle.rs`
@@ -382,7 +425,7 @@ The next agent should start by bumping to **v0.1.5** (this handoff batch is v0.1
 Suggested commit message:
 
 ```text
-v0.1.5: fix chrome UX and navigation feedback
+v0.1.6: fix chrome UX and navigation feedback
 ```
 
 Publish with:

@@ -4,6 +4,23 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
+## v0.1.5 — 2026-11-23
+
+### Added
+
+- Added the missing Back/Forward icon rendering bug to `BUGFIX_TASKS.md`, including likely font-glyph/disabled-state causes and a native `egui::Painter` / `ColorImage` fix path.
+- Updated the handoff implementation order and manual verification checklist to cover visible navigation icons.
+
+### Changed
+
+- Bumped the project and macOS bundle version from `0.1.4` to `0.1.5`.
+
+### Notes
+
+- This is a documentation-only batch. The runtime fixes are still deferred to the next versioned batch.
+
+---
+
 ## v0.1.4 — 2026-11-23
 
 ### Added
