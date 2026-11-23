@@ -14,7 +14,7 @@ Release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ## ✅ What Has Been Done
 
-Current version: **0.5.1**. A version bump is released when a PR is merged into `main`; PRs include the bump in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, `README.md`, `RELEASE_NOTES.md`, and `Cargo.lock` so CI checks the exact release state, as required by `AGENTS.md`.
+Current version: **0.5.2**. A version bump is released when a PR is merged into `main`; PRs include the bump in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, `README.md`, `RELEASE_NOTES.md`, and `Cargo.lock` so CI checks the exact release state, as required by `AGENTS.md`.
 
 - Renamed the project from LiteBrowser to **Kasumi Browser** everywhere: package, binary, CEF helper, bundle ID, window title, database path, and docs.
 - Implemented the CEF subprocess fork trap and `mimalloc` global allocator.
@@ -292,6 +292,38 @@ sha256sum kasumi-browser.tar.gz > kasumi-browser.tar.gz.sha256
 - **Packaged-app verification:** macOS, Windows, and Linux release artifacts still need interactive testing after signing/bundling.
 - **Release CI and signed artifact publishing:** extend the existing PR checks to signed release builds and published artifacts.
 - **Auto-update via GitHub Releases:** check the latest published release, download and verify the signed platform artifact, and install it from a native update prompt with a fallback to the releases page.
+- **Google Meet / WebRTC calls:** bridge CEF permission callbacks into the native egui chrome, add screen-share source selection, and handle macOS camera/microphone entitlements.
+- **Tiny local AI:** explore a sub-0.4B on-device model for omnibox intent routing, tab grouping, and short structured extraction without sending page data to the cloud.
+- **Automated CEF/Chromium engine updates:** add a scheduled check that opens a review PR when a newer `cef` crate is published, instead of silently swapping the engine at runtime.
+
+### Google Meet / WebRTC calls — research notes
+
+- **Permission bridge:** CEF permission callbacks are async and reference-counted. The CEF handler should send an event containing the callback handle over the existing lock-free `crossbeam_channel` to the main UI thread; the main thread parks it in `BrowserUiState`, egui renders a next-frame prompt, and Allow/Deny resolves the callback exactly once. Do not lock a `std::sync::Mutex` from a CEF callback, and call `egui_ctx.request_repaint()` so the prompt appears immediately even when the pointer is idle.
+- **Media access (`getUserMedia`):** Google Meet requests microphone/camera through the media-access permission callback. Decode the requested bitmask (`audio = 1 << 0`, `video = 1 << 1`) into a human-readable description, then grant with the exact requested mask or cancel.
+- **Site permissions:** notification/clipboard prompts arrive through the permission-prompt callback and should use the same pending-request state machine with Accept/Deny results.
+- **Screen sharing (`getDisplayMedia`):** Kasumi uses native child views, not OSR, which avoids the common picker-parenting failure. The Alloy runtime is still the default in current CEF builds; enabling the Chrome runtime may provide Chromium's native desktop-media picker where supported. Otherwise, enumerate monitors/windows (for example with `xcap`) and render an egui picker grid, or use `--auto-select-desktop-capture-source="Entire screen"` for kiosk/testing builds.
+- **Platform gotchas:** macOS bundles need `NSMicrophoneUsageDescription` and `NSCameraUsageDescription` in `Info.plist`, plus `com.apple.security.device.audio-input` and `com.apple.security.device.camera` entitlements. Persist `(origin, permission mask)` decisions in SQLite so known origins can be auto-resolved without showing the modal on every restart.
+
+### Tiny local AI — research notes
+
+- **Use cases:** omnibox intent routing (`search` / `command` / `url`), tab categorization, and short JSON extraction. Keep inference on an idle background worker, load the model on demand, and unload it after inactivity so the sub-20 MB shell target is preserved.
+- **Candidate models:**
+
+  | Model | Params | `Q8_0` GGUF | Best for | Caveat |
+  | --- | --- | --- | --- | --- |
+  | `LFM2.5-230M` | 230M | ~245 MB | Structured routing, JSON/schema extraction, tab grouping | Newer architecture; confirm `llm2` support in the chosen `llama.cpp` build |
+  | `Gemma-3-270M-it` | 270M | ~285 MB | Multilingual titles, short text cleanup | Large vocabulary; give 2–3 few-shot examples for strict JSON |
+  | `SmolLM2-360M-Instruct` | 360M | ~385 MB | Broad backend compatibility, fast CPU inference | Larger RAM footprint; prefer 360M over 135M for classification |
+
+- **Inference tips:** prefer `Q8_0` at this scale because 4-bit quant saves little RAM but degrades structured output; use GBNF grammar-constrained sampling so output is valid JSON or an enum label; cap `n_ctx` at 2048 tokens to keep the KV cache under ~15 MB.
+
+### CEF / Chromium engine updates — proposed process
+
+- Keep the `cef` crate pinned in `Cargo.toml` and the canonical `AGENTS.md` snippet. The matching CEF binaries are fetched from that version, so a crate bump is the engine upgrade.
+- Add a scheduled workflow (weekly plus manual `workflow_dispatch`) that queries crates.io for the newest stable `cef` release. When one exists, open a PR that bumps the crate, lockfile, canonical docs, and app version through one shared bump script.
+- Let Dependabot/Renovate handle ordinary Rust crates, but exclude `cef` from auto-merge: generated FFI signatures and OS-event types change between Chromium milestones, so engine bumps need human review.
+- Gate engine PRs on the full macOS/Windows/Linux CI matrix plus a runtime smoke test (page load, WebGL/WASM, and a media-permission prompt). Label them `cef-update` and record the exact CEF/Chromium version in the release notes for rollback.
+- Ship engine upgrades through signed GitHub Releases artifacts and the auto-update path, not by replacing CEF binaries inside an already installed app.
 
 ---
 
