@@ -8,11 +8,11 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cef::{ImplBrowser, ImplBrowserHost, ImplFrame};
+use cef::{CefString, ImplBrowser, ImplBrowserHost, ImplFrame};
 use crossbeam_channel::{Receiver, Sender};
 use sysinfo::{ProcessesToUpdate, System};
 
@@ -23,7 +23,7 @@ use crate::config::{
     RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_NORMAL, TAB_IDLE_TIMEOUT_PRESSURE,
     TAB_WATCHDOG_TICK_INTERVAL,
 };
-use crate::events::{BrowserEvent, UiAction};
+use crate::events::{BrowserEvent, BrowserShortcut, UiAction};
 use crate::storage::db::{SessionTabSnapshot, StorageHandle};
 use crate::ui::chrome::{ChromeState, Favicon, TabDisplayState, TabInfo};
 use crate::ui::platform_view::{self, ContentRect};
@@ -122,6 +122,64 @@ pub enum TabState {
     Hibernated,
 }
 
+/// Metadata preserved when a tab is closed so `Cmd/Ctrl+Z` can undo the close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedTab {
+    pub url: String,
+    pub title: String,
+    /// Position the tab occupied before it was closed.
+    pub index: usize,
+}
+
+/// Clamp a restored tab's original position to the current tab count.
+pub fn restore_insert_index(original_index: usize, tab_count: usize) -> usize {
+    original_index.min(tab_count)
+}
+
+/// Capture the metadata needed to undo a tab close. Keeping this pure makes
+/// the closed-tab stack's title and index behavior testable without CEF.
+pub fn closed_tab_from(tab: &Tab, index: usize) -> ClosedTab {
+    ClosedTab {
+        url: tab.url.clone(),
+        title: tab.title.clone(),
+        index,
+    }
+}
+
+/// CEF occasionally reports `about:blank` in `OnAfterCreated` before the
+/// initial navigation commits. Reissuing the load in that case prevents a
+/// newly spawned or restored browser from staying on an empty document.
+pub fn is_blank_navigation_url(url: &str) -> bool {
+    let url = url.trim();
+    url.is_empty() || url.eq_ignore_ascii_case("about:blank")
+}
+
+pub fn needs_initial_navigation(current_url: &str, target_url: &str) -> bool {
+    !is_blank_navigation_url(target_url) && is_blank_navigation_url(current_url)
+}
+
+/// Grace periods for CEF's own initial navigation before a blank frame is
+/// retried. The first is short enough to feel instantaneous; later attempts
+/// cover CEF dropping a retry while its render frame is still initializing.
+const INITIAL_NAVIGATION_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(750),
+    Duration::from_millis(1_500),
+    Duration::from_millis(3_000),
+];
+
+/// One-shot navigation watchdog state for a freshly spawned browser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingNavigationCheck {
+    pub target_url: String,
+    pub deadline: Instant,
+    pub attempt: usize,
+}
+
+/// Delay before the next blank-frame retry. `None` means all retries are spent.
+pub fn next_navigation_retry_delay(attempt: usize) -> Option<Duration> {
+    INITIAL_NAVIGATION_RETRY_DELAYS.get(attempt).copied()
+}
+
 /// Pure hibernation decision used by the watchdog. The active tab is never
 /// eligible, and only idle background tabs past the timeout are hibernated.
 pub fn should_hibernate_tab(
@@ -195,10 +253,19 @@ pub struct TabManager {
 
     // SQLite persistence worker & closed tab stack
     pub storage: Option<StorageHandle>,
-    pub recently_closed: Vec<String>,
+    pub recently_closed: Vec<ClosedTab>,
 
     // Number of `host.close_browser(1)` calls awaiting an `on_before_close` event.
     pending_browser_closes: u32,
+
+    // Browser creation is deferred out of winit window-event callbacks. CEF's
+    // external message pump re-enters the run loop on macOS, so creating a
+    // browser directly from a key/redraw event can intermittently lose the
+    // initial navigation. `tick()` drains this queue from `about_to_wait`.
+    pending_browser_spawns: VecDeque<(u64, String)>,
+
+    // Retry state for browsers that have not committed their initial URL.
+    pending_navigation_checks: HashMap<u64, PendingNavigationCheck>,
 
     // Set when CEF forwards Cmd/Ctrl+K; consumed by the winit handler.
     command_palette_requested: bool,
@@ -246,6 +313,8 @@ impl TabManager {
             storage,
             recently_closed: Vec::new(),
             pending_browser_closes: 0,
+            pending_browser_spawns: VecDeque::new(),
+            pending_navigation_checks: HashMap::new(),
             command_palette_requested: false,
             requested_favicons: HashSet::new(),
             pending_favicon_urls: HashMap::new(),
@@ -306,12 +375,20 @@ impl TabManager {
         self.sync_session();
     }
 
-    /// Re-open the most recently closed tab (Ctrl+Shift+T).
+    /// Re-open the most recently closed tab in its original position.
+    /// Bound to both `Ctrl/Cmd+Shift+T` and `Ctrl/Cmd+Z`.
     pub fn reopen_closed_tab(&mut self) {
-        if let Some(url) = self.recently_closed.pop() {
-            tracing::info!("Re-opening closed tab: {}", url);
-            self.create_tab(Some(url), true);
-        }
+        let Some(closed) = self.recently_closed.pop() else {
+            return;
+        };
+        let index = restore_insert_index(closed.index, self.tabs.len());
+        tracing::info!("Re-opening closed tab at {}: {}", index, closed.url);
+        self.insert_tab(Some(closed.url), Some(closed.title), Some(index), true);
+    }
+
+    /// Whether there is a closed tab available to restore.
+    pub fn can_reopen_closed_tab(&self) -> bool {
+        !self.recently_closed.is_empty()
     }
 
     /// Generate session snapshot for SQLite persistence.
@@ -359,15 +436,29 @@ impl TabManager {
 
     /// Create a new tab. If `make_active` is true, focuses the new tab immediately.
     pub fn create_tab(&mut self, url: Option<String>, make_active: bool) -> u64 {
+        self.insert_tab(url, None, None, make_active)
+    }
+
+    /// Insert a tab with an optional restored title and position.
+    fn insert_tab(
+        &mut self,
+        url: Option<String>,
+        title: Option<String>,
+        index: Option<usize>,
+        make_active: bool,
+    ) -> u64 {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
 
         let target_url = url.unwrap_or_else(|| DEFAULT_HOME_URL.to_string());
+        let at = index.map_or(self.tabs.len(), |i| {
+            restore_insert_index(i, self.tabs.len())
+        });
 
         let tab = Tab {
             id,
             url: target_url.clone(),
-            title: "New Tab".to_string(),
+            title: title.unwrap_or_else(|| "New Tab".to_string()),
             is_loading: false,
             can_go_back: false,
             can_go_forward: false,
@@ -381,7 +472,7 @@ impl TabManager {
             favicon: None,
         };
 
-        self.tabs.push(tab);
+        self.tabs.insert(at, tab);
 
         if make_active {
             self.focus_tab(id);
@@ -435,8 +526,10 @@ impl TabManager {
         };
 
         if is_hibernated || !has_browser {
-            // Wake or spawn CEF browser instance
-            self.spawn_browser(id, &target_url);
+            // Wake or spawn CEF browser instance. The actual CEF call is
+            // deferred to `tick()` so it never runs inside a winit window
+            // event callback (see `pending_browser_spawns`).
+            self.queue_browser_spawn(id, target_url);
         } else {
             // Browser already running — make its view visible and resized
             self.show_active_tab_view();
@@ -453,7 +546,8 @@ impl TabManager {
         };
 
         let mut tab = self.tabs.remove(index);
-        self.recently_closed.push(tab.url.clone());
+        self.recently_closed.push(closed_tab_from(&tab, index));
+        self.pending_navigation_checks.remove(&id);
         self.requested_favicons.retain(|(tab_id, _)| *tab_id != id);
         self.pending_favicon_urls.remove(&id);
         self.resolved_favicons.remove(&id);
@@ -489,11 +583,17 @@ impl TabManager {
             return;
         }
 
-        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
-            if tab.state == TabState::Hibernated {
-                return;
-            }
+        if self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .is_none_or(|tab| tab.state == TabState::Hibernated)
+        {
+            return;
+        }
 
+        self.pending_navigation_checks.remove(&id);
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tracing::info!("Hibernating tab {} ({})", id, tab.title);
             if let Some(browser) = tab.browser.take() {
                 if let Some(host) = browser.host() {
@@ -528,6 +628,100 @@ impl TabManager {
     pub fn resize(&mut self, rect: ContentRect) {
         self.content_rect = rect;
         self.resize_active_tab_view();
+    }
+
+    /// Queue a browser creation request for the next `about_to_wait` tick.
+    fn queue_browser_spawn(&mut self, tab_id: u64, url: String) {
+        if self
+            .pending_browser_spawns
+            .iter()
+            .any(|(id, _)| *id == tab_id)
+        {
+            return;
+        }
+        tracing::info!("Queued browser spawn for tab {tab_id} ({url})");
+        self.pending_browser_spawns.push_back((tab_id, url));
+    }
+
+    /// Create queued browsers on the UI thread, outside winit window events.
+    fn drain_browser_spawns(&mut self) {
+        while let Some((tab_id, url)) = self.pending_browser_spawns.pop_front() {
+            let still_needed = self.tabs.iter().any(|tab| {
+                tab.id == tab_id && tab.browser.is_none() && Some(tab_id) == self.active_tab_id
+            });
+            if !still_needed {
+                tracing::info!("Skipping stale browser spawn for tab {tab_id}");
+                continue;
+            }
+            self.pending_navigation_checks.insert(
+                tab_id,
+                PendingNavigationCheck {
+                    target_url: url.clone(),
+                    deadline: Instant::now()
+                        + next_navigation_retry_delay(0).unwrap_or(Duration::from_secs(1)),
+                    attempt: 0,
+                },
+            );
+            self.spawn_browser(tab_id, &url);
+        }
+    }
+
+    /// Reissue an initial navigation only when no commit was observed and the
+    /// main frame is still blank. This avoids racing CEF's own navigation.
+    fn retry_blank_initial_navigations(&mut self, now: Instant) {
+        let due: Vec<u64> = self
+            .pending_navigation_checks
+            .iter()
+            .filter_map(|(tab_id, check)| (check.deadline <= now).then_some(*tab_id))
+            .collect();
+
+        for tab_id in due {
+            let Some(check) = self.pending_navigation_checks.remove(&tab_id) else {
+                continue;
+            };
+            let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
+                continue;
+            };
+            if Some(tab_id) != self.active_tab_id {
+                continue;
+            }
+            let Some(frame) = tab
+                .browser
+                .as_ref()
+                .and_then(|browser| browser.main_frame())
+            else {
+                continue;
+            };
+            let current_url = CefString::from(&frame.url()).to_string();
+            if !needs_initial_navigation(&current_url, &check.target_url) {
+                tracing::info!("Initial navigation committed for tab {tab_id}: {current_url}");
+                continue;
+            }
+
+            let target = CefString::from(check.target_url.as_str());
+            frame.load_url(Some(&target));
+            tracing::warn!(
+                "Reissued initial navigation for tab {tab_id} (attempt {}, frame was '{current_url}')",
+                check.attempt + 1
+            );
+
+            let next_attempt = check.attempt + 1;
+            if let Some(delay) = next_navigation_retry_delay(next_attempt) {
+                self.pending_navigation_checks.insert(
+                    tab_id,
+                    PendingNavigationCheck {
+                        target_url: check.target_url,
+                        deadline: now + delay,
+                        attempt: next_attempt,
+                    },
+                );
+            } else {
+                tracing::error!(
+                    "Initial navigation still blank for tab {tab_id} after {} retries",
+                    check.attempt + 1
+                );
+            }
+        }
     }
 
     /// Spawns a CEF browser for a specific tab ID.
@@ -696,19 +890,11 @@ impl TabManager {
                     }
                 }
 
-                // CEF does not always emit on_favicon_urlchange for restored or
-                // cached navigations. Try the conventional site icon immediately.
-                if !self.last_favicon_urls.contains_key(&tab_id) {
-                    let fallback = self
-                        .tabs
-                        .iter()
-                        .find(|t| t.id == tab_id)
-                        .and_then(|t| fallback_favicon_url(&t.url));
-                    if let Some(fallback) = fallback {
-                        self.favicon_preferences.entry(tab_id).or_default();
-                        self.request_favicon_downloads(tab_id, vec![fallback]);
-                    }
-                }
+                // Do not download favicons here. `host.download_image()` can
+                // touch a speculative frame before CEF installs its
+                // URLLoaderFactoryBundle, which intermittently breaks the
+                // initial navigation. `AddressChange` requests the fallback
+                // icon only after a real URL has committed.
             }
             BrowserEvent::TitleChange { tab_id, title } => {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
@@ -720,6 +906,11 @@ impl TabManager {
                 self.sync_session();
             }
             BrowserEvent::AddressChange { tab_id, url } => {
+                let committed_initial = !is_blank_navigation_url(&url)
+                    && self.pending_navigation_checks.remove(&tab_id).is_some();
+                if committed_initial {
+                    tracing::info!("Initial navigation committed for tab {tab_id}: {url}");
+                }
                 let mut fallback = None;
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     if tab.url != url {
@@ -766,6 +957,7 @@ impl TabManager {
                 }
             }
             BrowserEvent::BrowserClosed { tab_id } => {
+                self.pending_navigation_checks.remove(&tab_id);
                 // CEF browser is gone (user tab close, hibernation, or app shutdown).
                 // Never remove the tab metadata here — only release the handle.
                 tracing::info!(
@@ -778,12 +970,23 @@ impl TabManager {
                     tab.browser = None;
                 }
             }
-            BrowserEvent::OpenDevTools { tab_id } => {
-                self.show_dev_tools(tab_id);
-            }
-            BrowserEvent::OpenCommandPalette { .. } => {
-                self.command_palette_requested = true;
-            }
+            BrowserEvent::BrowserShortcut { tab_id, shortcut } => match shortcut {
+                BrowserShortcut::NewTab => {
+                    self.create_tab(None, true);
+                }
+                BrowserShortcut::CloseTab => {
+                    self.close_tab(tab_id);
+                }
+                BrowserShortcut::ReopenClosedTab => {
+                    self.reopen_closed_tab();
+                }
+                BrowserShortcut::OpenCommandPalette => {
+                    self.command_palette_requested = true;
+                }
+                BrowserShortcut::OpenDevTools => {
+                    self.show_dev_tools(tab_id);
+                }
+            },
             BrowserEvent::ViewSource { url, .. } => {
                 if url.is_empty() {
                     return;
@@ -885,8 +1088,44 @@ impl TabManager {
             UiAction::NewTab { url } => {
                 self.create_tab(url, true);
             }
+            UiAction::ReopenClosedTab => {
+                self.reopen_closed_tab();
+            }
             UiAction::CloseTab { tab_id } => {
                 self.close_tab(tab_id);
+            }
+            UiAction::CloseOtherTabs { tab_id } => {
+                let ids: Vec<u64> = self
+                    .tabs
+                    .iter()
+                    .rev()
+                    .filter(|t| t.id != tab_id)
+                    .map(|t| t.id)
+                    .collect();
+                for id in ids {
+                    self.close_tab(id);
+                }
+            }
+            UiAction::CloseTabsToRight { tab_id } => {
+                let Some(index) = self.tabs.iter().position(|t| t.id == tab_id) else {
+                    return;
+                };
+                let ids: Vec<u64> = self.tabs[index + 1..].iter().rev().map(|t| t.id).collect();
+                for id in ids {
+                    self.close_tab(id);
+                }
+            }
+            UiAction::DuplicateTab { tab_id } => {
+                if let Some((index, tab)) = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, tab)| tab.id == tab_id)
+                {
+                    let url = tab.url.clone();
+                    let title = tab.title.clone();
+                    self.insert_tab(Some(url), Some(title), Some(index + 1), true);
+                }
             }
             UiAction::SelectTab { tab_id } => {
                 self.focus_tab(tab_id);
@@ -952,6 +1191,10 @@ impl TabManager {
     /// Watchdog tick: checks RAM pressure and tab idle durations.
     pub fn tick(&mut self) {
         let now = Instant::now();
+
+        // Create browsers only from `about_to_wait`, never from a window event.
+        self.drain_browser_spawns();
+        self.retry_blank_initial_navigations(now);
 
         // 1. Refresh RAM every RAM_CHECK_INTERVAL (5s)
         if now.duration_since(self.last_ram_check) >= RAM_CHECK_INTERVAL {
@@ -1038,6 +1281,7 @@ impl TabManager {
 
         state.active_tab_id = self.active_tab_id;
         state.ram_mb = self.ram_process_mb;
+        state.can_reopen_tab = self.can_reopen_closed_tab();
 
         if let Some(id) = self.active_tab_id {
             if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
@@ -1069,8 +1313,10 @@ impl TabManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        fallback_favicon_url, idle_timeout_for_pressure, is_critical_pressure,
-        preferred_favicon_url, ram_pressure, should_hibernate_tab, should_sync_omnibox, TabState,
+        closed_tab_from, fallback_favicon_url, idle_timeout_for_pressure, is_blank_navigation_url,
+        is_critical_pressure, needs_initial_navigation, next_navigation_retry_delay,
+        preferred_favicon_url, ram_pressure, restore_insert_index, should_hibernate_tab,
+        should_sync_omnibox, Tab, TabState,
     };
     use crate::config::{TAB_IDLE_TIMEOUT_NORMAL, TAB_IDLE_TIMEOUT_PRESSURE};
     use std::time::{Duration, Instant};
@@ -1208,6 +1454,82 @@ mod tests {
         assert_eq!(fallback_favicon_url("ftp://example.com"), None);
         assert_eq!(fallback_favicon_url("file:///tmp/page.html"), None);
         assert_eq!(fallback_favicon_url("not a url"), None);
+    }
+
+    #[test]
+    fn blank_navigation_urls_are_detected_case_insensitively() {
+        assert!(is_blank_navigation_url(""));
+        assert!(is_blank_navigation_url("   "));
+        assert!(is_blank_navigation_url("about:blank"));
+        assert!(is_blank_navigation_url(" ABOUT:BLANK "));
+        assert!(!is_blank_navigation_url("https://example.com"));
+    }
+
+    #[test]
+    fn navigation_retry_delays_are_finite_and_increase() {
+        assert_eq!(
+            next_navigation_retry_delay(0),
+            Some(Duration::from_millis(750))
+        );
+        assert_eq!(
+            next_navigation_retry_delay(1),
+            Some(Duration::from_millis(1_500))
+        );
+        assert_eq!(
+            next_navigation_retry_delay(2),
+            Some(Duration::from_millis(3_000))
+        );
+        assert_eq!(next_navigation_retry_delay(3), None);
+    }
+
+    #[test]
+    fn initial_navigation_is_reissued_only_for_blank_frames() {
+        assert!(needs_initial_navigation("", "https://example.com"));
+        assert!(needs_initial_navigation("   ", "https://example.com"));
+        assert!(needs_initial_navigation(
+            "about:blank",
+            "https://example.com"
+        ));
+        assert!(needs_initial_navigation(
+            "ABOUT:BLANK",
+            "https://example.com"
+        ));
+        assert!(!needs_initial_navigation(
+            "https://example.com",
+            "https://example.com"
+        ));
+        assert!(!needs_initial_navigation("about:blank", ""));
+    }
+
+    #[test]
+    fn restore_insert_index_clamps_to_current_tab_count() {
+        assert_eq!(restore_insert_index(0, 0), 0);
+        assert_eq!(restore_insert_index(2, 5), 2);
+        assert_eq!(restore_insert_index(5, 5), 5);
+        assert_eq!(restore_insert_index(99, 3), 3);
+    }
+
+    #[test]
+    fn closed_tab_captures_url_title_and_original_position() {
+        let tab = Tab {
+            id: 7,
+            url: "https://example.com/article".to_string(),
+            title: "Example Article".to_string(),
+            is_loading: false,
+            can_go_back: true,
+            can_go_forward: false,
+            blocked_requests: 12,
+            state: TabState::Background {
+                since: Instant::now(),
+            },
+            browser: None,
+            favicon: None,
+        };
+
+        let closed = closed_tab_from(&tab, 3);
+        assert_eq!(closed.url, tab.url);
+        assert_eq!(closed.title, tab.title);
+        assert_eq!(closed.index, 3);
     }
 
     #[test]

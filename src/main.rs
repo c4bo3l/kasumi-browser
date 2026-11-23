@@ -10,7 +10,7 @@ mod ui;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use app::KasumiBrowserApp;
 use browser::hibernation::TabManager;
@@ -18,13 +18,22 @@ use cef::CefString;
 use config::{rail_width, SHUTDOWN_MAX_WAIT_TICKS};
 use events::UiAction;
 use storage::db::{StorageHandle, StorageManager};
-use ui::chrome::{ChromeRenderer, ChromeState, PaletteRenderer, TooltipRenderer};
+use ui::chrome::{
+    ChromeOverlayRenderer, ChromeRenderer, ChromeState, ChromeTheme, TooltipRenderer,
+};
 use ui::platform_view::ContentRect;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId, WindowLevel};
+
+/// Custom winit event used to exit the loop after macOS CEF shutdown has run
+/// outside winit's single-entry event handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KasumiEvent {
+    ShutdownComplete,
+}
 
 // ---------------------------------------------------------------------------
 // macOS: CEF external message pump via a main-thread CoreFoundation timer.
@@ -42,10 +51,22 @@ mod cf {
     pub type CFAllocatorRef = *mut c_void;
     pub type CFRunLoopRef = *mut c_void;
     pub type CFRunLoopTimerRef = *mut c_void;
+    pub type CFRunLoopObserverRef = *mut c_void;
     pub type CFStringRef = *const c_void;
     pub type CFIndex = isize;
     pub type CFOptionFlags = usize;
     pub type CFRunLoopTimerCallBack = unsafe extern "C" fn(CFRunLoopTimerRef, *mut c_void);
+    pub type CFRunLoopObserverCallBack =
+        unsafe extern "C" fn(CFRunLoopObserverRef, u32, *mut c_void);
+
+    #[repr(C)]
+    pub struct CFRunLoopObserverContext {
+        pub version: CFIndex,
+        pub info: *mut c_void,
+        pub retain: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
+        pub release: Option<unsafe extern "C" fn(*const c_void)>,
+        pub copy_description: Option<unsafe extern "C" fn(*const c_void) -> *const c_void>,
+    }
 
     #[repr(C)]
     pub struct CFRunLoopTimerContext {
@@ -74,6 +95,19 @@ mod cf {
             mode: CFStringRef,
         );
         pub fn CFRunLoopTimerInvalidate(timer: CFRunLoopTimerRef);
+        pub fn CFRunLoopObserverCreate(
+            allocator: CFAllocatorRef,
+            activities: CFOptionFlags,
+            repeats: u8,
+            order: CFIndex,
+            callout: CFRunLoopObserverCallBack,
+            context: *const CFRunLoopObserverContext,
+        ) -> CFRunLoopObserverRef;
+        pub fn CFRunLoopAddObserver(
+            run_loop: CFRunLoopRef,
+            observer: CFRunLoopObserverRef,
+            mode: CFStringRef,
+        );
         pub fn CFRelease(cf: *const c_void);
         pub static kCFRunLoopCommonModes: CFStringRef;
     }
@@ -150,6 +184,84 @@ impl Drop for CefPumpTimer {
         unsafe {
             cf::CFRunLoopTimerInvalidate(self.timer);
             cf::CFRelease(self.timer.cast_const());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+static CEF_SHUTDOWN_SCHEDULED: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static CEF_SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static SHUTDOWN_PROXY: OnceLock<winit::event_loop::EventLoopProxy<KasumiEvent>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn cef_shutdown_observer_callback(
+    _observer: cf::CFRunLoopObserverRef,
+    _activity: u32,
+    _info: *mut std::ffi::c_void,
+) {
+    // `cef::shutdown()` dispatches NSApp events that can re-enter
+    // `about_to_wait` and try to schedule another shutdown. The done flag is
+    // set before the call, so those nested ticks become no-ops.
+    CEF_SHUTDOWN_SCHEDULED.store(false, Ordering::Release);
+    if CEF_SHUTDOWN_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    // Crucially, this runs from the run loop instead of from winit's
+    // `about_to_wait` handler. `cef::shutdown()` dispatches NSApp events, and
+    // doing that inside winit's single-entry handler panics with
+    // "tried to handle event while another event is currently being handled".
+    tracing::info!("Running deferred CEF shutdown outside the winit event handler");
+    cef::shutdown();
+
+    if let Some(proxy) = SHUTDOWN_PROXY.get() {
+        let _ = proxy.send_event(KasumiEvent::ShutdownComplete);
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct CefShutdownObserver;
+
+#[cfg(target_os = "macos")]
+impl CefShutdownObserver {
+    /// Schedule a one-shot shutdown on the next run-loop pass, after the
+    /// current winit event handler has returned.
+    fn schedule() {
+        if CEF_SHUTDOWN_DONE.load(Ordering::Acquire)
+            || CEF_SHUTDOWN_SCHEDULED.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let context = cf::CFRunLoopObserverContext {
+            version: 0,
+            info: std::ptr::null_mut(),
+            retain: None,
+            release: None,
+            copy_description: None,
+        };
+
+        unsafe {
+            // kCFRunLoopBeforeWaiting | kCFRunLoopAfterWaiting
+            let activities: cf::CFOptionFlags = (1 << 5) | (1 << 6);
+            let observer = cf::CFRunLoopObserverCreate(
+                std::ptr::null_mut(),
+                activities,
+                0, // one-shot
+                0, // order
+                cef_shutdown_observer_callback,
+                &context,
+            );
+            if observer.is_null() {
+                CEF_SHUTDOWN_SCHEDULED.store(false, Ordering::Release);
+                tracing::error!("Failed to create CEF shutdown observer");
+                return;
+            }
+            cf::CFRunLoopAddObserver(cf::CFRunLoopGetMain(), observer, cf::kCFRunLoopCommonModes);
+            // Intentionally leaked: the observer invalidates itself after its
+            // single fire, and releasing it after CEF shutdown is unsafe.
         }
     }
 }
@@ -231,11 +343,11 @@ struct KasumiBrowserHandler {
     tab_manager: Option<TabManager>,
     storage_handle: Option<StorageHandle>,
 
-    // Transparent always-on-top overlay for the full-window command palette.
-    // The CEF child view stays visible behind it on every platform.
+    // Transparent always-on-top overlay shared by the command palette and the
+    // rail tab context menu. The CEF child view stays visible behind it.
     overlay_window: Option<Arc<Window>>,
     overlay_window_id: Option<WindowId>,
-    overlay: Option<PaletteRenderer>,
+    overlay: Option<ChromeOverlayRenderer>,
     overlay_visible: bool,
 
     // Transparent, click-through overlay for rail tooltips. A native window is
@@ -292,19 +404,19 @@ impl KasumiBrowserHandler {
         }
     }
 
-    fn sync_palette_overlay(&mut self, event_loop: &ActiveEventLoop) {
+    fn sync_chrome_overlay(&mut self, event_loop: &ActiveEventLoop) {
         if self.shutdown_requested {
-            self.hide_palette_overlay();
+            self.hide_chrome_overlay();
             return;
         }
-        if self.chrome_state.command_palette_open {
-            self.ensure_palette_overlay(event_loop);
+        if self.chrome_state.command_palette_open || self.chrome_state.menu.is_some() {
+            self.ensure_chrome_overlay(event_loop);
         } else {
-            self.hide_palette_overlay();
+            self.hide_chrome_overlay();
         }
     }
 
-    fn ensure_palette_overlay(&mut self, event_loop: &ActiveEventLoop) {
+    fn ensure_chrome_overlay(&mut self, event_loop: &ActiveEventLoop) {
         let mut created_window = false;
         if self.overlay_window.is_none() {
             created_window = true;
@@ -334,7 +446,7 @@ impl KasumiBrowserHandler {
             let Some(window) = self.overlay_window.as_ref() else {
                 return;
             };
-            let Some(overlay) = PaletteRenderer::new(
+            let Some(overlay) = ChromeOverlayRenderer::new(
                 Arc::clone(window),
                 &self.wgpu_instance,
                 &self.adapter,
@@ -348,7 +460,7 @@ impl KasumiBrowserHandler {
         }
 
         if created_window || !self.overlay_visible {
-            self.position_palette_overlay();
+            self.position_chrome_overlay();
         }
         if let Some(window) = self.overlay_window.as_ref() {
             if !self.overlay_visible {
@@ -360,7 +472,7 @@ impl KasumiBrowserHandler {
         }
     }
 
-    fn position_palette_overlay(&self) {
+    fn position_chrome_overlay(&self) {
         let (Some(main), Some(overlay)) = (self.window.as_ref(), self.overlay_window.as_ref())
         else {
             return;
@@ -379,7 +491,7 @@ impl KasumiBrowserHandler {
         }
     }
 
-    fn hide_palette_overlay(&mut self) {
+    fn hide_chrome_overlay(&mut self) {
         if self.overlay_visible {
             if let Some(window) = self.overlay_window.as_ref() {
                 let _ = window.set_visible(false);
@@ -393,7 +505,10 @@ impl KasumiBrowserHandler {
     }
 
     fn sync_tooltip_overlay(&mut self, event_loop: &ActiveEventLoop) {
-        if self.shutdown_requested || self.chrome_state.command_palette_open {
+        if self.shutdown_requested
+            || self.chrome_state.command_palette_open
+            || self.chrome_state.menu.is_some()
+        {
             self.hide_tooltip_overlay();
             return;
         }
@@ -486,6 +601,13 @@ impl KasumiBrowserHandler {
     }
 }
 
+/// True when a main-window pointer position is over the CEF content area
+/// instead of the native rail. Used to clear cached rail tooltips when the
+/// cursor crosses into the child view, where egui receives no hover updates.
+fn pointer_is_past_rail(physical_x: f64, scale_factor: f64, rail_expanded: bool) -> bool {
+    scale_factor > 0.0 && physical_x / scale_factor >= rail_width(rail_expanded) as f64
+}
+
 /// Convert an egui content-space point into physical screen coordinates.
 ///
 /// egui coordinates start at the main window's *content* origin, while the
@@ -509,7 +631,25 @@ fn is_primary_shortcut_modifier(modifiers: ModifiersState) -> bool {
     modifiers.control_key() || modifiers.super_key()
 }
 
-impl ApplicationHandler for KasumiBrowserHandler {
+/// `Cmd/Ctrl+Z` restores the most recently closed tab. Shift is excluded so
+/// `Cmd/Ctrl+Shift+Z` remains available for a future redo action.
+fn is_reopen_tab_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
+    is_primary_shortcut_modifier(modifiers)
+        && !modifiers.alt_key()
+        && !modifiers.shift_key()
+        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("z"))
+}
+
+impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: KasumiEvent) {
+        match event {
+            KasumiEvent::ShutdownComplete => {
+                tracing::info!("CEF shutdown complete — exiting event loop");
+                event_loop.exit();
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return; // already created
@@ -539,6 +679,12 @@ impl ApplicationHandler for KasumiBrowserHandler {
             event_loop.exit();
             return;
         };
+
+        // Follow the OS appearance from the very first frame, not only after
+        // the first `ThemeChanged` event arrives.
+        self.chrome_state.theme =
+            ChromeTheme::from_winit(event_loop.system_theme().or_else(|| window.theme()));
+        tracing::info!("Chrome theme: {:?}", self.chrome_state.theme);
 
         let parent_view: *mut std::ffi::c_void = {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -608,7 +754,7 @@ impl ApplicationHandler for KasumiBrowserHandler {
             match event {
                 WindowEvent::CloseRequested => {
                     self.chrome_state.close_command_palette();
-                    self.sync_palette_overlay(event_loop);
+                    self.sync_chrome_overlay(event_loop);
                 }
                 WindowEvent::Resized(new_size) => {
                     if let Some(overlay) = self.overlay.as_mut() {
@@ -634,7 +780,7 @@ impl ApplicationHandler for KasumiBrowserHandler {
                             tm.handle_ui_action(action);
                         }
                     }
-                    self.sync_palette_overlay(event_loop);
+                    self.sync_chrome_overlay(event_loop);
                 }
                 _ => {}
             }
@@ -652,7 +798,7 @@ impl ApplicationHandler for KasumiBrowserHandler {
             };
 
             match event {
-                WindowEvent::CloseRequested => {
+                WindowEvent::CloseRequested | WindowEvent::CursorLeft { .. } => {
                     self.chrome_state.tooltip = None;
                     self.hide_tooltip_overlay();
                 }
@@ -673,7 +819,7 @@ impl ApplicationHandler for KasumiBrowserHandler {
                         (self.tooltip_window.as_ref(), self.tooltip.as_mut())
                     {
                         if let Some(tooltip) = self.chrome_state.tooltip.clone() {
-                            renderer.render(window, &tooltip);
+                            renderer.render(window, &tooltip, self.chrome_state.theme);
                         }
                     }
                 }
@@ -695,11 +841,37 @@ impl ApplicationHandler for KasumiBrowserHandler {
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
             }
+            WindowEvent::ThemeChanged(theme) => {
+                let next = ChromeTheme::from_winit(Some(*theme));
+                if next != self.chrome_state.theme {
+                    tracing::info!("System theme changed to {:?}", next);
+                    self.chrome_state.theme = next;
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                // The pointer may leave the rail without egui receiving a
+                // hover update (for example when it enters the CEF child
+                // view). Clear the cached tooltip immediately.
+                self.chrome_state.tooltip = None;
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map_or(1.0, |window| window.scale_factor());
+                if pointer_is_past_rail(position.x, scale, self.chrome_state.rail_expanded) {
+                    self.chrome_state.tooltip = None;
+                }
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
                         logical_key,
                         state: ElementState::Pressed,
+                        repeat: false,
                         ..
                     },
                 ..
@@ -723,6 +895,10 @@ impl ApplicationHandler for KasumiBrowserHandler {
                                 tm.reopen_closed_tab();
                             }
                         }
+                    }
+                } else if is_reopen_tab_shortcut(self.modifiers, logical_key) {
+                    if let Some(tm) = self.tab_manager.as_mut() {
+                        tm.handle_ui_action(UiAction::ReopenClosedTab);
                     }
                 } else {
                     match logical_key {
@@ -766,7 +942,7 @@ impl ApplicationHandler for KasumiBrowserHandler {
                 if let Some(chrome) = self.chrome.as_mut() {
                     chrome.resize(*new_size);
                 }
-                self.position_palette_overlay();
+                self.position_chrome_overlay();
                 if let (Some(window), Some(tm)) = (self.window.as_ref(), self.tab_manager.as_mut())
                 {
                     let scale = window.scale_factor();
@@ -817,7 +993,7 @@ impl ApplicationHandler for KasumiBrowserHandler {
             _ => {}
         }
 
-        self.sync_palette_overlay(event_loop);
+        self.sync_chrome_overlay(event_loop);
         self.sync_tooltip_overlay(event_loop);
     }
 
@@ -863,7 +1039,7 @@ impl ApplicationHandler for KasumiBrowserHandler {
             tm.update_chrome_state(&mut self.chrome_state);
         }
 
-        self.sync_palette_overlay(event_loop);
+        self.sync_chrome_overlay(event_loop);
         self.sync_tooltip_overlay(event_loop);
 
         if self.shutdown_requested {
@@ -885,16 +1061,25 @@ impl ApplicationHandler for KasumiBrowserHandler {
                     self.shutdown_ticks
                 );
                 // On macOS winit installs CFRunLoop observers that are torn
-                // down when run_app() returns. CEF shutdown dispatches NSApp
-                // events, so it must happen while those observers still exist
-                // (but after the CEF pump timer has been disabled).
+                // down when run_app() returns, so CEF shutdown must happen
+                // before returning from run_app(). It also dispatches NSApp
+                // events, so run it from a one-shot run-loop observer rather
+                // than inside this winit handler to avoid reentrant dispatch.
                 #[cfg(target_os = "macos")]
                 {
                     CEF_PUMP_ENABLED.store(false, Ordering::Release);
-                    cef::shutdown();
+                    CefShutdownObserver::schedule();
+                    // Do not exit yet; the observer sends ShutdownComplete
+                    // after `cef::shutdown()` has finished.
+                    return;
                 }
-                event_loop.exit();
-                return;
+
+                #[cfg(not(target_os = "macos"))]
+                {
+                    cef::shutdown();
+                    event_loop.exit();
+                    return;
+                }
             }
 
             // Keep ticking until every on_before_close callback has been observed.
@@ -1091,7 +1276,7 @@ fn main() {
     tracing::info!("wgpu adapter: {:?}", adapter.get_info().name);
 
     // ── 7. Run winit event loop ───────────────────────────────────────────────
-    let event_loop = match EventLoop::new() {
+    let event_loop = match EventLoop::<KasumiEvent>::with_user_event().build() {
         Ok(el) => el,
         Err(e) => {
             tracing::error!("Failed to create event loop: {}", e);
@@ -1099,6 +1284,11 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    #[cfg(target_os = "macos")]
+    if SHUTDOWN_PROXY.set(event_loop.create_proxy()).is_err() {
+        tracing::warn!("Shutdown event proxy was already initialized");
+    }
 
     let mut handler = KasumiBrowserHandler::new(wgpu_instance, adapter, device, queue);
 
@@ -1120,9 +1310,12 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_primary_shortcut_modifier, overlay_screen_position};
+    use super::{
+        is_primary_shortcut_modifier, is_reopen_tab_shortcut, overlay_screen_position,
+        pointer_is_past_rail,
+    };
     use winit::dpi::PhysicalPosition;
-    use winit::keyboard::ModifiersState;
+    use winit::keyboard::{Key, ModifiersState};
 
     #[test]
     fn shortcuts_accept_ctrl_or_cmd_without_conflicting_modifiers() {
@@ -1137,6 +1330,43 @@ mod tests {
         ));
         assert!(!is_primary_shortcut_modifier(ModifiersState::SHIFT));
         assert!(!is_primary_shortcut_modifier(ModifiersState::ALT));
+    }
+
+    #[test]
+    fn reopen_tab_shortcut_requires_primary_modifier_without_shift_or_alt() {
+        let z: Key = Key::Character("z".into());
+        let upper_z: Key = Key::Character("Z".into());
+
+        assert!(is_reopen_tab_shortcut(ModifiersState::CONTROL, &z));
+        assert!(is_reopen_tab_shortcut(ModifiersState::SUPER, &upper_z));
+        assert!(!is_reopen_tab_shortcut(ModifiersState::empty(), &z));
+        assert!(!is_reopen_tab_shortcut(ModifiersState::SHIFT, &z));
+        assert!(!is_reopen_tab_shortcut(
+            ModifiersState::CONTROL | ModifiersState::SHIFT,
+            &z
+        ));
+        assert!(!is_reopen_tab_shortcut(
+            ModifiersState::CONTROL | ModifiersState::ALT,
+            &z
+        ));
+        assert!(!is_reopen_tab_shortcut(
+            ModifiersState::CONTROL,
+            &Key::Character("t".into())
+        ));
+    }
+
+    #[test]
+    fn pointer_past_rail_uses_logical_rail_width() {
+        // Expanded rail is 180 logical points: 360 physical pixels at 2x.
+        assert!(!pointer_is_past_rail(359.0, 2.0, true));
+        assert!(pointer_is_past_rail(360.0, 2.0, true));
+
+        // Collapsed rail is 44 logical points.
+        assert!(!pointer_is_past_rail(43.0, 1.0, false));
+        assert!(pointer_is_past_rail(44.0, 1.0, false));
+
+        // Invalid scale factors must not clear tooltips spuriously.
+        assert!(!pointer_is_past_rail(1_000.0, 0.0, true));
     }
 
     #[test]

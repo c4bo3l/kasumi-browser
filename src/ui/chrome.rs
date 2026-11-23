@@ -29,20 +29,175 @@ use crate::config::{
 };
 use crate::events::UiAction;
 
-/// Rail palette. Keeping these as named constants makes the active state
-/// consistent between the expanded and favicon-only layouts.
-const RAIL_BG: Color32 = Color32::from_rgb(24, 25, 29);
-const RAIL_SURFACE: Color32 = Color32::from_rgb(38, 44, 58);
-const RAIL_ROW_ACTIVE: Color32 = Color32::from_rgb(52, 75, 112);
-const RAIL_ROW_HOVER: Color32 = Color32::from_rgb(42, 46, 54);
-const RAIL_ACCENT: Color32 = Color32::from_rgb(110, 170, 255);
-const RAIL_TEXT: Color32 = Color32::from_rgb(214, 218, 226);
-const RAIL_TEXT_DIM: Color32 = Color32::from_rgb(140, 148, 162);
+/// Light or dark chrome appearance. The OS theme decides the default, and
+/// `ChromeTheme::from_winit` maps live `ThemeChanged` events into this enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChromeTheme {
+    #[default]
+    Dark,
+    Light,
+}
+
+/// Colours for every native chrome surface. Keeping the two themes in one
+/// struct makes it impossible for a new control to silently stay dark when the
+/// OS switches to light mode.
+#[derive(Debug, Clone, Copy)]
+pub struct ChromePalette {
+    pub rail_bg: Color32,
+    pub rail_surface: Color32,
+    pub rail_row_active: Color32,
+    pub rail_row_hover: Color32,
+    pub rail_accent: Color32,
+    pub text: Color32,
+    pub text_dim: Color32,
+    pub text_strong: Color32,
+    pub brand: Color32,
+    pub section_label: Color32,
+    pub shield_ok: Color32,
+    pub scrim: Color32,
+    pub palette_bg: Color32,
+    pub palette_border: Color32,
+    pub palette_subtext: Color32,
+    pub palette_hint: Color32,
+    pub palette_row_selected: Color32,
+    pub palette_row_hover: Color32,
+    pub menu_bg: Color32,
+    pub menu_border: Color32,
+    pub menu_disabled: Color32,
+    pub close_bg: Color32,
+    pub close_icon: Color32,
+    pub tab_border: Color32,
+    pub loading: Color32,
+    pub tooltip_bg: Color32,
+    pub tooltip_border: Color32,
+    pub tooltip_text: Color32,
+}
+
+impl ChromePalette {
+    pub const DARK: Self = Self {
+        rail_bg: Color32::from_rgb(24, 25, 29),
+        rail_surface: Color32::from_rgb(38, 44, 58),
+        rail_row_active: Color32::from_rgb(52, 75, 112),
+        rail_row_hover: Color32::from_rgb(42, 46, 54),
+        rail_accent: Color32::from_rgb(110, 170, 255),
+        text: Color32::from_rgb(214, 218, 226),
+        text_dim: Color32::from_rgb(140, 148, 162),
+        text_strong: Color32::WHITE,
+        brand: Color32::from_rgb(150, 185, 235),
+        section_label: Color32::from_rgb(125, 130, 140),
+        shield_ok: Color32::from_rgb(80, 200, 120),
+        scrim: Color32::from_rgba_premultiplied(0, 0, 0, 150),
+        palette_bg: Color32::from_rgb(30, 32, 38),
+        palette_border: Color32::from_rgb(72, 88, 116),
+        palette_subtext: Color32::from_rgb(155, 160, 170),
+        palette_hint: Color32::from_rgb(120, 125, 135),
+        palette_row_selected: Color32::from_rgb(58, 82, 120),
+        palette_row_hover: Color32::from_rgb(44, 48, 56),
+        menu_bg: Color32::from_rgb(26, 29, 36),
+        menu_border: Color32::from_rgb(90, 110, 142),
+        menu_disabled: Color32::from_rgb(105, 111, 122),
+        close_bg: Color32::from_rgb(64, 70, 84),
+        close_icon: Color32::WHITE,
+        tab_border: Color32::from_rgb(86, 128, 192),
+        loading: Color32::from_rgb(115, 190, 255),
+        tooltip_bg: Color32::from_rgb(16, 19, 26),
+        tooltip_border: Color32::from_rgb(110, 130, 160),
+        tooltip_text: Color32::from_rgb(250, 251, 255),
+    };
+
+    pub const LIGHT: Self = Self {
+        rail_bg: Color32::from_rgb(241, 243, 246),
+        rail_surface: Color32::from_rgb(224, 228, 234),
+        rail_row_active: Color32::from_rgb(211, 227, 250),
+        rail_row_hover: Color32::from_rgb(231, 235, 241),
+        rail_accent: Color32::from_rgb(44, 107, 237),
+        text: Color32::from_rgb(31, 35, 40),
+        text_dim: Color32::from_rgb(95, 102, 114),
+        text_strong: Color32::from_rgb(17, 20, 24),
+        brand: Color32::from_rgb(36, 92, 158),
+        section_label: Color32::from_rgb(107, 114, 128),
+        shield_ok: Color32::from_rgb(31, 138, 76),
+        scrim: Color32::from_rgba_premultiplied(4, 5, 10, 60),
+        palette_bg: Color32::from_rgb(255, 255, 255),
+        palette_border: Color32::from_rgb(183, 193, 207),
+        palette_subtext: Color32::from_rgb(95, 102, 114),
+        palette_hint: Color32::from_rgb(122, 130, 142),
+        palette_row_selected: Color32::from_rgb(210, 226, 250),
+        palette_row_hover: Color32::from_rgb(235, 238, 243),
+        menu_bg: Color32::from_rgb(255, 255, 255),
+        menu_border: Color32::from_rgb(160, 175, 195),
+        menu_disabled: Color32::from_rgb(150, 157, 168),
+        close_bg: Color32::from_rgb(214, 220, 229),
+        close_icon: Color32::from_rgb(17, 20, 24),
+        tab_border: Color32::from_rgb(113, 155, 209),
+        loading: Color32::from_rgb(44, 107, 237),
+        tooltip_bg: Color32::from_rgb(255, 255, 255),
+        tooltip_border: Color32::from_rgb(150, 166, 188),
+        tooltip_text: Color32::from_rgb(25, 28, 33),
+    };
+}
+
+impl ChromeTheme {
+    pub fn palette(self) -> &'static ChromePalette {
+        match self {
+            Self::Dark => &ChromePalette::DARK,
+            Self::Light => &ChromePalette::LIGHT,
+        }
+    }
+
+    /// Map winit's optional system theme to a concrete chrome theme. Missing
+    /// information keeps the established dark look instead of flashing light.
+    pub fn from_winit(theme: Option<winit::window::Theme>) -> Self {
+        match theme {
+            Some(winit::window::Theme::Light) => Self::Light,
+            Some(winit::window::Theme::Dark) | None => Self::Dark,
+        }
+    }
+
+    /// Apply egui defaults so separators, hint text, scrollbars, and text
+    /// cursors match the native palette. Explicit painted colours still come
+    /// from `palette()`.
+    pub fn apply_visuals(self, ctx: &egui::Context) {
+        let palette = self.palette();
+        let mut visuals = match self {
+            Self::Dark => egui::Visuals::dark(),
+            Self::Light => egui::Visuals::light(),
+        };
+        visuals.panel_fill = palette.rail_bg;
+        visuals.window_fill = palette.palette_bg;
+        visuals.extreme_bg_color = palette.rail_bg;
+        visuals.faint_bg_color = palette.palette_row_hover;
+        visuals.selection.bg_fill = palette.palette_row_selected;
+        visuals.selection.stroke = Stroke::new(1.0_f32, palette.rail_accent);
+        visuals.hyperlink_color = palette.rail_accent;
+        visuals.override_text_color = Some(palette.text);
+        ctx.set_visuals(visuals);
+    }
+
+    pub fn clear_color(self) -> wgpu::Color {
+        match self {
+            Self::Dark => wgpu::Color {
+                r: 0.10,
+                g: 0.11,
+                b: 0.13,
+                a: 1.0,
+            },
+            Self::Light => wgpu::Color {
+                r: 0.945,
+                g: 0.953,
+                b: 0.965,
+                a: 1.0,
+            },
+        }
+    }
+}
+
 const TOOLTIP_WIDTH: f32 = 240.0;
 const TOOLTIP_HEIGHT_EXPANDED: f32 = 52.0;
 const TOOLTIP_HEIGHT_COLLAPSED: f32 = 40.0;
-const PALETTE_ROW_SELECTED: Color32 = Color32::from_rgb(58, 82, 120);
-const PALETTE_ROW_HOVER: Color32 = Color32::from_rgb(44, 48, 56);
+const RAIL_MENU_WIDTH: f32 = 224.0;
+const RAIL_MENU_ROW_HEIGHT: f32 = 28.0;
+const RAIL_MENU_PADDING: f32 = 7.0;
 
 /// Prefer egui's recommended non-sRGB surface formats. Some drivers only list
 /// `Bgra8UnormSrgb` first, which makes `egui_wgpu` warn about linear sRGB
@@ -68,6 +223,7 @@ fn preferred_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::Tex
 enum RailIcon {
     Plus,
     Search,
+    Code,
     ChevronLeft,
     ChevronRight,
     Moon,
@@ -119,6 +275,7 @@ pub enum CommandAction {
     Navigate { tab_id: u64, url: String },
     HibernateAll,
     ToggleRail,
+    OpenDevTools,
 }
 
 /// One row in the floating command palette.
@@ -138,6 +295,45 @@ pub struct RailTooltip {
     pub anchor: egui::Pos2,
     pub width: f32,
     pub height: f32,
+}
+
+/// A native tab context menu drawn in a transparent overlay above the page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RailMenu {
+    pub tab_id: u64,
+    /// Top-left corner in main-window logical coordinates.
+    pub anchor: egui::Pos2,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// Commands offered by the rail tab context menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RailMenuAction {
+    NewTab,
+    DuplicateTab,
+    CopyUrl,
+    Reload,
+    CloseOtherTabs,
+    CloseTabsToRight,
+    ReopenClosedTab,
+    CloseTab,
+    OpenDevTools,
+}
+
+/// Result produced by the menu overlay on each interaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RailMenuOutcome {
+    Dismiss,
+    Action(UiAction),
+}
+
+/// One row in the rail tab context menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RailMenuItem {
+    pub label: &'static str,
+    pub action: RailMenuAction,
+    pub enabled: bool,
 }
 
 /// All mutable UI state consumed by `ChromeRenderer::render()` each frame.
@@ -168,6 +364,14 @@ pub struct ChromeState {
     pub command_palette_focus_requested: bool,
     /// Latest rail tooltip; consumed by the overlay window on each frame.
     pub tooltip: Option<RailTooltip>,
+    /// Open tab context menu; consumed by the shared full-window overlay.
+    pub menu: Option<RailMenu>,
+    /// Currently highlighted context-menu row.
+    pub menu_selection: usize,
+    /// True when at least one closed tab can be restored with Cmd/Ctrl+Z.
+    pub can_reopen_tab: bool,
+    /// Current OS light/dark appearance used by every native chrome surface.
+    pub theme: ChromeTheme,
 }
 
 impl Default for ChromeState {
@@ -189,6 +393,10 @@ impl Default for ChromeState {
             command_selection: 0,
             command_palette_focus_requested: false,
             tooltip: None,
+            menu: None,
+            menu_selection: 0,
+            can_reopen_tab: false,
+            theme: ChromeTheme::default(),
         }
     }
 }
@@ -202,6 +410,7 @@ impl ChromeState {
             self.command_palette_focus_requested = true;
         }
         self.command_palette_open = true;
+        self.close_tab_menu();
     }
 
     pub fn close_command_palette(&mut self) {
@@ -210,10 +419,37 @@ impl ChromeState {
         self.command_selection = 0;
         self.command_palette_focus_requested = false;
         self.tooltip = None;
+        self.close_tab_menu();
     }
 
     pub fn toggle_rail(&mut self) {
         self.rail_expanded = !self.rail_expanded;
+        self.close_tab_menu();
+    }
+
+    pub fn open_tab_menu(&mut self, tab_id: u64, anchor: egui::Pos2) {
+        // The palette and menu share one transparent overlay window and must
+        // never both claim it. Clearing the palette here also avoids a stale
+        // focus request when the menu is dismissed.
+        self.command_palette_open = false;
+        self.command_palette_query.clear();
+        self.command_selection = 0;
+        self.command_palette_focus_requested = false;
+
+        let (width, height) = rail_menu_metrics();
+        self.menu = Some(RailMenu {
+            tab_id,
+            anchor,
+            width,
+            height,
+        });
+        self.menu_selection = 0;
+        self.tooltip = None;
+    }
+
+    pub fn close_tab_menu(&mut self) {
+        self.menu = None;
+        self.menu_selection = 0;
     }
 }
 
@@ -343,6 +579,7 @@ impl ChromeRenderer {
         let mut actions: Vec<UiAction> = Vec::new();
 
         self.sync_favicon_textures(state);
+        state.theme.apply_visuals(&self.egui_ctx);
 
         let raw_input = self.egui_state.take_egui_input(window);
         let egui_ctx = self.egui_ctx.clone();
@@ -398,12 +635,7 @@ impl ChromeRenderer {
                         view: &view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.10,
-                                g: 0.11,
-                                b: 0.13,
-                                a: 1.0,
-                            }),
+                            load: wgpu::LoadOp::Clear(state.theme.clear_color()),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -480,25 +712,35 @@ impl ChromeRenderer {
         // Tooltips are rendered in a transparent overlay above the page, so
         // collect the hovered row for this frame instead of painting in-rail.
         let mut rail_tooltip: Option<RailTooltip> = None;
+        let mut menu_request: Option<(u64, egui::Pos2)> = None;
+        // Pass a borrow into the panel closure so the collected tooltip can be
+        // read again after the closure finishes.
+        let tooltip_slot = &mut rail_tooltip;
         let width = rail_width(state.rail_expanded);
+        let palette = state.theme.palette();
         let rail = egui::SidePanel::left("workspace_rail")
             .exact_width(width)
             .resizable(false)
-            .frame(Frame::none().fill(RAIL_BG))
+            .frame(Frame::none().fill(palette.rail_bg))
             .show(ctx, |ui| {
                 if !state.rail_expanded {
                     // Favicon-only mode: show one large, clickable icon per tab,
                     // plus always-visible expand / new-tab / command controls.
                     ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                        let rail_rect = ui.clip_rect();
                         ui.add_space(5.0);
 
-                        let expand =
-                            Self::rail_icon_button(ui, vec2(34.0, 30.0), RailIcon::ChevronRight);
+                        let expand = Self::rail_icon_button(
+                            ui,
+                            vec2(34.0, 30.0),
+                            RailIcon::ChevronRight,
+                            palette,
+                        );
                         if expand.clicked() {
                             state.toggle_rail();
                         }
                         Self::chrome_tooltip(
-                            &mut rail_tooltip,
+                            tooltip_slot,
                             ui,
                             &expand,
                             "Expand workspace rail",
@@ -506,12 +748,13 @@ impl ChromeRenderer {
                         );
 
                         ui.add_space(3.0);
-                        let new_tab = Self::rail_icon_button(ui, vec2(34.0, 34.0), RailIcon::Plus);
+                        let new_tab =
+                            Self::rail_icon_button(ui, vec2(34.0, 34.0), RailIcon::Plus, palette);
                         if new_tab.clicked() {
                             actions.push(UiAction::NewTab { url: None });
                         }
                         Self::chrome_tooltip(
-                            &mut rail_tooltip,
+                            tooltip_slot,
                             ui,
                             &new_tab,
                             "New tab (Cmd/Ctrl+T)",
@@ -520,15 +763,31 @@ impl ChromeRenderer {
 
                         ui.add_space(2.0);
                         let command =
-                            Self::rail_icon_button(ui, vec2(34.0, 30.0), RailIcon::Search);
+                            Self::rail_icon_button(ui, vec2(34.0, 30.0), RailIcon::Search, palette);
                         if command.clicked() {
                             state.open_command_palette();
                         }
                         Self::chrome_tooltip(
-                            &mut rail_tooltip,
+                            tooltip_slot,
                             ui,
                             &command,
                             "Command palette (Cmd/Ctrl+K)",
+                            state.rail_expanded,
+                        );
+
+                        ui.add_space(2.0);
+                        let devtools =
+                            Self::rail_icon_button(ui, vec2(34.0, 30.0), RailIcon::Code, palette);
+                        if devtools.clicked() {
+                            if let Some(tab_id) = state.active_tab_id {
+                                actions.push(UiAction::OpenDevTools { tab_id });
+                            }
+                        }
+                        Self::chrome_tooltip(
+                            tooltip_slot,
+                            ui,
+                            &devtools,
+                            "DevTools (F12, new window)",
                             state.rail_expanded,
                         );
 
@@ -552,20 +811,29 @@ impl ChromeRenderer {
                                         row_rect,
                                         is_active,
                                         row_resp.hovered(),
+                                        palette,
                                     );
                                     let icon_rect = egui::Rect::from_center_size(
                                         row_rect.center(),
                                         vec2(24.0, 24.0),
                                     );
-                                    self.paint_favicon_in_rect(ui, tab, icon_rect);
+                                    self.paint_favicon_in_rect(ui, tab, icon_rect, palette);
                                     let close_resp = Self::paint_tab_close(
                                         ui,
                                         row_rect,
                                         row_resp.hovered(),
                                         tab_id,
                                         false,
+                                        palette,
                                     );
-                                    Self::paint_tab_status(ui, row_rect, tab, false);
+                                    Self::paint_tab_status(ui, row_rect, tab, false, palette);
+                                    Self::chrome_tooltip(
+                                        tooltip_slot,
+                                        ui,
+                                        &close_resp,
+                                        format!("Close tab: {}", tab.title),
+                                        state.rail_expanded,
+                                    );
 
                                     if close_resp.clicked() {
                                         actions.push(UiAction::CloseTab { tab_id });
@@ -575,13 +843,28 @@ impl ChromeRenderer {
                                     if row_resp.middle_clicked() {
                                         actions.push(UiAction::CloseTab { tab_id });
                                     }
+                                    if row_resp.secondary_clicked() {
+                                        let pointer = ui
+                                            .ctx()
+                                            .pointer_latest_pos()
+                                            .unwrap_or(row_rect.right_top());
+                                        let (menu_width, menu_height) = rail_menu_metrics();
+                                        let anchor = rail_menu_anchor(
+                                            rail_rect,
+                                            pointer,
+                                            ui.ctx().screen_rect(),
+                                            menu_width,
+                                            menu_height,
+                                        );
+                                        menu_request = Some((tab_id, anchor));
+                                    }
                                     let tooltip_text = if state.rail_expanded {
                                         format!("{}\n{}", tab.title, tab.url)
                                     } else {
                                         tab.title.clone()
                                     };
                                     Self::chrome_tooltip(
-                                        &mut rail_tooltip,
+                                        tooltip_slot,
                                         ui,
                                         &row_resp,
                                         tooltip_text,
@@ -594,36 +877,28 @@ impl ChromeRenderer {
                 }
 
                 ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
+                    let rail_rect = ui.clip_rect();
                     ui.add_space(7.0);
+                    ui.add_space(3.0);
+                    let collapse = Self::rail_action_button(
+                        ui,
+                        width - 12.0,
+                        30.0,
+                        RailIcon::ChevronLeft,
+                        "Collapse rail",
+                        palette,
+                    );
+                    if collapse.clicked() {
+                        state.toggle_rail();
+                    }
+                    ui.add_space(3.0);
                     ui.horizontal(|ui| {
-                        // Keep the collapse affordance pinned to the outer
-                        // edge; the workspace label follows it.
-                        ui.add_space(3.0);
-                        let collapse =
-                            Self::rail_icon_button(ui, vec2(26.0, 26.0), RailIcon::ChevronLeft);
-                        if collapse.clicked() {
-                            state.toggle_rail();
-                        }
-                        Self::chrome_tooltip(
-                            &mut rail_tooltip,
-                            ui,
-                            &collapse,
-                            "Collapse workspace rail",
-                            state.rail_expanded,
-                        );
-                        ui.add_space(7.0);
-                        let brand = ui.label(
+                        ui.add_space(10.0);
+                        ui.label(
                             RichText::new("KASUMI")
                                 .size(12.0)
                                 .strong()
-                                .color(Color32::from_rgb(150, 185, 235)),
-                        );
-                        Self::chrome_tooltip(
-                            &mut rail_tooltip,
-                            ui,
-                            &brand,
-                            "Kasumi Browser workspace",
-                            state.rail_expanded,
+                                .color(palette.brand),
                         );
                     });
 
@@ -638,12 +913,13 @@ impl ChromeRenderer {
                         32.0,
                         RailIcon::Search,
                         "Command",
+                        palette,
                     );
                     if command.clicked() {
                         state.open_command_palette();
                     }
                     Self::chrome_tooltip(
-                        &mut rail_tooltip,
+                        tooltip_slot,
                         ui,
                         &command,
                         "Open command palette (Cmd/Ctrl+K)",
@@ -651,16 +927,44 @@ impl ChromeRenderer {
                     );
 
                     ui.add_space(3.0);
-                    let new_tab =
-                        Self::rail_action_button(ui, width - 12.0, 32.0, RailIcon::Plus, "New tab");
+                    let new_tab = Self::rail_action_button(
+                        ui,
+                        width - 12.0,
+                        32.0,
+                        RailIcon::Plus,
+                        "New tab",
+                        palette,
+                    );
                     if new_tab.clicked() {
                         actions.push(UiAction::NewTab { url: None });
                     }
                     Self::chrome_tooltip(
-                        &mut rail_tooltip,
+                        tooltip_slot,
                         ui,
                         &new_tab,
                         "New tab (Cmd/Ctrl+T)",
+                        state.rail_expanded,
+                    );
+
+                    ui.add_space(3.0);
+                    let devtools = Self::rail_action_button(
+                        ui,
+                        width - 12.0,
+                        32.0,
+                        RailIcon::Code,
+                        "DevTools",
+                        palette,
+                    );
+                    if devtools.clicked() {
+                        if let Some(tab_id) = state.active_tab_id {
+                            actions.push(UiAction::OpenDevTools { tab_id });
+                        }
+                    }
+                    Self::chrome_tooltip(
+                        tooltip_slot,
+                        ui,
+                        &devtools,
+                        "DevTools (F12, new window)",
                         state.rail_expanded,
                     );
 
@@ -670,7 +974,7 @@ impl ChromeRenderer {
                         ui.label(
                             RichText::new("WORKSPACE")
                                 .size(9.0)
-                                .color(Color32::from_rgb(125, 130, 140)),
+                                .color(palette.section_label),
                         );
                     });
                     ui.add_space(2.0);
@@ -694,14 +998,24 @@ impl ChromeRenderer {
                                 // same rect. Previously the labels were added after
                                 // the row had advanced the cursor, so they appeared
                                 // below the highlight instead of inside it.
-                                Self::paint_tab_row(ui, row_rect, is_active, row_resp.hovered());
+                                Self::paint_tab_row(
+                                    ui,
+                                    row_rect,
+                                    is_active,
+                                    row_resp.hovered(),
+                                    palette,
+                                );
                                 let icon_rect = egui::Rect::from_min_size(
                                     pos2(row_rect.min.x + 8.0, row_rect.center().y - 10.0),
                                     vec2(20.0, 20.0),
                                 );
-                                self.paint_favicon_in_rect(ui, tab, icon_rect);
+                                self.paint_favicon_in_rect(ui, tab, icon_rect, palette);
 
-                                let text_color = if is_active { Color32::WHITE } else { RAIL_TEXT };
+                                let text_color = if is_active {
+                                    palette.text_strong
+                                } else {
+                                    palette.text
+                                };
                                 ui.painter().text(
                                     pos2(row_rect.min.x + 34.0, row_rect.center().y),
                                     Align2::LEFT_CENTER,
@@ -715,12 +1029,14 @@ impl ChromeRenderer {
                                     row_resp.hovered(),
                                     tab_id,
                                     true,
+                                    palette,
                                 );
                                 Self::paint_tab_status(
                                     ui,
                                     row_rect,
                                     tab,
                                     row_resp.hovered() || close_resp.hovered(),
+                                    palette,
                                 );
 
                                 if close_resp.clicked() {
@@ -731,13 +1047,28 @@ impl ChromeRenderer {
                                 if row_resp.middle_clicked() {
                                     actions.push(UiAction::CloseTab { tab_id });
                                 }
+                                if row_resp.secondary_clicked() {
+                                    let pointer = ui
+                                        .ctx()
+                                        .pointer_latest_pos()
+                                        .unwrap_or(row_rect.right_top());
+                                    let (menu_width, menu_height) = rail_menu_metrics();
+                                    let anchor = rail_menu_anchor(
+                                        rail_rect,
+                                        pointer,
+                                        ui.ctx().screen_rect(),
+                                        menu_width,
+                                        menu_height,
+                                    );
+                                    menu_request = Some((tab_id, anchor));
+                                }
                                 let tooltip_text = if state.rail_expanded {
                                     format!("{}\n{}", tab.title, tab.url)
                                 } else {
                                     tab.title.clone()
                                 };
                                 Self::chrome_tooltip(
-                                    &mut rail_tooltip,
+                                    tooltip_slot,
                                     ui,
                                     &row_resp,
                                     tooltip_text,
@@ -761,12 +1092,13 @@ impl ChromeRenderer {
                             30.0,
                             RailIcon::Moon,
                             "Hibernate",
+                            palette,
                         );
                         if hibernate.clicked() {
                             actions.push(UiAction::HibernateAllBackground);
                         }
                         Self::chrome_tooltip(
-                            &mut rail_tooltip,
+                            tooltip_slot,
                             ui,
                             &hibernate,
                             "Hibernate all background tabs (Alt+H)",
@@ -778,7 +1110,7 @@ impl ChromeRenderer {
                             ui.add_space(10.0);
                             let (icon_rect, _) =
                                 ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
-                            paint_rail_icon(ui, icon_rect, RailIcon::Shield, RAIL_TEXT_DIM);
+                            paint_rail_icon(ui, icon_rect, RailIcon::Shield, palette.text_dim);
                             ui.add_space(3.0);
                             let blocked = state
                                 .tabs
@@ -789,7 +1121,7 @@ impl ChromeRenderer {
                             ui.label(
                                 RichText::new(format!("{blocked}"))
                                     .size(11.0)
-                                    .color(Color32::from_rgb(80, 200, 120)),
+                                    .color(palette.shield_ok),
                             );
                         });
 
@@ -798,18 +1130,26 @@ impl ChromeRenderer {
                             ui.add_space(10.0);
                             let (icon_rect, _) =
                                 ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
-                            paint_rail_icon(ui, icon_rect, RailIcon::Chip, RAIL_TEXT_DIM);
+                            paint_rail_icon(ui, icon_rect, RailIcon::Chip, palette.text_dim);
                             ui.add_space(3.0);
                             ui.label(
                                 RichText::new(format!("RAM {} MB", state.ram_mb))
                                     .size(11.0)
-                                    .color(RAIL_TEXT_DIM),
+                                    .color(palette.text_dim),
                             );
                         });
                     });
                 });
             });
-        state.tooltip = rail_tooltip;
+        // Applied after the panel closure releases its borrow of `state`.
+        if let Some((tab_id, anchor)) = menu_request {
+            state.open_tab_menu(tab_id, anchor);
+        }
+        state.tooltip = if state.menu.is_some() {
+            None
+        } else {
+            rail_tooltip
+        };
 
         // Keep the rail width associated with the panel for tests/debugging.
         let _ = rail.response.rect;
@@ -840,6 +1180,7 @@ impl ChromeRenderer {
 
         let execute_enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let mut executed = false;
+        let palette = state.theme.palette();
 
         let screen = ctx.screen_rect();
         let palette_width = COMMAND_PALETTE_WIDTH.min((screen.width() - 24.0).max(200.0));
@@ -854,11 +1195,8 @@ impl ChromeRenderer {
                 // Allocate the full screen so the Area's clip rect includes the
                 // overlay; painting outside an unallocated Area gets clipped.
                 let (overlay_rect, _) = ui.allocate_exact_size(screen.size(), Sense::hover());
-                ui.painter().rect_filled(
-                    overlay_rect,
-                    Rounding::ZERO,
-                    Color32::from_rgba_unmultiplied(0, 0, 0, 150),
-                );
+                ui.painter()
+                    .rect_filled(overlay_rect, Rounding::ZERO, palette.scrim);
             });
 
         let mut palette_rect =
@@ -870,8 +1208,8 @@ impl ChromeRenderer {
             .show(ctx, |ui| {
                 ui.set_width(palette_width);
                 palette_rect = Frame::none()
-                    .fill(Color32::from_rgb(30, 32, 38))
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(72, 88, 116)))
+                    .fill(palette.palette_bg)
+                    .stroke(Stroke::new(1.0_f32, palette.palette_border))
                     .rounding(Rounding::same(12.0))
                     .inner_margin(egui::Margin::symmetric(14.0, 12.0))
                     .show(ui, |ui| {
@@ -883,7 +1221,7 @@ impl ChromeRenderer {
                             TextEdit::singleline(&mut state.command_palette_query)
                                 .id(input_id)
                                 .hint_text("Search, open a tab, or enter an address…")
-                                .text_color(Color32::WHITE)
+                                .text_color(palette.text_strong)
                                 .frame(false)
                                 .desired_width(palette_width - 28.0),
                         );
@@ -898,7 +1236,7 @@ impl ChromeRenderer {
                         if items.is_empty() {
                             ui.label(
                                 RichText::new("No matching commands")
-                                    .color(Color32::GRAY)
+                                    .color(palette.palette_subtext)
                                     .size(12.0),
                             );
                         } else {
@@ -908,7 +1246,7 @@ impl ChromeRenderer {
                                     vec2(palette_width - 28.0, 34.0),
                                     Sense::click(),
                                 );
-                                let fill = palette_row_fill(selected, row_resp.hovered());
+                                let fill = palette_row_fill(palette, selected, row_resp.hovered());
                                 ui.painter()
                                     .rect_filled(row_rect, Rounding::same(6.0), fill);
 
@@ -923,13 +1261,13 @@ impl ChromeRenderer {
                                         ui.label(
                                             RichText::new(&item.label)
                                                 .size(12.0)
-                                                .color(Color32::WHITE),
+                                                .color(palette.text_strong),
                                         );
                                         ui.add_space(8.0);
                                         ui.label(
                                             RichText::new(truncate_title(&item.subtitle, 38))
                                                 .size(10.0)
-                                                .color(Color32::from_rgb(155, 160, 170)),
+                                                .color(palette.palette_subtext),
                                         );
                                     });
                                 });
@@ -946,7 +1284,7 @@ impl ChromeRenderer {
                             ui.label(
                                 RichText::new("↑↓ select   ↵ run   esc close")
                                     .size(10.0)
-                                    .color(Color32::from_rgb(120, 125, 135)),
+                                    .color(palette.palette_hint),
                             );
                         });
                     })
@@ -977,6 +1315,123 @@ impl ChromeRenderer {
         }
     }
 
+    /// Draw the right-click tab menu in the shared transparent overlay.
+    ///
+    /// The native CEF child view sits above the main window's wgpu layer, so
+    /// this menu must live in a separate top-level window. It is intentionally
+    /// not dimmed: the page remains visible behind the card, and a primary
+    /// click anywhere outside the card dismisses it.
+    fn build_tab_menu(ctx: &egui::Context, state: &mut ChromeState, actions: &mut Vec<UiAction>) {
+        let Some(menu) = state.menu.clone() else {
+            return;
+        };
+        let items = rail_menu_items(state, menu.tab_id);
+        state.menu_selection = clamp_command_selection(state.menu_selection, items.len());
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            state.close_tab_menu();
+            return;
+        }
+        let move_up = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
+        let move_down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+        state.menu_selection =
+            advance_command_selection(state.menu_selection, items.len(), move_up, move_down);
+        let execute_enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut executed = false;
+        let palette = state.theme.palette();
+
+        let screen = ctx.screen_rect();
+        let width = menu.width.min((screen.width() - 12.0).max(160.0));
+        let height = menu.height.min((screen.height() - 12.0).max(96.0));
+        let x = menu.anchor.x.clamp(
+            screen.left() + 4.0,
+            (screen.right() - width - 4.0).max(screen.left() + 4.0),
+        );
+        let y = menu.anchor.y.clamp(
+            screen.top() + 4.0,
+            (screen.bottom() - height - 4.0).max(screen.top() + 4.0),
+        );
+        let anchor = pos2(x, y);
+        let mut card_rect = egui::Rect::from_min_size(anchor, vec2(width, height));
+
+        egui::Area::new(egui::Id::new("tab_context_menu"))
+            .order(Order::Foreground)
+            .fixed_pos(anchor)
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_width(width - 4.0);
+                card_rect = Frame::none()
+                    .fill(palette.menu_bg)
+                    .stroke(Stroke::new(1.0_f32, palette.menu_border))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(egui::Margin::symmetric(6.0, 6.0))
+                    .show(ui, |ui| {
+                        for (index, item) in items.iter().enumerate() {
+                            let (row_rect, row_resp) = ui.allocate_exact_size(
+                                vec2(width - 16.0, RAIL_MENU_ROW_HEIGHT),
+                                Sense::click(),
+                            );
+                            let selected = index == state.menu_selection;
+                            let fill = palette_row_fill(
+                                palette,
+                                selected,
+                                row_resp.hovered() && item.enabled,
+                            );
+                            ui.painter()
+                                .rect_filled(row_rect, Rounding::same(5.0), fill);
+
+                            let text_color = if !item.enabled {
+                                palette.menu_disabled
+                            } else if selected {
+                                palette.text_strong
+                            } else {
+                                palette.text
+                            };
+                            // Paint directly into the same rect that receives
+                            // the click. A nested `allocate_new_ui` also advances
+                            // the parent cursor, which drifts the painted rows
+                            // away from their hover targets.
+                            let label = item.label.to_string();
+                            ui.painter().text(
+                                pos2(row_rect.min.x + 10.0, row_rect.center().y),
+                                Align2::LEFT_CENTER,
+                                label.as_str(),
+                                FontId::new(12.0, FontFamily::Proportional),
+                                text_color,
+                            );
+
+                            if row_resp.clicked() && item.enabled {
+                                apply_menu_item(ctx, &item.action, state, actions);
+                                executed = true;
+                            }
+                        }
+                    })
+                    .response
+                    .rect
+                    .expand(2.0);
+            });
+
+        let outside_click = ctx.input(|i| {
+            rail_menu_click_outside(
+                card_rect,
+                i.pointer.latest_pos(),
+                i.pointer.primary_clicked(),
+            )
+        });
+        if outside_click {
+            state.close_tab_menu();
+            return;
+        }
+
+        if execute_enter && !executed {
+            if let Some(item) = items.get(state.menu_selection) {
+                if item.enabled {
+                    apply_menu_item(ctx, &item.action, state, actions);
+                }
+            }
+        }
+    }
+
     /// Record a tooltip for the hovered rail row. It is painted later by a
     /// transparent overlay window so it appears above the native CEF view.
     fn chrome_tooltip(
@@ -986,7 +1441,9 @@ impl ChromeRenderer {
         text: impl Into<String>,
         expanded: bool,
     ) {
-        if !response.hovered() {
+        // Expanded controls already draw visible labels. Tooltips are reserved
+        // for the collapsed icon rail so they act as the button labels there.
+        if !rail_tooltip_enabled(expanded) || !response.hovered() {
             return;
         }
 
@@ -1003,7 +1460,13 @@ impl ChromeRenderer {
     }
 
     /// Draw a cached favicon into an explicit rect, or a vector globe fallback.
-    fn paint_favicon_in_rect(&self, ui: &mut Ui, tab: &TabInfo, rect: egui::Rect) {
+    fn paint_favicon_in_rect(
+        &self,
+        ui: &mut Ui,
+        tab: &TabInfo,
+        rect: egui::Rect,
+        palette: &ChromePalette,
+    ) {
         if !ui.is_rect_visible(rect) {
             return;
         }
@@ -1016,15 +1479,20 @@ impl ChromeRenderer {
             }
         }
 
-        paint_rail_icon(ui, rect.shrink(2.0), RailIcon::Globe, RAIL_TEXT_DIM);
+        paint_rail_icon(ui, rect.shrink(2.0), RailIcon::Globe, palette.text_dim);
     }
 
     /// A compact square icon button used by the collapsed rail and expanded
     /// header. The hover state uses the same palette as tab rows.
-    fn rail_icon_button(ui: &mut Ui, size: egui::Vec2, icon: RailIcon) -> Response {
+    fn rail_icon_button(
+        ui: &mut Ui,
+        size: egui::Vec2,
+        icon: RailIcon,
+        palette: &ChromePalette,
+    ) -> Response {
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
         let fill = if response.hovered() {
-            RAIL_SURFACE
+            palette.rail_surface
         } else {
             Color32::TRANSPARENT
         };
@@ -1034,9 +1502,9 @@ impl ChromeRenderer {
             rect.shrink(5.0),
             icon,
             if response.hovered() {
-                Color32::WHITE
+                palette.text_strong
             } else {
-                RAIL_TEXT
+                palette.text
             },
         );
         response
@@ -1049,14 +1517,20 @@ impl ChromeRenderer {
         height: f32,
         icon: RailIcon,
         label: &str,
+        palette: &ChromePalette,
     ) -> Response {
         let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
         let fill = if response.hovered() {
-            RAIL_SURFACE
+            palette.rail_surface
         } else {
             Color32::TRANSPARENT
         };
         ui.painter().rect_filled(rect, Rounding::same(7.0), fill);
+        let content_color = if response.hovered() {
+            palette.text_strong
+        } else {
+            palette.text
+        };
         paint_rail_icon(
             ui,
             egui::Rect::from_center_size(
@@ -1064,22 +1538,14 @@ impl ChromeRenderer {
                 vec2(18.0, 18.0),
             ),
             icon,
-            if response.hovered() {
-                Color32::WHITE
-            } else {
-                RAIL_TEXT
-            },
+            content_color,
         );
         ui.painter().text(
             pos2(rect.min.x + 34.0, rect.center().y),
             Align2::LEFT_CENTER,
             label,
             FontId::new(12.0, FontFamily::Proportional),
-            if response.hovered() {
-                Color32::WHITE
-            } else {
-                RAIL_TEXT
-            },
+            content_color,
         );
         response
     }
@@ -1092,6 +1558,7 @@ impl ChromeRenderer {
         row_hovered: bool,
         tab_id: u64,
         expanded: bool,
+        palette: &ChromePalette,
     ) -> Response {
         let size = if expanded { 18.0 } else { 14.0 };
         let rect =
@@ -1103,19 +1570,25 @@ impl ChromeRenderer {
         );
         if row_hovered || response.hovered() {
             ui.painter()
-                .rect_filled(rect, Rounding::same(4.0), Color32::from_rgb(64, 70, 84));
-            paint_rail_icon(ui, rect.shrink(2.0), RailIcon::Close, Color32::WHITE);
+                .rect_filled(rect, Rounding::same(4.0), palette.close_bg);
+            paint_rail_icon(ui, rect.shrink(2.0), RailIcon::Close, palette.close_icon);
         }
         response
     }
 
     /// Shared tab-row background. Drawing this against the same rect as the
     /// row contents is what keeps the active/hover highlight aligned.
-    fn paint_tab_row(ui: &Ui, rect: egui::Rect, is_active: bool, hovered: bool) {
+    fn paint_tab_row(
+        ui: &Ui,
+        rect: egui::Rect,
+        is_active: bool,
+        hovered: bool,
+        palette: &ChromePalette,
+    ) {
         let fill = if is_active {
-            RAIL_ROW_ACTIVE
+            palette.rail_row_active
         } else if hovered {
-            RAIL_ROW_HOVER
+            palette.rail_row_hover
         } else {
             Color32::TRANSPARENT
         };
@@ -1125,29 +1598,34 @@ impl ChromeRenderer {
             ui.painter().rect_stroke(
                 rect.shrink(0.5),
                 Rounding::same(7.0),
-                Stroke::new(1.0_f32, Color32::from_rgb(86, 128, 192)),
+                Stroke::new(1.0_f32, palette.tab_border),
             );
             ui.painter().rect_filled(
                 egui::Rect::from_min_size(rect.min, vec2(3.0, rect.height())),
                 Rounding::same(1.5),
-                RAIL_ACCENT,
+                palette.rail_accent,
             );
         }
     }
 
     /// Loading/hibernated marker anchored inside the tab row. It shifts left
     /// while the close button is visible so the two never overlap.
-    fn paint_tab_status(ui: &Ui, row_rect: egui::Rect, tab: &TabInfo, close_visible: bool) {
+    fn paint_tab_status(
+        ui: &Ui,
+        row_rect: egui::Rect,
+        tab: &TabInfo,
+        close_visible: bool,
+        palette: &ChromePalette,
+    ) {
         let center = tab_status_center(row_rect, close_visible);
         if tab.is_loading {
-            ui.painter()
-                .circle_filled(center, 3.5, Color32::from_rgb(115, 190, 255));
+            ui.painter().circle_filled(center, 3.5, palette.loading);
         } else if tab.display_state == TabDisplayState::Hibernated {
             paint_rail_icon(
                 ui,
                 egui::Rect::from_center_size(center, vec2(12.0, 12.0)),
                 RailIcon::Moon,
-                RAIL_TEXT_DIM,
+                palette.text_dim,
             );
         }
     }
@@ -1157,12 +1635,13 @@ impl ChromeRenderer {
 // Palette overlay renderer
 // ---------------------------------------------------------------------------
 
-/// Owns the transparent top-level window used for the command palette.
+/// Owns the transparent top-level window shared by the command palette and
+/// the rail tab context menu.
 ///
 /// The CEF child view is a native view above the main window's wgpu layer, so
 /// an in-window egui overlay would be covered by the page. A separate native
 /// window lets the page stay visible behind a real overlay on every platform.
-pub struct PaletteRenderer {
+pub struct ChromeOverlayRenderer {
     surface: wgpu::Surface<'static>,
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -1173,7 +1652,7 @@ pub struct PaletteRenderer {
     max_texture_dim: u32,
 }
 
-impl PaletteRenderer {
+impl ChromeOverlayRenderer {
     pub fn new(
         window: Arc<winit::window::Window>,
         instance: &wgpu::Instance,
@@ -1263,7 +1742,7 @@ impl PaletteRenderer {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    /// Render the palette into the transparent overlay window.
+    /// Render the palette or tab menu into the transparent overlay window.
     pub fn render(
         &mut self,
         window: &winit::window::Window,
@@ -1271,7 +1750,9 @@ impl PaletteRenderer {
     ) -> Vec<UiAction> {
         let mut actions = Vec::new();
         let mut raw_input = self.egui_state.take_egui_input(window);
-        let focus_before = state.command_palette_focus_requested;
+        let menu_open = state.menu.is_some();
+        let focus_before = state.command_palette_focus_requested && !menu_open;
+        state.theme.apply_visuals(&self.egui_ctx);
 
         if focus_before {
             raw_input.events.push(egui::Event::Key {
@@ -1286,7 +1767,11 @@ impl PaletteRenderer {
 
         let egui_ctx = self.egui_ctx.clone();
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            ChromeRenderer::build_command_palette(ctx, state, &mut actions, focus_command);
+            if menu_open {
+                ChromeRenderer::build_tab_menu(ctx, state, &mut actions);
+            } else {
+                ChromeRenderer::build_command_palette(ctx, state, &mut actions, focus_command);
+            }
         });
         // The rail button raises this flag during the main window's render,
         // which happens before this overlay's first frame. Consume it here.
@@ -1476,8 +1961,15 @@ impl TooltipRenderer {
     }
 
     /// Paint the tooltip card into the transparent overlay window.
-    pub fn render(&mut self, window: &winit::window::Window, tooltip: &RailTooltip) {
+    pub fn render(
+        &mut self,
+        window: &winit::window::Window,
+        tooltip: &RailTooltip,
+        theme: ChromeTheme,
+    ) {
         self.resize(window.inner_size());
+        theme.apply_visuals(&self.egui_ctx);
+        let palette = theme.palette();
         let raw_input = self.egui_state.take_egui_input(window);
         let card = tooltip.clone();
         let egui_ctx = self.egui_ctx.clone();
@@ -1486,8 +1978,8 @@ impl TooltipRenderer {
                 .frame(Frame::none().fill(Color32::TRANSPARENT))
                 .show(ctx, |ui| {
                     Frame::none()
-                        .fill(Color32::from_rgb(16, 19, 26))
-                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(110, 130, 160)))
+                        .fill(palette.tooltip_bg)
+                        .stroke(Stroke::new(1.0_f32, palette.tooltip_border))
                         .rounding(Rounding::same(7.0))
                         .inner_margin(egui::Margin::symmetric(8.0, 7.0))
                         .show(ui, |ui| {
@@ -1514,7 +2006,7 @@ impl TooltipRenderer {
                                     Align2::CENTER_CENTER,
                                     *line,
                                     FontId::proportional(11.0),
-                                    Color32::from_rgb(250, 251, 255),
+                                    palette.tooltip_text,
                                 );
                             }
                         });
@@ -1597,13 +2089,14 @@ impl TooltipRenderer {
 /// consistent, familiar icon language.
 fn paint_rail_icon(ui: &Ui, rect: egui::Rect, icon: RailIcon, color: Color32) {
     use egui_material_icons::icons::{
-        ICON_ADD, ICON_BEDTIME, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_MEMORY,
-        ICON_PUBLIC, ICON_SEARCH, ICON_SHIELD,
+        ICON_ADD, ICON_BEDTIME, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_CODE,
+        ICON_MEMORY, ICON_PUBLIC, ICON_SEARCH, ICON_SHIELD,
     };
 
     let glyph = match icon {
         RailIcon::Plus => ICON_ADD,
         RailIcon::Search => ICON_SEARCH,
+        RailIcon::Code => ICON_CODE,
         RailIcon::ChevronLeft => ICON_CHEVRON_LEFT,
         RailIcon::ChevronRight => ICON_CHEVRON_RIGHT,
         RailIcon::Moon => ICON_BEDTIME,
@@ -1627,6 +2120,12 @@ fn paint_rail_icon(ui: &Ui, rect: egui::Rect, icon: RailIcon, color: Color32) {
 // Pure chrome helpers (unit-tested)
 // ---------------------------------------------------------------------------
 
+/// Tooltips are labels for the icon-only collapsed rail. Expanded controls
+/// already draw visible text, so expanded-mode tooltips are disabled.
+pub fn rail_tooltip_enabled(expanded: bool) -> bool {
+    !expanded
+}
+
 /// Tooltip width/height for each rail mode. Both modes use a readable card
 /// placed over the page; expanded rows include the URL and need more height.
 pub fn rail_tooltip_metrics(expanded: bool) -> (f32, f32) {
@@ -1634,6 +2133,95 @@ pub fn rail_tooltip_metrics(expanded: bool) -> (f32, f32) {
         (TOOLTIP_WIDTH, TOOLTIP_HEIGHT_EXPANDED)
     } else {
         (TOOLTIP_WIDTH, TOOLTIP_HEIGHT_COLLAPSED)
+    }
+}
+
+/// Fixed card size for the rail tab context menu.
+pub fn rail_menu_metrics() -> (f32, f32) {
+    const ITEM_COUNT: usize = 9;
+    (
+        RAIL_MENU_WIDTH,
+        ITEM_COUNT as f32 * RAIL_MENU_ROW_HEIGHT + RAIL_MENU_PADDING * 2.0,
+    )
+}
+
+/// Place the context menu beside the rail, near the right-click, and clamp it
+/// inside the visible window. This is the card's top-left in main-window
+/// logical coordinates.
+pub fn rail_menu_anchor(
+    rail: egui::Rect,
+    pointer: egui::Pos2,
+    screen: egui::Rect,
+    menu_width: f32,
+    menu_height: f32,
+) -> egui::Pos2 {
+    let min_x = rail.right() + 8.0;
+    let max_x = (screen.right() - menu_width - 6.0).max(min_x);
+    let x = pointer.x.clamp(min_x, max_x);
+    let max_y = (screen.bottom() - menu_height - 6.0).max(screen.top() + 6.0);
+    let y = (pointer.y - 8.0).clamp(screen.top() + 6.0, max_y);
+    pos2(x, y)
+}
+
+/// True when a click landed outside the context-menu card.
+pub fn rail_menu_click_outside(
+    card: egui::Rect,
+    pointer_pos: Option<egui::Pos2>,
+    primary_clicked: bool,
+) -> bool {
+    primary_clicked && pointer_pos.is_some_and(|p| !card.contains(p))
+}
+
+/// Build the context-menu rows for the right-clicked tab.
+pub fn rail_menu_items(state: &ChromeState, tab_id: u64) -> Vec<RailMenuItem> {
+    let index = state.tabs.iter().position(|tab| tab.id == tab_id);
+    let tab_count = state.tabs.len();
+    let item = |label, action, enabled| RailMenuItem {
+        label,
+        action,
+        enabled,
+    };
+    vec![
+        item("New tab", RailMenuAction::NewTab, true),
+        item("Duplicate tab", RailMenuAction::DuplicateTab, true),
+        item("Copy URL", RailMenuAction::CopyUrl, true),
+        item("Reload tab", RailMenuAction::Reload, true),
+        item("Close tab", RailMenuAction::CloseTab, true),
+        item(
+            "Close other tabs",
+            RailMenuAction::CloseOtherTabs,
+            tab_count > 1,
+        ),
+        item(
+            "Close tabs below this tab",
+            RailMenuAction::CloseTabsToRight,
+            index.is_some_and(|i| i + 1 < tab_count),
+        ),
+        item(
+            "Reopen closed tab (Cmd/Ctrl+Z)",
+            RailMenuAction::ReopenClosedTab,
+            state.can_reopen_tab,
+        ),
+        item("DevTools (new window)", RailMenuAction::OpenDevTools, true),
+    ]
+}
+
+/// Convert a menu command into a tab-manager action. Copying a URL is handled
+/// directly by the overlay because it needs the egui clipboard context.
+pub fn rail_menu_ui_action(action: RailMenuAction, tab_id: u64) -> Option<UiAction> {
+    match action {
+        RailMenuAction::NewTab => Some(UiAction::NewTab { url: None }),
+        RailMenuAction::DuplicateTab => Some(UiAction::DuplicateTab { tab_id }),
+        RailMenuAction::CopyUrl => None,
+        RailMenuAction::Reload => Some(UiAction::Reload {
+            tab_id,
+            ignore_cache: false,
+        }),
+        RailMenuAction::CloseTab => Some(UiAction::CloseTab { tab_id }),
+        RailMenuAction::CloseOtherTabs => Some(UiAction::CloseOtherTabs { tab_id }),
+        RailMenuAction::CloseTabsToRight => Some(UiAction::CloseTabsToRight { tab_id }),
+        RailMenuAction::ReopenClosedTab => Some(UiAction::ReopenClosedTab),
+        RailMenuAction::OpenDevTools => Some(UiAction::OpenDevTools { tab_id }),
     }
 }
 
@@ -1730,11 +2318,11 @@ pub fn advance_command_selection(selection: usize, len: usize, up: bool, down: b
 }
 
 /// Selected rows win over hover; hover is only a secondary affordance.
-pub fn palette_row_fill(selected: bool, hovered: bool) -> Color32 {
+pub fn palette_row_fill(palette: &ChromePalette, selected: bool, hovered: bool) -> Color32 {
     if selected {
-        PALETTE_ROW_SELECTED
+        palette.palette_row_selected
     } else if hovered {
-        PALETTE_ROW_HOVER
+        palette.palette_row_hover
     } else {
         Color32::TRANSPARENT
     }
@@ -1794,6 +2382,18 @@ pub fn command_palette_items(
         }
     }
 
+    if needle.contains("devtool") {
+        if let Some(tab_id) = active_tab_id {
+            items.push(CommandPaletteItem {
+                icon: "⌘",
+                label: "Open DevTools".to_string(),
+                subtitle: "Inspect the active tab in a new window".to_string(),
+                action: CommandAction::OpenDevTools,
+            });
+            let _ = tab_id;
+        }
+    }
+
     let url = resolve_omnibox(trimmed);
     let looks_like_address = trimmed.contains('.')
         || trimmed.contains("://")
@@ -1841,8 +2441,35 @@ fn apply_command_item(
         }),
         CommandAction::HibernateAll => actions.push(UiAction::HibernateAllBackground),
         CommandAction::ToggleRail => state.toggle_rail(),
+        CommandAction::OpenDevTools => {
+            if let Some(tab_id) = state.active_tab_id {
+                actions.push(UiAction::OpenDevTools { tab_id });
+            }
+        }
     }
     state.close_command_palette();
+}
+
+/// Apply one context-menu command. `CopyUrl` is handled here because it needs
+/// the egui clipboard context; every other command is dispatched to TabManager.
+fn apply_menu_item(
+    ctx: &egui::Context,
+    action: &RailMenuAction,
+    state: &mut ChromeState,
+    actions: &mut Vec<UiAction>,
+) {
+    if *action == RailMenuAction::CopyUrl {
+        if let Some(menu) = state.menu.as_ref() {
+            if let Some(tab) = state.tabs.iter().find(|tab| tab.id == menu.tab_id) {
+                ctx.copy_text(tab.url.clone());
+            }
+        }
+    } else if let Some(action) =
+        rail_menu_ui_action(*action, state.menu.as_ref().map_or(0, |m| m.tab_id))
+    {
+        actions.push(action);
+    }
+    state.close_tab_menu();
 }
 
 // ---------------------------------------------------------------------------
@@ -1884,14 +2511,17 @@ mod tests {
     use egui::{pos2, vec2, Color32};
 
     use super::{
-        advance_command_selection, clamp_command_selection, command_palette_click_outside,
-        command_palette_items, focus_request_after_render, page_tooltip_anchor, palette_row_fill,
-        preferred_surface_format, rail_tooltip_metrics, resolve_omnibox, tab_close_center,
-        tab_status_center, truncate_title, ChromeState, CommandAction, TabDisplayState, TabInfo,
-        PALETTE_ROW_HOVER, PALETTE_ROW_SELECTED, TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED,
-        TOOLTIP_WIDTH,
+        advance_command_selection, apply_command_item, clamp_command_selection,
+        command_palette_click_outside, command_palette_items, focus_request_after_render,
+        page_tooltip_anchor, palette_row_fill, preferred_surface_format, rail_menu_anchor,
+        rail_menu_click_outside, rail_menu_items, rail_menu_metrics, rail_menu_ui_action,
+        rail_tooltip_enabled, rail_tooltip_metrics, resolve_omnibox, tab_close_center,
+        tab_status_center, truncate_title, ChromePalette, ChromeState, ChromeTheme, CommandAction,
+        RailMenuAction, TabDisplayState, TabInfo, TOOLTIP_HEIGHT_COLLAPSED,
+        TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
     };
     use crate::config::{DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX};
+    use crate::events::UiAction;
 
     fn tab(id: u64, title: &str, url: &str) -> TabInfo {
         TabInfo {
@@ -2010,6 +2640,12 @@ mod tests {
     }
 
     #[test]
+    fn tooltips_are_limited_to_the_collapsed_rail() {
+        assert!(rail_tooltip_enabled(false));
+        assert!(!rail_tooltip_enabled(true));
+    }
+
+    #[test]
     fn collapsed_tooltips_are_readable_and_render_over_the_page() {
         let (width, height) = rail_tooltip_metrics(false);
         assert_eq!(width, TOOLTIP_WIDTH);
@@ -2110,10 +2746,62 @@ mod tests {
 
     #[test]
     fn palette_row_fill_prefers_keyboard_selection_over_hover() {
-        assert_eq!(palette_row_fill(true, true), PALETTE_ROW_SELECTED);
-        assert_eq!(palette_row_fill(true, false), PALETTE_ROW_SELECTED);
-        assert_eq!(palette_row_fill(false, true), PALETTE_ROW_HOVER);
-        assert_eq!(palette_row_fill(false, false), Color32::TRANSPARENT);
+        let palette = &ChromePalette::DARK;
+        assert_eq!(
+            palette_row_fill(palette, true, true),
+            palette.palette_row_selected
+        );
+        assert_eq!(
+            palette_row_fill(palette, true, false),
+            palette.palette_row_selected
+        );
+        assert_eq!(
+            palette_row_fill(palette, false, true),
+            palette.palette_row_hover
+        );
+        assert_eq!(
+            palette_row_fill(palette, false, false),
+            Color32::TRANSPARENT
+        );
+    }
+
+    #[test]
+    fn theme_maps_system_appearance_and_defaults_to_dark() {
+        use winit::window::Theme;
+
+        assert_eq!(ChromeTheme::default(), ChromeTheme::Dark);
+        assert_eq!(ChromeTheme::from_winit(None), ChromeTheme::Dark);
+        assert_eq!(
+            ChromeTheme::from_winit(Some(Theme::Dark)),
+            ChromeTheme::Dark
+        );
+        assert_eq!(
+            ChromeTheme::from_winit(Some(Theme::Light)),
+            ChromeTheme::Light
+        );
+    }
+
+    #[test]
+    fn light_palette_keeps_contrast_and_differs_from_dark() {
+        let dark = &ChromePalette::DARK;
+        let light = &ChromePalette::LIGHT;
+
+        assert_ne!(dark.rail_bg, light.rail_bg);
+        assert_ne!(dark.text, light.text);
+        assert_ne!(dark.palette_bg, light.palette_bg);
+        assert_ne!(dark.tooltip_bg, light.tooltip_bg);
+
+        // The light rail must be brighter than its text, while the dark rail
+        // is darker than its text. This catches inverted palette entries.
+        let lum = |color: Color32| {
+            0.2126 * color.r() as f32 + 0.7152 * color.g() as f32 + 0.0722 * color.b() as f32
+        };
+        assert!(lum(light.rail_bg) > lum(light.text));
+        assert!(lum(dark.rail_bg) < lum(dark.text));
+
+        // Selected rows need a visible fill in both themes.
+        assert_ne!(light.palette_row_selected, Color32::TRANSPARENT);
+        assert_ne!(light.palette_row_hover, Color32::TRANSPARENT);
     }
 
     #[test]
@@ -2180,6 +2868,22 @@ mod tests {
     }
 
     #[test]
+    fn palette_offers_devtools_action() {
+        let items = command_palette_items("devtools", &[], Some(7));
+        assert!(items
+            .iter()
+            .any(|item| item.action == CommandAction::OpenDevTools));
+
+        let mut state = ChromeState::default();
+        state.active_tab_id = Some(7);
+        state.command_palette_open = true;
+        let mut actions = Vec::new();
+        apply_command_item(&CommandAction::OpenDevTools, &mut state, &mut actions);
+        assert_eq!(actions, vec![UiAction::OpenDevTools { tab_id: 7 }]);
+        assert!(!state.command_palette_open);
+    }
+
+    #[test]
     fn default_state_shows_the_workspace_rail() {
         let state = ChromeState::default();
         assert!(state.rail_expanded);
@@ -2200,5 +2904,164 @@ mod tests {
         assert!(!state.command_palette_open);
         assert!(state.command_palette_query.is_empty());
         assert!(!state.command_palette_focus_requested);
+    }
+
+    #[test]
+    fn tab_menu_metrics_and_anchor_stay_beside_rail() {
+        let (width, height) = rail_menu_metrics();
+        assert_eq!(width, 224.0);
+        assert_eq!(height, 9.0 * 28.0 + 14.0);
+
+        let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(180.0, 800.0));
+        let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let anchor = rail_menu_anchor(rail, pos2(400.0, 300.0), screen, width, height);
+        assert_eq!(anchor, pos2(400.0, 292.0));
+        assert!(anchor.x >= rail.right());
+        assert!(anchor.y + height <= screen.bottom());
+
+        let near_bottom = rail_menu_anchor(rail, pos2(400.0, 795.0), screen, width, height);
+        assert_eq!(near_bottom.y, 800.0 - height - 6.0);
+        assert!(near_bottom.y + height <= screen.bottom());
+    }
+
+    #[test]
+    fn tab_menu_click_outside_ignores_missing_pointer_and_inside_clicks() {
+        let card = egui::Rect::from_min_size(pos2(188.0, 92.0), vec2(224.0, 238.0));
+        assert!(rail_menu_click_outside(
+            card,
+            Some(pos2(100.0, 200.0)),
+            true
+        ));
+        assert!(!rail_menu_click_outside(
+            card,
+            Some(pos2(200.0, 120.0)),
+            true
+        ));
+        assert!(!rail_menu_click_outside(
+            card,
+            Some(pos2(188.0, 92.0)),
+            true
+        ));
+        assert!(!rail_menu_click_outside(card, None, true));
+        assert!(!rail_menu_click_outside(
+            card,
+            Some(pos2(100.0, 200.0)),
+            false
+        ));
+    }
+
+    #[test]
+    fn tab_menu_rows_enable_only_available_commands() {
+        let mut state = ChromeState::default();
+        state.tabs = vec![tab(1, "First", "https://first.example")];
+
+        let items = rail_menu_items(&state, 1);
+        assert_eq!(items.len(), 9);
+        assert!(items
+            .iter()
+            .any(|item| item.action == RailMenuAction::NewTab && item.enabled));
+        assert!(items
+            .iter()
+            .any(|item| item.action == RailMenuAction::CopyUrl && item.enabled));
+        assert!(!items
+            .iter()
+            .any(|item| item.action == RailMenuAction::CloseOtherTabs && item.enabled));
+        assert!(!items
+            .iter()
+            .any(|item| item.action == RailMenuAction::CloseTabsToRight && item.enabled));
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.action == RailMenuAction::CloseTabsToRight)
+                .map(|item| item.label),
+            Some("Close tabs below this tab")
+        );
+        assert!(!items
+            .iter()
+            .any(|item| item.action == RailMenuAction::ReopenClosedTab && item.enabled));
+
+        assert!(items
+            .iter()
+            .any(|item| item.action == RailMenuAction::OpenDevTools && item.enabled));
+
+        state.tabs.push(tab(2, "Second", "https://second.example"));
+        state.can_reopen_tab = true;
+        let items = rail_menu_items(&state, 1);
+        assert!(items
+            .iter()
+            .any(|item| item.action == RailMenuAction::CloseOtherTabs && item.enabled));
+        assert!(items
+            .iter()
+            .any(|item| item.action == RailMenuAction::CloseTabsToRight && item.enabled));
+        assert!(items
+            .iter()
+            .any(|item| item.action == RailMenuAction::ReopenClosedTab && item.enabled));
+
+        let last_items = rail_menu_items(&state, 2);
+        assert!(!last_items
+            .iter()
+            .any(|item| item.action == RailMenuAction::CloseTabsToRight && item.enabled));
+    }
+
+    #[test]
+    fn tab_menu_actions_map_to_tab_manager_commands() {
+        assert_eq!(
+            rail_menu_ui_action(RailMenuAction::NewTab, 3),
+            Some(UiAction::NewTab { url: None })
+        );
+        assert_eq!(
+            rail_menu_ui_action(RailMenuAction::DuplicateTab, 3),
+            Some(UiAction::DuplicateTab { tab_id: 3 })
+        );
+        assert_eq!(rail_menu_ui_action(RailMenuAction::CopyUrl, 3), None);
+        assert_eq!(
+            rail_menu_ui_action(RailMenuAction::Reload, 3),
+            Some(UiAction::Reload {
+                tab_id: 3,
+                ignore_cache: false
+            })
+        );
+        assert_eq!(
+            rail_menu_ui_action(RailMenuAction::CloseTab, 3),
+            Some(UiAction::CloseTab { tab_id: 3 })
+        );
+        assert_eq!(
+            rail_menu_ui_action(RailMenuAction::CloseOtherTabs, 3),
+            Some(UiAction::CloseOtherTabs { tab_id: 3 })
+        );
+        assert_eq!(
+            rail_menu_ui_action(RailMenuAction::CloseTabsToRight, 3),
+            Some(UiAction::CloseTabsToRight { tab_id: 3 })
+        );
+        assert_eq!(
+            rail_menu_ui_action(RailMenuAction::ReopenClosedTab, 3),
+            Some(UiAction::ReopenClosedTab)
+        );
+        assert_eq!(
+            rail_menu_ui_action(RailMenuAction::OpenDevTools, 3),
+            Some(UiAction::OpenDevTools { tab_id: 3 })
+        );
+    }
+
+    #[test]
+    fn opening_tab_menu_replaces_palette_and_reset_selection() {
+        let mut state = ChromeState::default();
+        state.omnibox_text = "https://example.com".to_string();
+        state.command_selection = 4;
+        state.menu_selection = 5;
+        state.open_command_palette();
+        state.open_tab_menu(9, pos2(200.0, 100.0));
+
+        assert!(!state.command_palette_open);
+        assert!(state.command_palette_query.is_empty());
+        assert!(!state.command_palette_focus_requested);
+        let menu = state.menu.as_ref().expect("tab menu should be open");
+        assert_eq!(menu.tab_id, 9);
+        assert_eq!(menu.anchor, pos2(200.0, 100.0));
+        assert_eq!(state.menu_selection, 0);
+
+        state.close_tab_menu();
+        assert!(state.menu.is_none());
+        assert_eq!(state.menu_selection, 0);
     }
 }
