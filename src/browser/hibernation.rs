@@ -20,12 +20,15 @@ use sysinfo::{ProcessesToUpdate, System};
 use crate::browser::favicon::create_favicon_download_callback;
 use crate::browser::{adblocker, client};
 use crate::config::{
-    BrowserPreferences, RAM_CHECK_INTERVAL, RAM_CRITICAL_PRESSURE_THRESHOLD,
-    RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_PRESSURE, TAB_WATCHDOG_TICK_INTERVAL,
+    BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, RAM_CHECK_INTERVAL,
+    RAM_CRITICAL_PRESSURE_THRESHOLD, RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_PRESSURE,
+    TAB_WATCHDOG_TICK_INTERVAL,
 };
 use crate::events::{BrowserEvent, BrowserShortcut, UiAction};
-use crate::storage::db::{SessionTabSnapshot, StorageHandle};
-use crate::ui::chrome::{ChromeState, Favicon, TabDisplayState, TabInfo};
+use crate::storage::db::{BookmarkItem, SessionTabSnapshot, StorageHandle};
+use crate::ui::chrome::{
+    BookmarkInfo, ChromeState, Favicon, TabDisplayState, TabInfo, WorkspaceInfo,
+};
 use crate::ui::platform_view::{self, ContentRect};
 
 /// Derive the conventional favicon URL from a page URL. This is the fallback
@@ -126,6 +129,7 @@ pub enum TabState {
 /// Metadata preserved when a tab is closed so `Cmd/Ctrl+Z` can undo the close.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosedTab {
+    pub workspace_id: u64,
     pub url: String,
     pub title: String,
     /// Position the tab occupied before it was closed.
@@ -142,29 +146,45 @@ pub fn restore_insert_index(original_index: usize, tab_count: usize) -> usize {
 /// Number of pinned tabs that remain after excluding one tab. This is the
 /// boundary where a pinned tab is inserted (or where an unpinned tab lands
 /// when it leaves the pinned section).
-pub fn pinned_insert_index(tabs: &[Tab], exclude_index: Option<usize>) -> usize {
+pub fn pinned_insert_index(tabs: &[Tab], workspace_id: u64, exclude_index: Option<usize>) -> usize {
     tabs.iter()
         .enumerate()
-        .filter(|(index, tab)| Some(*index) != exclude_index && tab.pinned)
+        .filter(|(index, tab)| {
+            Some(*index) != exclude_index && tab.workspace_id == workspace_id && tab.pinned
+        })
         .count()
 }
 
-/// Choose an insertion index that preserves the pinned-before-unpinned
-/// invariant used by both the tab model and the native rail.
-pub fn insertion_index(tabs: &[Tab], requested: Option<usize>, pinned: bool) -> usize {
-    let boundary = pinned_insert_index(tabs, None);
-    let requested = requested.unwrap_or(tabs.len());
+/// Choose an insertion index that preserves the workspace-grouped,
+/// pinned-before-unpinned invariant used by the tab model and native rail.
+pub fn insertion_index(
+    tabs: &[Tab],
+    workspace_id: u64,
+    requested: Option<usize>,
+    pinned: bool,
+) -> usize {
+    let workspace_end = tabs
+        .iter()
+        .rposition(|tab| tab.workspace_id == workspace_id)
+        .map_or(tabs.len(), |index| index + 1);
+    let workspace_start = tabs
+        .iter()
+        .position(|tab| tab.workspace_id == workspace_id)
+        .unwrap_or(workspace_end);
+    let boundary = workspace_start + pinned_insert_index(tabs, workspace_id, None);
+    let requested = requested.unwrap_or(workspace_end);
     if pinned {
-        requested.min(boundary)
+        requested.clamp(workspace_start, boundary)
     } else {
-        requested.clamp(boundary, tabs.len())
+        requested.clamp(boundary, workspace_end)
     }
 }
 
 /// Capture the metadata needed to undo a tab close. Keeping this pure makes
-/// the closed-tab stack's title and index behavior testable without CEF.
+/// the closed-tab stack's title, index, and workspace behavior testable.
 pub fn closed_tab_from(tab: &Tab, index: usize) -> ClosedTab {
     ClosedTab {
+        workspace_id: tab.workspace_id,
         url: tab.url.clone(),
         title: tab.title.clone(),
         index,
@@ -243,6 +263,7 @@ pub fn should_hibernate_tab(
 
 pub struct Tab {
     pub id: u64,
+    pub workspace_id: u64,
     pub url: String,
     pub title: String,
     pub is_loading: bool,
@@ -259,6 +280,7 @@ impl std::fmt::Debug for Tab {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tab")
             .field("id", &self.id)
+            .field("workspace_id", &self.workspace_id)
             .field("url", &self.url)
             .field("title", &self.title)
             .field("is_loading", &self.is_loading)
@@ -276,6 +298,12 @@ impl std::fmt::Debug for Tab {
 pub struct TabManager {
     pub tabs: Vec<Tab>,
     pub active_tab_id: Option<u64>,
+    pub workspaces: Vec<Workspace>,
+    pub active_workspace_id: u64,
+    /// Remembers the selected tab in each workspace so switching back restores context.
+    active_tab_by_workspace: HashMap<u64, u64>,
+    /// Globally visible bookmarks, grouped by workspace name in `folder`.
+    pub bookmarks: Vec<BookmarkItem>,
     next_tab_id: u64,
 
     // Lock-free event channels for CEF callbacks -> UI
@@ -347,6 +375,8 @@ impl TabManager {
         content_rect: ContentRect,
         storage: Option<StorageHandle>,
         preferences: &BrowserPreferences,
+        workspaces: Vec<Workspace>,
+        bookmarks: Vec<BookmarkItem>,
     ) -> Self {
         let mut sys = System::new();
         sys.refresh_memory();
@@ -355,9 +385,23 @@ impl TabManager {
         let adblock_engine = adblocker::create_adblock_engine();
         let adblock_enabled = Arc::new(AtomicBool::new(preferences.adblock_enabled));
 
+        let mut workspaces = workspaces;
+        if workspaces.is_empty() {
+            workspaces.push(Workspace::default_workspace());
+        }
+        let active_workspace_id = workspaces
+            .iter()
+            .find(|workspace| workspace.is_active)
+            .or_else(|| workspaces.first())
+            .map_or(Workspace::DEFAULT_ID, |workspace| workspace.id);
+
         Self {
             tabs: Vec::new(),
             active_tab_id: None,
+            workspaces,
+            active_workspace_id,
+            active_tab_by_workspace: HashMap::new(),
+            bookmarks,
             next_tab_id: 1,
             event_sender,
             event_receiver,
@@ -398,25 +442,49 @@ impl TabManager {
         self.home_url = preferences.home_url().to_string();
     }
 
-    /// Restore previous session tabs (instant startup: active tab live, all others hibernated).
+    /// Restore previous session tabs (instant startup: only the active tab of
+    /// the active workspace is live; everything else starts hibernated).
     pub fn restore_session(&mut self, restored: Vec<SessionTabSnapshot>) {
         if restored.is_empty() {
             self.create_tab(None, true);
+            self.sync_session();
             return;
         }
 
-        let mut active_id = None;
+        let workspace_rank: HashMap<u64, usize> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(index, workspace)| (workspace.id, index))
+            .collect();
         let mut ordered = restored;
-        // Legacy sessions have no pin data, so always place pinned tabs first.
-        ordered.sort_by_key(|snapshot| !snapshot.is_pinned);
+        // Group by workspace first, then keep pinned tabs at the top of each group.
+        ordered.sort_by_key(|snapshot| {
+            (
+                workspace_rank
+                    .get(&snapshot.workspace_id)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+                !snapshot.is_pinned,
+            )
+        });
 
+        let mut active_by_workspace: HashMap<u64, u64> = HashMap::new();
         for snapshot in ordered {
             let id = self.next_tab_id;
             self.next_tab_id += 1;
+            // A stale session can reference a workspace that no longer exists.
+            // Fold those tabs into the active workspace so focus_tab can never
+            // activate a workspace id with no metadata behind it.
+            let workspace_id = if workspace_rank.contains_key(&snapshot.workspace_id) {
+                snapshot.workspace_id
+            } else {
+                self.active_workspace_id
+            };
 
-            let is_active = snapshot.is_active;
             let tab = Tab {
                 id,
+                workspace_id,
                 url: snapshot.url.clone(),
                 title: if snapshot.title.is_empty() {
                     "Restored Tab".to_string()
@@ -428,24 +496,31 @@ impl TabManager {
                 can_go_forward: false,
                 blocked_requests: 0,
                 pinned: snapshot.is_pinned,
-                state: if is_active {
-                    TabState::Active
-                } else {
-                    TabState::Hibernated
-                },
+                state: TabState::Hibernated,
                 browser: None,
                 favicon: None,
             };
 
             self.tabs.push(tab);
-
-            if is_active && active_id.is_none() {
-                active_id = Some(id);
+            if snapshot.is_active {
+                active_by_workspace.entry(workspace_id).or_insert(id);
             }
         }
 
-        // If no tab was marked active, pick the first one
-        let target_active = active_id.or_else(|| self.tabs.first().map(|t| t.id));
+        self.active_tab_by_workspace = active_by_workspace;
+
+        let first_in_active_workspace = self
+            .tabs
+            .iter()
+            .find(|tab| tab.workspace_id == self.active_workspace_id)
+            .map(|tab| tab.id);
+        let target_active = self
+            .active_tab_by_workspace
+            .get(&self.active_workspace_id)
+            .copied()
+            .or(first_in_active_workspace)
+            .or_else(|| self.tabs.first().map(|tab| tab.id));
+
         if let Some(id) = target_active {
             self.focus_tab(id);
         }
@@ -459,14 +534,25 @@ impl TabManager {
         let Some(closed) = self.recently_closed.pop() else {
             return;
         };
+        let workspace_id = if self.workspaces.iter().any(|w| w.id == closed.workspace_id) {
+            closed.workspace_id
+        } else {
+            self.active_workspace_id
+        };
         let index = restore_insert_index(closed.index, self.tabs.len());
-        tracing::info!("Re-opening closed tab at {}: {}", index, closed.url);
-        self.insert_tab(
+        tracing::info!(
+            "Re-opening closed tab at {} in workspace {}: {}",
+            index,
+            workspace_id,
+            closed.url
+        );
+        self.insert_tab_in_workspace(
             Some(closed.url),
             Some(closed.title),
             Some(index),
             true,
             closed.pinned,
+            workspace_id,
         );
     }
 
@@ -480,19 +566,34 @@ impl TabManager {
         self.tabs
             .iter()
             .map(|t| SessionTabSnapshot {
+                workspace_id: t.workspace_id,
                 url: t.url.clone(),
                 title: t.title.clone(),
-                is_active: Some(t.id) == self.active_tab_id,
+                is_active: self.active_tab_by_workspace.get(&t.workspace_id).copied() == Some(t.id),
                 is_hibernated: t.state == TabState::Hibernated,
                 is_pinned: t.pinned,
             })
             .collect()
     }
 
-    /// Sync open tabs to SQLite.
+    fn workspace_snapshots(&self) -> Vec<Workspace> {
+        if self.workspaces.is_empty() {
+            return vec![Workspace::default_workspace()];
+        }
+        self.workspaces
+            .iter()
+            .map(|workspace| Workspace {
+                is_active: workspace.id == self.active_workspace_id,
+                ..workspace.clone()
+            })
+            .collect()
+    }
+
+    /// Sync open tabs and workspace metadata to SQLite.
     pub fn sync_session(&self) {
         if let Some(ref storage) = self.storage {
             storage.save_session(self.session_snapshots());
+            storage.save_workspaces(self.workspace_snapshots());
         }
     }
 
@@ -519,7 +620,8 @@ impl TabManager {
         self.parent_window_view = parent_view;
     }
 
-    /// Create a new tab. If `make_active` is true, focuses the new tab immediately.
+    /// Create a new tab in the active workspace. If `make_active` is true,
+    /// focuses the new tab immediately.
     pub fn create_tab(&mut self, url: Option<String>, make_active: bool) -> u64 {
         self.insert_tab(url, None, None, make_active, false)
     }
@@ -539,7 +641,7 @@ impl TabManager {
         id
     }
 
-    /// Insert a tab with an optional restored title, position, and pin state.
+    /// Insert a tab in the active workspace.
     fn insert_tab(
         &mut self,
         url: Option<String>,
@@ -548,14 +650,41 @@ impl TabManager {
         make_active: bool,
         pinned: bool,
     ) -> u64 {
+        self.insert_tab_in_workspace(
+            url,
+            title,
+            index,
+            make_active,
+            pinned,
+            self.active_workspace_id,
+        )
+    }
+
+    /// Insert a tab in a specific workspace with optional restored title,
+    /// position, and pin state.
+    fn insert_tab_in_workspace(
+        &mut self,
+        url: Option<String>,
+        title: Option<String>,
+        index: Option<usize>,
+        make_active: bool,
+        pinned: bool,
+        workspace_id: u64,
+    ) -> u64 {
+        let workspace_id = if self.workspaces.iter().any(|w| w.id == workspace_id) {
+            workspace_id
+        } else {
+            self.active_workspace_id
+        };
         let id = self.next_tab_id;
         self.next_tab_id += 1;
 
         let target_url = url.unwrap_or_else(|| self.home_url.clone());
-        let at = insertion_index(&self.tabs, index, pinned);
+        let at = insertion_index(&self.tabs, workspace_id, index, pinned);
 
         let tab = Tab {
             id,
+            workspace_id,
             url: target_url.clone(),
             title: title.unwrap_or_else(|| "New Tab".to_string()),
             is_loading: false,
@@ -583,21 +712,23 @@ impl TabManager {
         id
     }
 
-    /// Toggle a tab between the compact pinned section and the normal tabs.
-    /// Pinning appends to the pinned section; unpinning inserts at its start.
+    /// Toggle a tab between the compact pinned section and the normal tabs of
+    /// its own workspace.
     pub fn toggle_pin_tab(&mut self, id: u64) {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return;
         };
+        let workspace_id = self.tabs[index].workspace_id;
         let pinned = !self.tabs[index].pinned;
-        let insert_at = pinned_insert_index(&self.tabs, Some(index));
+        let insert_at = pinned_insert_index(&self.tabs, workspace_id, Some(index));
         let mut tab = self.tabs.remove(index);
         tab.pinned = pinned;
         self.tabs.insert(insert_at, tab);
         self.sync_session();
     }
 
-    /// Focus an existing tab by ID.
+    /// Focus an existing tab by ID. Focusing a tab in another workspace also
+    /// switches the visible workspace.
     pub fn focus_tab(&mut self, id: u64) {
         if self.active_tab_id == Some(id) {
             // Already active; ensure child view is positioned
@@ -605,9 +736,11 @@ impl TabManager {
             return;
         }
 
-        // 1. Hide the old active tab's native view and transition to Background
+        // 1. Hide the old active tab's native view and remember its selection.
         if let Some(old_id) = self.active_tab_id {
             if let Some(old_tab) = self.tabs.iter_mut().find(|t| t.id == old_id) {
+                let old_workspace = old_tab.workspace_id;
+                self.active_tab_by_workspace.insert(old_workspace, old_id);
                 if let Some(ref browser) = old_tab.browser {
                     if let Some(host) = browser.host() {
                         let view_handle = host.window_handle();
@@ -625,8 +758,18 @@ impl TabManager {
             }
         }
 
-        // 2. Activate target tab
+        // 2. Activate target tab and its workspace.
+        let target_workspace = {
+            let tab = match self.tabs.iter().find(|t| t.id == id) {
+                Some(tab) => tab,
+                None => return,
+            };
+            tab.workspace_id
+        };
+
         self.active_tab_id = Some(id);
+        self.active_workspace_id = target_workspace;
+        self.active_tab_by_workspace.insert(target_workspace, id);
 
         let (target_url, is_hibernated, has_browser) = {
             let tab = match self.tabs.iter_mut().find(|t| t.id == id) {
@@ -659,8 +802,12 @@ impl TabManager {
             None => return,
         };
 
+        let workspace_id = self.tabs[index].workspace_id;
         let mut tab = self.tabs.remove(index);
         self.recently_closed.push(closed_tab_from(&tab, index));
+        if self.active_tab_by_workspace.get(&tab.workspace_id) == Some(&id) {
+            self.active_tab_by_workspace.remove(&tab.workspace_id);
+        }
         self.pending_navigation_checks.remove(&id);
         self.requested_favicons.retain(|(tab_id, _)| *tab_id != id);
         self.pending_favicon_urls.remove(&id);
@@ -677,14 +824,32 @@ impl TabManager {
 
         if self.active_tab_id == Some(id) {
             self.active_tab_id = None;
-            if !self.tabs.is_empty() {
-                // Focus nearest tab
-                let new_index = index.min(self.tabs.len() - 1);
-                let new_id = self.tabs[new_index].id;
-                self.focus_tab(new_id);
-            } else {
-                // All tabs closed — open a default tab
+            if self.tabs.is_empty() {
+                // All tabs closed — open a default tab in the current workspace.
                 self.create_tab(None, true);
+            } else {
+                // Stay in the same workspace when possible. Tabs are grouped by
+                // workspace, so the global nearest index can otherwise land in
+                // the next workspace after closing that workspace's last tab.
+                let same_workspace: Vec<(usize, u64)> = self
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tab)| tab.workspace_id == workspace_id)
+                    .map(|(i, tab)| (i, tab.id))
+                    .collect();
+                if same_workspace.is_empty() {
+                    // The workspace still exists but has no tabs left; open a
+                    // fresh one there instead of silently jumping workspaces.
+                    self.create_tab(None, true);
+                } else {
+                    let new_id = same_workspace
+                        .into_iter()
+                        .min_by_key(|(i, _)| i.abs_diff(index))
+                        .map(|(_, tab_id)| tab_id)
+                        .unwrap_or_else(|| self.tabs[0].id);
+                    self.focus_tab(new_id);
+                }
             }
         } else {
             self.sync_session();
@@ -736,6 +901,248 @@ impl TabManager {
         for id in to_hibernate {
             self.hibernate_tab(id);
         }
+    }
+
+    /// Name of a workspace, falling back to the default if it was removed.
+    pub fn workspace_name(&self, workspace_id: u64) -> String {
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .map(|workspace| workspace.name.clone())
+            .unwrap_or_else(|| Workspace::DEFAULT_NAME.to_string())
+    }
+
+    /// Keep the flat tab vector grouped by workspace and pinned-first inside
+    /// each group after a workspace is deleted.
+    fn regroup_tabs(&mut self) {
+        let rank: HashMap<u64, usize> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(index, workspace)| (workspace.id, index))
+            .collect();
+        self.tabs.sort_by_key(|tab| {
+            (
+                rank.get(&tab.workspace_id).copied().unwrap_or(usize::MAX),
+                !tab.pinned,
+            )
+        });
+    }
+
+    /// Switch the visible workspace, preserving each workspace's selected tab.
+    pub fn switch_workspace(&mut self, workspace_id: u64) {
+        if !self
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id)
+        {
+            return;
+        }
+        if self.active_workspace_id == workspace_id {
+            if self.active_tab_id.is_some() {
+                self.show_active_tab_view();
+            }
+            return;
+        }
+
+        self.active_workspace_id = workspace_id;
+        let target = self
+            .active_tab_by_workspace
+            .get(&workspace_id)
+            .copied()
+            .or_else(|| {
+                self.tabs
+                    .iter()
+                    .find(|tab| tab.workspace_id == workspace_id)
+                    .map(|tab| tab.id)
+            });
+
+        match target {
+            Some(tab_id) => self.focus_tab(tab_id),
+            None => {
+                self.create_tab(None, true);
+            }
+        }
+    }
+
+    /// Choose a unique workspace name. Names double as bookmark folder names,
+    /// so collisions would merge two workspaces' bookmarks in the UI.
+    fn unique_workspace_name(&self, requested: &str, exclude_id: Option<u64>) -> String {
+        let base = Workspace::normalize_name(requested);
+        let collides = |candidate: &str| {
+            self.workspaces.iter().any(|workspace| {
+                Some(workspace.id) != exclude_id && workspace.name.eq_ignore_ascii_case(candidate)
+            })
+        };
+        if !collides(&base) {
+            return base;
+        }
+
+        let mut suffix = 2_u32;
+        loop {
+            let suffix_text = suffix.to_string();
+            let room = Workspace::MAX_NAME_LEN.saturating_sub(suffix_text.len() + 1);
+            let root: String = base.chars().take(room).collect();
+            let candidate = format!("{root} {suffix_text}");
+            if !collides(&candidate) {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
+    /// Create a workspace and make it active.
+    pub fn create_workspace(&mut self, name: String, icon: WorkspaceIcon, color: WorkspaceColor) {
+        let name = self.unique_workspace_name(&name, None);
+
+        let id = self
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.id)
+            .max()
+            .unwrap_or(Workspace::DEFAULT_ID)
+            + 1;
+        self.workspaces.push(Workspace {
+            id,
+            name,
+            icon,
+            color,
+            is_active: false,
+        });
+        self.switch_workspace(id);
+        self.sync_session();
+    }
+
+    /// Rename, re-icon, or recolour a workspace. Renaming also updates its
+    /// bookmark folder so saved pages stay grouped under the new name.
+    pub fn update_workspace(
+        &mut self,
+        workspace_id: u64,
+        name: String,
+        icon: WorkspaceIcon,
+        color: WorkspaceColor,
+    ) {
+        let name = self.unique_workspace_name(&name, Some(workspace_id));
+        let Some(workspace) = self
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
+            return;
+        };
+        let old_name = workspace.name.clone();
+        let name_changed = old_name != name;
+        workspace.name = name.clone();
+        workspace.icon = icon;
+        workspace.color = color;
+
+        if name_changed {
+            if let Some(storage) = self.storage.as_ref() {
+                storage.rename_bookmark_folder(workspace_id, old_name.clone(), name.clone());
+            }
+            for bookmark in &mut self.bookmarks {
+                if bookmark.workspace_id == workspace_id && bookmark.folder == old_name {
+                    bookmark.folder = name.clone();
+                }
+            }
+        }
+        self.sync_session();
+    }
+
+    /// Delete a workspace without losing its tabs or bookmarks. Tabs move to
+    /// the first remaining workspace; bookmarks move to an archived folder.
+    pub fn delete_workspace(&mut self, workspace_id: u64) {
+        if self.workspaces.len() <= 1
+            || !self
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == workspace_id)
+        {
+            return;
+        }
+
+        let target_id = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id != workspace_id)
+            .map(|workspace| workspace.id)
+            .unwrap_or(Workspace::DEFAULT_ID);
+        let old_name = self.workspace_name(workspace_id);
+        let archived = Workspace::archived_folder(&old_name);
+        let active_was_deleted = self.active_workspace_id == workspace_id;
+        let active_tab_in_deleted = self
+            .active_tab_id
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .is_some_and(|tab| tab.workspace_id == workspace_id);
+
+        for tab in &mut self.tabs {
+            if tab.workspace_id == workspace_id {
+                tab.workspace_id = target_id;
+            }
+        }
+        self.active_tab_by_workspace.remove(&workspace_id);
+        if active_tab_in_deleted {
+            if let Some(active_id) = self.active_tab_id {
+                self.active_tab_by_workspace.insert(target_id, active_id);
+            }
+        }
+        self.workspaces
+            .retain(|workspace| workspace.id != workspace_id);
+        self.regroup_tabs();
+
+        if active_was_deleted {
+            self.active_workspace_id = target_id;
+            if self.active_tab_id.is_some() {
+                self.show_active_tab_view();
+            }
+        }
+
+        if let Some(storage) = self.storage.as_ref() {
+            storage.rename_bookmark_folder(workspace_id, old_name.clone(), archived.clone());
+        }
+        for bookmark in &mut self.bookmarks {
+            if bookmark.workspace_id == workspace_id && bookmark.folder == old_name {
+                bookmark.folder = archived.clone();
+            }
+        }
+        self.sync_session();
+    }
+
+    /// Bookmark a tab in a folder named after the tab's workspace.
+    pub fn add_bookmark(&mut self, tab_id: u64) {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let workspace_id = tab.workspace_id;
+        let folder = self.workspace_name(workspace_id);
+        let url = tab.url.clone();
+        let title = tab.title.clone();
+
+        if let Some(existing) = self
+            .bookmarks
+            .iter_mut()
+            .find(|bookmark| bookmark.workspace_id == workspace_id && bookmark.url == url)
+        {
+            existing.title = title.clone();
+            existing.folder = folder.clone();
+        } else {
+            self.bookmarks.push(BookmarkItem {
+                id: -1,
+                workspace_id,
+                url: url.clone(),
+                title: title.clone(),
+                folder: folder.clone(),
+            });
+        }
+
+        if let Some(storage) = self.storage.as_ref() {
+            storage.add_bookmark(workspace_id, url, title, folder);
+        }
+    }
+
+    /// Open a bookmark in whichever workspace is currently visible.
+    pub fn open_bookmark(&mut self, url: String) {
+        self.create_tab(Some(url), true);
     }
 
     /// Resize outer bounds and adjust CEF child view.
@@ -1272,22 +1679,36 @@ impl TabManager {
                 self.close_tab(tab_id);
             }
             UiAction::CloseOtherTabs { tab_id } => {
+                let Some(workspace_id) = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| tab.workspace_id)
+                else {
+                    return;
+                };
                 let ids: Vec<u64> = self
                     .tabs
                     .iter()
                     .rev()
-                    .filter(|t| t.id != tab_id)
-                    .map(|t| t.id)
+                    .filter(|tab| tab.workspace_id == workspace_id && tab.id != tab_id)
+                    .map(|tab| tab.id)
                     .collect();
                 for id in ids {
                     self.close_tab(id);
                 }
             }
             UiAction::CloseTabsToRight { tab_id } => {
-                let Some(index) = self.tabs.iter().position(|t| t.id == tab_id) else {
+                let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
                     return;
                 };
-                let ids: Vec<u64> = self.tabs[index + 1..].iter().rev().map(|t| t.id).collect();
+                let workspace_id = self.tabs[index].workspace_id;
+                let ids: Vec<u64> = self.tabs[index + 1..]
+                    .iter()
+                    .rev()
+                    .filter(|tab| tab.workspace_id == workspace_id)
+                    .map(|tab| tab.id)
+                    .collect();
                 for id in ids {
                     self.close_tab(id);
                 }
@@ -1302,7 +1723,15 @@ impl TabManager {
                     let url = tab.url.clone();
                     let title = tab.title.clone();
                     let pinned = tab.pinned;
-                    self.insert_tab(Some(url), Some(title), Some(index + 1), true, pinned);
+                    let workspace_id = tab.workspace_id;
+                    self.insert_tab_in_workspace(
+                        Some(url),
+                        Some(title),
+                        Some(index + 1),
+                        true,
+                        pinned,
+                        workspace_id,
+                    );
                 }
             }
             UiAction::TogglePinTab { tab_id } => {
@@ -1365,6 +1794,29 @@ impl TabManager {
             }
             UiAction::OpenDevTools { tab_id } => {
                 self.show_dev_tools(tab_id);
+            }
+            UiAction::SwitchWorkspace { workspace_id } => {
+                self.switch_workspace(workspace_id);
+            }
+            UiAction::CreateWorkspace { name, icon, color } => {
+                self.create_workspace(name, icon, color);
+            }
+            UiAction::UpdateWorkspace {
+                workspace_id,
+                name,
+                icon,
+                color,
+            } => {
+                self.update_workspace(workspace_id, name, icon, color);
+            }
+            UiAction::DeleteWorkspace { workspace_id } => {
+                self.delete_workspace(workspace_id);
+            }
+            UiAction::AddBookmark { tab_id } => {
+                self.add_bookmark(tab_id);
+            }
+            UiAction::OpenBookmark { url } => {
+                self.open_bookmark(url);
             }
             UiAction::ApplyPreferences(preferences) => {
                 self.apply_preferences(&preferences);
@@ -1448,6 +1900,8 @@ impl TabManager {
             .iter()
             .map(|t| TabInfo {
                 id: t.id,
+                workspace_id: t.workspace_id,
+                workspace_name: self.workspace_name(t.workspace_id),
                 url: t.url.clone(),
                 title: t.title.clone(),
                 is_loading: t.is_loading,
@@ -1465,6 +1919,30 @@ impl TabManager {
             .collect();
 
         state.active_tab_id = self.active_tab_id;
+        state.workspaces = self
+            .workspaces
+            .iter()
+            .map(|workspace| WorkspaceInfo {
+                id: workspace.id,
+                name: workspace.name.clone(),
+                icon: workspace.icon,
+                color: workspace.color,
+                is_active: workspace.id == self.active_workspace_id,
+            })
+            .collect();
+        state.active_workspace_id = self.active_workspace_id;
+        state.bookmarks = self
+            .bookmarks
+            .iter()
+            .map(|bookmark| BookmarkInfo {
+                id: bookmark.id,
+                workspace_id: bookmark.workspace_id,
+                url: bookmark.url.clone(),
+                title: bookmark.title.clone(),
+                folder: bookmark.folder.clone(),
+            })
+            .collect();
+        state.sync_workspace_draft();
         state.ram_mb = self.ram_process_mb;
         state.can_reopen_tab = self.can_reopen_closed_tab();
 
@@ -1502,9 +1980,14 @@ mod tests {
         is_blank_navigation_url, is_critical_pressure, needs_initial_navigation,
         next_navigation_retry_delay, pinned_insert_index, preferred_favicon_url, ram_pressure,
         restore_insert_index, should_hibernate_tab, should_sync_omnibox, BrowserSpawnMode, Tab,
-        TabState,
+        TabManager, TabState,
     };
-    use crate::config::{TAB_IDLE_TIMEOUT_NORMAL, TAB_IDLE_TIMEOUT_PRESSURE};
+    use crate::config::{
+        BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, TAB_IDLE_TIMEOUT_NORMAL,
+        TAB_IDLE_TIMEOUT_PRESSURE,
+    };
+    use crate::storage::db::SessionTabSnapshot;
+    use crate::ui::platform_view::ContentRect;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1721,6 +2204,7 @@ mod tests {
     fn closed_tab_captures_url_title_and_original_position() {
         let tab = Tab {
             id: 7,
+            workspace_id: 1,
             url: "https://example.com/article".to_string(),
             title: "Example Article".to_string(),
             is_loading: false,
@@ -1747,6 +2231,7 @@ mod tests {
         let tabs = vec![
             Tab {
                 id: 1,
+                workspace_id: 1,
                 url: "https://pinned.example".to_string(),
                 title: "Pinned".to_string(),
                 is_loading: false,
@@ -1760,6 +2245,7 @@ mod tests {
             },
             Tab {
                 id: 2,
+                workspace_id: 1,
                 url: "https://pinned-two.example".to_string(),
                 title: "Pinned Two".to_string(),
                 is_loading: false,
@@ -1773,6 +2259,7 @@ mod tests {
             },
             Tab {
                 id: 3,
+                workspace_id: 1,
                 url: "https://regular.example".to_string(),
                 title: "Regular".to_string(),
                 is_loading: false,
@@ -1786,12 +2273,220 @@ mod tests {
             },
         ];
 
-        assert_eq!(pinned_insert_index(&tabs, None), 2);
-        assert_eq!(pinned_insert_index(&tabs, Some(0)), 1);
-        assert_eq!(insertion_index(&tabs, None, true), 2);
-        assert_eq!(insertion_index(&tabs, Some(99), true), 2);
-        assert_eq!(insertion_index(&tabs, None, false), 3);
-        assert_eq!(insertion_index(&tabs, Some(0), false), 2);
+        assert_eq!(pinned_insert_index(&tabs, 1, None), 2);
+        assert_eq!(pinned_insert_index(&tabs, 1, Some(0)), 1);
+        assert_eq!(insertion_index(&tabs, 1, None, true), 2);
+        assert_eq!(insertion_index(&tabs, 1, Some(99), true), 2);
+        assert_eq!(insertion_index(&tabs, 1, None, false), 3);
+        assert_eq!(insertion_index(&tabs, 1, Some(0), false), 2);
+    }
+
+    #[test]
+    fn insertion_indexes_respect_workspace_groups() {
+        let tabs = vec![
+            Tab {
+                id: 1,
+                workspace_id: 1,
+                url: "https://one.example".to_string(),
+                title: "One".to_string(),
+                is_loading: false,
+                can_go_back: false,
+                can_go_forward: false,
+                blocked_requests: 0,
+                pinned: true,
+                state: TabState::Hibernated,
+                browser: None,
+                favicon: None,
+            },
+            Tab {
+                id: 2,
+                workspace_id: 1,
+                url: "https://two.example".to_string(),
+                title: "Two".to_string(),
+                is_loading: false,
+                can_go_back: false,
+                can_go_forward: false,
+                blocked_requests: 0,
+                pinned: false,
+                state: TabState::Hibernated,
+                browser: None,
+                favicon: None,
+            },
+            Tab {
+                id: 3,
+                workspace_id: 2,
+                url: "https://three.example".to_string(),
+                title: "Three".to_string(),
+                is_loading: false,
+                can_go_back: false,
+                can_go_forward: false,
+                blocked_requests: 0,
+                pinned: true,
+                state: TabState::Hibernated,
+                browser: None,
+                favicon: None,
+            },
+            Tab {
+                id: 4,
+                workspace_id: 2,
+                url: "https://four.example".to_string(),
+                title: "Four".to_string(),
+                is_loading: false,
+                can_go_back: false,
+                can_go_forward: false,
+                blocked_requests: 0,
+                pinned: false,
+                state: TabState::Hibernated,
+                browser: None,
+                favicon: None,
+            },
+        ];
+
+        assert_eq!(pinned_insert_index(&tabs, 2, None), 1);
+        assert_eq!(insertion_index(&tabs, 2, None, true), 3);
+        assert_eq!(insertion_index(&tabs, 2, None, false), 4);
+        assert_eq!(insertion_index(&tabs, 1, None, true), 1);
+        assert_eq!(insertion_index(&tabs, 1, None, false), 2);
+    }
+
+    #[test]
+    fn workspaces_own_tabs_and_bookmark_folders() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut manager = TabManager::new(
+            tx,
+            rx,
+            std::ptr::null_mut(),
+            ContentRect {
+                x: 180,
+                y: 0,
+                width: 1100,
+                height: 800,
+                scale_factor: 1.0,
+            },
+            None,
+            &BrowserPreferences::default(),
+            vec![Workspace::default_workspace()],
+            vec![],
+        );
+
+        manager.create_tab(Some("https://personal.example".to_string()), true);
+        manager.create_workspace(
+            "Work".to_string(),
+            WorkspaceIcon::Code,
+            WorkspaceColor::Green,
+        );
+
+        assert_eq!(manager.active_workspace_id, 2);
+        let work_tab_id = manager
+            .active_tab_id
+            .expect("new workspace has an active tab");
+        assert_eq!(
+            manager
+                .tabs
+                .iter()
+                .find(|tab| tab.id == work_tab_id)
+                .map(|tab| tab.workspace_id),
+            Some(2)
+        );
+
+        manager.add_bookmark(work_tab_id);
+        assert_eq!(manager.bookmarks[0].folder, "Work");
+
+        manager.update_workspace(
+            2,
+            "Studio".to_string(),
+            WorkspaceIcon::Palette,
+            WorkspaceColor::Purple,
+        );
+        assert_eq!(manager.bookmarks[0].folder, "Studio");
+
+        manager.switch_workspace(1);
+        assert_eq!(manager.active_workspace_id, 1);
+
+        manager.delete_workspace(2);
+        assert!(manager.workspaces.iter().all(|workspace| workspace.id != 2));
+        assert_eq!(
+            manager
+                .tabs
+                .iter()
+                .filter(|tab| tab.workspace_id == 1)
+                .count(),
+            manager.tabs.len()
+        );
+        assert_eq!(manager.bookmarks[0].folder, "Archived Studio");
+    }
+
+    #[test]
+    fn closing_the_last_tab_stays_in_the_same_workspace() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut manager = TabManager::new(
+            tx,
+            rx,
+            std::ptr::null_mut(),
+            ContentRect {
+                x: 180,
+                y: 0,
+                width: 1100,
+                height: 800,
+                scale_factor: 1.0,
+            },
+            None,
+            &BrowserPreferences::default(),
+            vec![Workspace::default_workspace()],
+            vec![],
+        );
+
+        manager.create_tab(Some("https://personal.example".to_string()), true);
+        manager.create_workspace(
+            "Work".to_string(),
+            WorkspaceIcon::Code,
+            WorkspaceColor::Green,
+        );
+        manager.switch_workspace(1);
+
+        let personal_id = manager.active_tab_id.expect("personal tab is active");
+        manager.close_tab(personal_id);
+
+        assert_eq!(manager.active_workspace_id, 1);
+        let active = manager
+            .tabs
+            .iter()
+            .find(|tab| Some(tab.id) == manager.active_tab_id)
+            .expect("a replacement tab is opened");
+        assert_eq!(active.workspace_id, 1);
+    }
+
+    #[test]
+    fn restore_session_normalizes_unknown_workspace_ids() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut manager = TabManager::new(
+            tx,
+            rx,
+            std::ptr::null_mut(),
+            ContentRect {
+                x: 180,
+                y: 0,
+                width: 1100,
+                height: 800,
+                scale_factor: 1.0,
+            },
+            None,
+            &BrowserPreferences::default(),
+            vec![Workspace::default_workspace()],
+            vec![],
+        );
+
+        manager.restore_session(vec![SessionTabSnapshot {
+            workspace_id: 99,
+            url: "https://stale.example".to_string(),
+            title: "Stale".to_string(),
+            is_active: true,
+            is_hibernated: true,
+            is_pinned: false,
+        }]);
+
+        assert_eq!(manager.active_workspace_id, 1);
+        assert!(manager.tabs.iter().all(|tab| tab.workspace_id == 1));
     }
 
     #[test]

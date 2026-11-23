@@ -15,7 +15,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use egui::{
@@ -25,9 +25,9 @@ use egui::{
 use egui_wgpu::ScreenDescriptor;
 
 use crate::config::{
-    rail_width, BrowserPreferences, SearchEngine, ThemePreference, COMMAND_PALETTE_TOP_OFFSET,
-    COMMAND_PALETTE_WIDTH, DEFAULT_SEARCH_URL_PREFIX, MAX_IDLE_TIMEOUT_MINUTES,
-    MIN_IDLE_TIMEOUT_MINUTES,
+    rail_width, BrowserPreferences, SearchEngine, ThemePreference, Workspace, WorkspaceColor,
+    WorkspaceIcon, COMMAND_PALETTE_TOP_OFFSET, COMMAND_PALETTE_WIDTH, DEFAULT_SEARCH_URL_PREFIX,
+    MAX_IDLE_TIMEOUT_MINUTES, MIN_IDLE_TIMEOUT_MINUTES,
 };
 use crate::events::UiAction;
 
@@ -137,6 +137,41 @@ impl ChromePalette {
         tooltip_border: Color32::from_rgb(150, 166, 188),
         tooltip_text: Color32::from_rgb(25, 28, 33),
     };
+
+    /// Return a copy tinted by the active workspace accent. This keeps global
+    /// theme constants immutable while letting workspaces recolour native
+    /// chrome without ever touching CEF page content.
+    pub fn with_workspace_accent(self, accent: Color32, light: bool) -> Self {
+        let muted = if light {
+            mix_color(accent, Color32::from_rgb(20, 28, 42), 0.32)
+        } else {
+            accent
+        };
+        Self {
+            rail_row_active: mix_color(
+                self.rail_row_active,
+                accent,
+                if light { 0.38 } else { 0.32 },
+            ),
+            rail_accent: muted,
+            brand: muted,
+            palette_border: mix_color(self.palette_border, accent, 0.45),
+            palette_row_selected: mix_color(self.palette_row_selected, accent, 0.35),
+            tab_border: muted,
+            loading: muted,
+            tooltip_border: mix_color(self.tooltip_border, accent, 0.4),
+            ..self
+        }
+    }
+}
+
+fn mix_color(a: Color32, b: Color32, b_weight: f32) -> Color32 {
+    let weight = b_weight.clamp(0.0, 1.0);
+    Color32::from_rgb(
+        (a.r() as f32 * (1.0 - weight) + b.r() as f32 * weight).round() as u8,
+        (a.g() as f32 * (1.0 - weight) + b.g() as f32 * weight).round() as u8,
+        (a.b() as f32 * (1.0 - weight) + b.b() as f32 * weight).round() as u8,
+    )
 }
 
 impl ChromeTheme {
@@ -249,6 +284,29 @@ enum RailIcon {
     Pin,
     PinOff,
     Settings,
+    WorkspaceWork,
+    WorkspaceCode,
+    WorkspaceStudy,
+    WorkspaceLaunch,
+    WorkspaceDesign,
+    WorkspaceMusic,
+    WorkspaceReading,
+    WorkspaceWeb,
+}
+
+impl From<WorkspaceIcon> for RailIcon {
+    fn from(icon: WorkspaceIcon) -> Self {
+        match icon {
+            WorkspaceIcon::Work => Self::WorkspaceWork,
+            WorkspaceIcon::Code => Self::WorkspaceCode,
+            WorkspaceIcon::School => Self::WorkspaceStudy,
+            WorkspaceIcon::Rocket => Self::WorkspaceLaunch,
+            WorkspaceIcon::Palette => Self::WorkspaceDesign,
+            WorkspaceIcon::Music => Self::WorkspaceMusic,
+            WorkspaceIcon::Book => Self::WorkspaceReading,
+            WorkspaceIcon::Public => Self::WorkspaceWeb,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +333,8 @@ pub struct Favicon {
 #[derive(Debug, Clone)]
 pub struct TabInfo {
     pub id: u64,
+    pub workspace_id: u64,
+    pub workspace_name: String,
     pub url: String,
     pub title: String,
     pub is_loading: bool,
@@ -284,6 +344,26 @@ pub struct TabInfo {
     pub can_go_forward: bool,
     pub is_pinned: bool,
     pub favicon: Option<Favicon>,
+}
+
+/// A native workspace as displayed in the rail and settings overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceInfo {
+    pub id: u64,
+    pub name: String,
+    pub icon: WorkspaceIcon,
+    pub color: WorkspaceColor,
+    pub is_active: bool,
+}
+
+/// A globally visible bookmark grouped by its workspace-named folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookmarkInfo {
+    pub id: i64,
+    pub workspace_id: u64,
+    pub url: String,
+    pub title: String,
+    pub folder: String,
 }
 
 /// An action produced by selecting a command-palette row.
@@ -362,6 +442,9 @@ pub struct RailMenuItem {
 pub struct ChromeState {
     pub tabs: Vec<TabInfo>,
     pub active_tab_id: Option<u64>,
+    pub workspaces: Vec<WorkspaceInfo>,
+    pub active_workspace_id: u64,
+    pub bookmarks: Vec<BookmarkInfo>,
     /// Text mirrored from the active tab; the command palette edits a copy.
     pub omnibox_text: String,
     /// True while the command palette is editing `omnibox_text`.
@@ -406,6 +489,10 @@ pub struct ChromeState {
     pub settings_open: bool,
     /// Working copy edited by the Settings overlay; committed on every change.
     pub settings_draft: BrowserPreferences,
+    /// Draft values for creating or editing the active workspace in Settings.
+    pub workspace_name_draft: String,
+    pub workspace_icon_draft: WorkspaceIcon,
+    pub workspace_color_draft: WorkspaceColor,
 }
 
 impl Default for ChromeState {
@@ -413,6 +500,9 @@ impl Default for ChromeState {
         Self {
             tabs: Vec::new(),
             active_tab_id: None,
+            workspaces: Vec::new(),
+            active_workspace_id: 1,
+            bookmarks: Vec::new(),
             omnibox_text: String::new(),
             omnibox_focused: false,
             last_synced_tab_id: None,
@@ -436,6 +526,9 @@ impl Default for ChromeState {
             preferences: BrowserPreferences::default(),
             settings_open: false,
             settings_draft: BrowserPreferences::default(),
+            workspace_name_draft: String::new(),
+            workspace_icon_draft: WorkspaceIcon::default(),
+            workspace_color_draft: WorkspaceColor::default(),
         }
     }
 }
@@ -506,6 +599,7 @@ impl ChromeState {
         self.close_tab_menu();
         self.tooltip = None;
         self.settings_draft = self.preferences.clone();
+        self.sync_workspace_draft();
         self.settings_open = true;
     }
 
@@ -550,6 +644,57 @@ impl ChromeState {
 
     fn refresh_theme(&mut self) {
         self.theme = effective_theme(self.preferences.theme, self.system_theme);
+    }
+
+    /// Palette for this frame, tinted by the active workspace's accent colour.
+    pub fn palette(&self) -> ChromePalette {
+        let accent = self
+            .active_workspace()
+            .map(|workspace| workspace.color)
+            .unwrap_or_default();
+        let (r, g, b) = accent.rgb();
+        self.theme
+            .palette()
+            .with_workspace_accent(Color32::from_rgb(r, g, b), self.theme == ChromeTheme::Light)
+    }
+
+    /// Apply chrome visuals plus the live workspace accent to egui widgets.
+    pub fn apply_visuals(&self, ctx: &egui::Context) {
+        let base = self.theme.palette();
+        let palette = self.palette();
+        let mut visuals = match self.theme {
+            ChromeTheme::Dark => egui::Visuals::dark(),
+            ChromeTheme::Light => egui::Visuals::light(),
+        };
+        visuals.panel_fill = base.rail_bg;
+        visuals.window_fill = base.palette_bg;
+        visuals.extreme_bg_color = base.rail_bg;
+        visuals.faint_bg_color = base.palette_row_hover;
+        visuals.selection.bg_fill = palette.palette_row_selected;
+        visuals.selection.stroke = Stroke::new(1.0_f32, palette.rail_accent);
+        visuals.hyperlink_color = palette.rail_accent;
+        visuals.override_text_color = Some(base.text);
+        ctx.set_visuals(visuals);
+    }
+
+    pub fn active_workspace(&self) -> Option<&WorkspaceInfo> {
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.id == self.active_workspace_id)
+    }
+
+    /// Refresh the Settings workspace editor from the active workspace. Skipped
+    /// while Settings is open so typing a name is never clobbered by the next
+    /// frame's tab-manager sync.
+    pub fn sync_workspace_draft(&mut self) {
+        if self.settings_open {
+            return;
+        }
+        if let Some(workspace) = self.active_workspace().cloned() {
+            self.workspace_name_draft = workspace.name;
+            self.workspace_icon_draft = workspace.icon;
+            self.workspace_color_draft = workspace.color;
+        }
     }
 }
 
@@ -679,7 +824,7 @@ impl ChromeRenderer {
         let mut actions: Vec<UiAction> = Vec::new();
 
         self.sync_favicon_textures(state);
-        state.theme.apply_visuals(&self.egui_ctx);
+        state.apply_visuals(&self.egui_ctx);
 
         let raw_input = self.egui_state.take_egui_input(window);
         let egui_ctx = self.egui_ctx.clone();
@@ -802,6 +947,125 @@ impl ChromeRenderer {
             .show(ctx, |_ui| {});
     }
 
+    /// Draw the workspace strip at the top of the rail. Workspaces switch the
+    /// visible tab set and accent colour; the plus button opens Settings where
+    /// a new workspace can be named and customised.
+    fn build_workspace_switcher(
+        ui: &mut Ui,
+        state: &mut ChromeState,
+        actions: &mut Vec<UiAction>,
+        palette: &ChromePalette,
+        width: f32,
+        expanded: bool,
+    ) {
+        let workspaces = state.workspaces.clone();
+        if workspaces.is_empty() {
+            return;
+        }
+
+        if !expanded {
+            ui.horizontal_wrapped(|ui| {
+                for workspace in &workspaces {
+                    let active = workspace.id == state.active_workspace_id;
+                    let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
+                    let (r, g, b) = workspace.color.rgb();
+                    ui.painter().rect_filled(
+                        rect,
+                        Rounding::same(7.0),
+                        if active {
+                            Color32::from_rgb(r, g, b)
+                        } else if response.hovered() {
+                            palette.rail_surface
+                        } else {
+                            Color32::TRANSPARENT
+                        },
+                    );
+                    paint_rail_icon(
+                        ui,
+                        rect.shrink(5.0),
+                        workspace.icon.into(),
+                        if active {
+                            Color32::from_rgb(12, 16, 24)
+                        } else {
+                            palette.text
+                        },
+                    );
+                    if response.clicked() {
+                        actions.push(UiAction::SwitchWorkspace {
+                            workspace_id: workspace.id,
+                        });
+                    }
+                }
+            });
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("SPACES")
+                    .size(9.0)
+                    .color(palette.section_label),
+            );
+        });
+        ui.add_space(2.0);
+        for workspace in &workspaces {
+            let active = workspace.id == state.active_workspace_id;
+            let (rect, response) = ui.allocate_exact_size(vec2(width - 12.0, 26.0), Sense::click());
+            let (r, g, b) = workspace.color.rgb();
+            let color = Color32::from_rgb(r, g, b);
+            let fill = if active {
+                mix_color(palette.rail_surface, color, 0.34)
+            } else if response.hovered() {
+                palette.rail_row_hover
+            } else {
+                Color32::TRANSPARENT
+            };
+            ui.painter().rect_filled(rect, Rounding::same(7.0), fill);
+            if active {
+                ui.painter().rect_stroke(
+                    rect.shrink(0.5),
+                    Rounding::same(7.0),
+                    Stroke::new(1.0_f32, color),
+                );
+            }
+            let icon_rect = egui::Rect::from_center_size(
+                pos2(rect.min.x + 16.0, rect.center().y),
+                vec2(16.0, 16.0),
+            );
+            paint_rail_icon(ui, icon_rect, workspace.icon.into(), color);
+            ui.painter().text(
+                pos2(rect.min.x + 30.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                truncate_title(&workspace.name, 14),
+                FontId::new(11.0, FontFamily::Proportional),
+                if active {
+                    palette.text_strong
+                } else {
+                    palette.text
+                },
+            );
+            if response.clicked() {
+                actions.push(UiAction::SwitchWorkspace {
+                    workspace_id: workspace.id,
+                });
+            }
+        }
+
+        let add = Self::rail_action_button(
+            ui,
+            width - 12.0,
+            26.0,
+            RailIcon::Plus,
+            "New workspace",
+            palette,
+        );
+        if add.clicked() {
+            // Workspace creation values are edited in the native Settings card.
+            state.open_settings();
+        }
+    }
+
     /// Draw the collapsible left workspace rail.
     fn build_rail(
         &self,
@@ -817,7 +1081,8 @@ impl ChromeRenderer {
         // read again after the closure finishes.
         let tooltip_slot = &mut rail_tooltip;
         let width = rail_width(state.rail_expanded);
-        let palette = state.theme.palette();
+        let palette = state.palette();
+        let palette = &palette;
         let rail = egui::SidePanel::left("workspace_rail")
             .exact_width(width)
             .resizable(false)
@@ -846,6 +1111,10 @@ impl ChromeRenderer {
                             "Expand workspace rail",
                             state.rail_expanded,
                         );
+
+                        ui.add_space(4.0);
+                        Self::build_workspace_switcher(ui, state, actions, &palette, width, false);
+                        ui.add_space(4.0);
 
                         ui.add_space(3.0);
                         let new_tab =
@@ -901,7 +1170,9 @@ impl ChromeRenderer {
                             .id_salt("favicon_rail_tabs")
                             .max_height(tab_area_height)
                             .show(ui, |ui| {
-                                for tab in state.tabs.iter().filter(|tab| tab.is_pinned) {
+                                for tab in state.tabs.iter().filter(|tab| {
+                                    tab.workspace_id == state.active_workspace_id && tab.is_pinned
+                                }) {
                                     self.rail_tab_row(
                                         ui,
                                         tab,
@@ -915,14 +1186,18 @@ impl ChromeRenderer {
                                         false,
                                     );
                                 }
-                                if state.tabs.iter().any(|tab| tab.is_pinned)
-                                    && state.tabs.iter().any(|tab| !tab.is_pinned)
-                                {
+                                if state.tabs.iter().any(|tab| {
+                                    tab.workspace_id == state.active_workspace_id && tab.is_pinned
+                                }) && state.tabs.iter().any(|tab| {
+                                    tab.workspace_id == state.active_workspace_id && !tab.is_pinned
+                                }) {
                                     ui.add_space(2.0);
                                     ui.separator();
                                     ui.add_space(2.0);
                                 }
-                                for tab in state.tabs.iter().filter(|tab| !tab.is_pinned) {
+                                for tab in state.tabs.iter().filter(|tab| {
+                                    tab.workspace_id == state.active_workspace_id && !tab.is_pinned
+                                }) {
                                     self.rail_tab_row(
                                         ui,
                                         tab,
@@ -1103,17 +1378,14 @@ impl ChromeRenderer {
                     );
 
                     ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new("WORKSPACE")
-                                .size(9.0)
-                                .color(palette.section_label),
-                        );
-                    });
-                    ui.add_space(2.0);
+                    Self::build_workspace_switcher(ui, state, actions, &palette, width, true);
+                    ui.add_space(6.0);
 
-                    if state.tabs.iter().any(|tab| tab.is_pinned) {
+                    if state
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.workspace_id == state.active_workspace_id && tab.is_pinned)
+                    {
                         ui.add_space(2.0);
                         ui.horizontal(|ui| {
                             ui.add_space(8.0);
@@ -1129,7 +1401,9 @@ impl ChromeRenderer {
                     egui::ScrollArea::vertical()
                         .id_salt("rail_tabs")
                         .show(ui, |ui| {
-                            for tab in state.tabs.iter().filter(|tab| tab.is_pinned) {
+                            for tab in state.tabs.iter().filter(|tab| {
+                                tab.workspace_id == state.active_workspace_id && tab.is_pinned
+                            }) {
                                 self.rail_tab_row(
                                     ui,
                                     tab,
@@ -1143,14 +1417,18 @@ impl ChromeRenderer {
                                     true,
                                 );
                             }
-                            if state.tabs.iter().any(|tab| tab.is_pinned)
-                                && state.tabs.iter().any(|tab| !tab.is_pinned)
-                            {
+                            if state.tabs.iter().any(|tab| {
+                                tab.workspace_id == state.active_workspace_id && tab.is_pinned
+                            }) && state.tabs.iter().any(|tab| {
+                                tab.workspace_id == state.active_workspace_id && !tab.is_pinned
+                            }) {
                                 ui.add_space(3.0);
                                 ui.separator();
                                 ui.add_space(3.0);
                             }
-                            for tab in state.tabs.iter().filter(|tab| !tab.is_pinned) {
+                            for tab in state.tabs.iter().filter(|tab| {
+                                tab.workspace_id == state.active_workspace_id && !tab.is_pinned
+                            }) {
                                 self.rail_tab_row(
                                     ui,
                                     tab,
@@ -1290,7 +1568,8 @@ impl ChromeRenderer {
 
         let execute_enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let mut executed = false;
-        let palette = state.theme.palette();
+        let palette = state.palette();
+        let palette = &palette;
 
         let screen = ctx.screen_rect();
         let palette_width = COMMAND_PALETTE_WIDTH.min((screen.width() - 24.0).max(200.0));
@@ -1448,7 +1727,8 @@ impl ChromeRenderer {
             advance_command_selection(state.menu_selection, items.len(), move_up, move_down);
         let execute_enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
         let mut executed = false;
-        let palette = state.theme.palette();
+        let palette = state.palette();
+        let palette = &palette;
 
         let screen = ctx.screen_rect();
         let width = menu.width.min((screen.width() - 12.0).max(160.0));
@@ -1553,7 +1833,18 @@ impl ChromeRenderer {
         actions: &mut Vec<UiAction>,
     ) {
         let mut draft = state.settings_draft.clone();
-        let palette = state.theme.palette();
+        let mut workspace_name = state.workspace_name_draft.clone();
+        let mut workspace_icon = state.workspace_icon_draft;
+        let mut workspace_color = state.workspace_color_draft;
+        let active_workspace = state.active_workspace().cloned();
+        let workspace_count = state.workspaces.len();
+        let active_tab_id = state.active_tab_id;
+        let bookmarks = state.bookmarks.clone();
+        let mut workspace_actions: Vec<UiAction> = Vec::new();
+        let mut create_clicked = false;
+        let mut delete_clicked = false;
+        let palette = state.palette();
+        let palette = &palette;
         let screen = ctx.screen_rect();
         let width = SETTINGS_WIDTH.min((screen.width() - 24.0).max(280.0));
         let mut card_rect = egui::Rect::from_min_size(screen.center(), vec2(width, 0.0));
@@ -1684,16 +1975,164 @@ impl ChromeRenderer {
                                 ui.separator();
                                 ui.add_space(6.0);
                                 ui.label(
-                                    RichText::new("WORKSPACE")
+                                    RichText::new("WORKSPACES")
                                         .size(10.0)
                                         .strong()
                                         .color(palette.section_label),
                                 );
                                 ui.add_space(3.0);
+                                if let Some(workspace) = &active_workspace {
+                                    ui.label(
+                                        RichText::new(format!("Editing “{}”", workspace.name))
+                                            .size(10.0)
+                                            .color(palette.palette_subtext),
+                                    );
+                                    ui.add_space(3.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Name");
+                                        ui.add(
+                                            TextEdit::singleline(&mut workspace_name)
+                                                .desired_width(240.0),
+                                        );
+                                    });
+                                    ui.add_space(5.0);
+                                    ui.label(
+                                        RichText::new("ICON")
+                                            .size(9.0)
+                                            .color(palette.section_label),
+                                    );
+                                    ui.horizontal_wrapped(|ui| {
+                                        for icon in WorkspaceIcon::ALL {
+                                            if ui
+                                                .selectable_label(
+                                                    workspace_icon == icon,
+                                                    icon.label(),
+                                                )
+                                                .clicked()
+                                            {
+                                                workspace_icon = icon;
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(5.0);
+                                    ui.label(
+                                        RichText::new("ACCENT")
+                                            .size(9.0)
+                                            .color(palette.section_label),
+                                    );
+                                    ui.horizontal_wrapped(|ui| {
+                                        for color in WorkspaceColor::ALL {
+                                            let (r, g, b) = color.rgb();
+                                            let swatch = RichText::new(format!("● {}", color.label()))
+                                                .color(Color32::from_rgb(r, g, b));
+                                            if ui
+                                                .selectable_label(workspace_color == color, swatch)
+                                                .clicked()
+                                            {
+                                                workspace_color = color;
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        create_clicked = ui.button("Create workspace").clicked();
+                                        delete_clicked = ui
+                                            .add_enabled(
+                                                workspace_count > 1,
+                                                egui::Button::new("Delete this workspace"),
+                                            )
+                                            .clicked();
+                                    });
+                                    ui.label(
+                                        RichText::new(
+                                            "New workspace uses the name, icon, and accent above. Bookmarks are archived, never deleted.",
+                                        )
+                                        .size(10.0)
+                                        .color(palette.palette_hint),
+                                    );
+                                }
                                 ui.checkbox(
                                     &mut draft.rail_expanded,
                                     "Expand the workspace rail on startup",
                                 );
+
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("BOOKMARKS")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(palette.section_label),
+                                );
+                                ui.add_space(3.0);
+                                if ui
+                                    .add_enabled(
+                                        active_tab_id.is_some(),
+                                        egui::Button::new("Bookmark current tab"),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some(tab_id) = active_tab_id {
+                                        workspace_actions
+                                            .push(UiAction::AddBookmark { tab_id });
+                                    }
+                                }
+                                ui.label(
+                                    RichText::new(
+                                        "Bookmarks stay visible from every workspace; folders are named after workspaces.",
+                                    )
+                                    .size(10.0)
+                                    .color(palette.palette_hint),
+                                );
+
+                                let mut folders: BTreeMap<String, Vec<BookmarkInfo>> =
+                                    BTreeMap::new();
+                                for bookmark in &bookmarks {
+                                    folders
+                                        .entry(bookmark.folder.clone())
+                                        .or_default()
+                                        .push(bookmark.clone());
+                                }
+                                for (folder, items) in folders {
+                                    let heading = format!("{}  ·  {}", folder, items.len());
+                                    egui::CollapsingHeader::new(heading)
+                                        .id_salt(("bookmark_folder", folder.clone()))
+                                        .default_open(true)
+                                        .show(ui, |ui| {
+                                            for bookmark in items {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        RichText::new(truncate_title(
+                                                            &bookmark.title,
+                                                            26,
+                                                        ))
+                                                        .size(11.0),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(truncate_title(
+                                                            &bookmark.url,
+                                                            38,
+                                                        ))
+                                                        .size(9.0)
+                                                        .color(palette.palette_hint),
+                                                    );
+                                                    ui.with_layout(
+                                                        Layout::right_to_left(Align::Center),
+                                                        |ui| {
+                                                            if ui.button("Open").clicked() {
+                                                                workspace_actions.push(
+                                                                    UiAction::OpenBookmark {
+                                                                        url: bookmark.url.clone(),
+                                                                    },
+                                                                );
+                                                            }
+                                                        },
+                                                    );
+                                                });
+                                            }
+                                        });
+                                }
                             });
 
                         ui.add_space(8.0);
@@ -1722,6 +2161,44 @@ impl ChromeRenderer {
         if next != state.preferences {
             actions.push(UiAction::ApplyPreferences(next.clone()));
             state.set_preferences(next);
+        }
+
+        let workspace_name = Workspace::normalize_name(&workspace_name);
+        state.workspace_name_draft = workspace_name.clone();
+        state.workspace_icon_draft = workspace_icon;
+        state.workspace_color_draft = workspace_color;
+        if let Some(ref workspace) = active_workspace {
+            let changed = workspace_name != workspace.name
+                || workspace_icon != workspace.icon
+                || workspace_color != workspace.color;
+            if changed && !create_clicked && !delete_clicked {
+                actions.push(UiAction::UpdateWorkspace {
+                    workspace_id: workspace.id,
+                    name: workspace_name.clone(),
+                    icon: workspace_icon,
+                    color: workspace_color,
+                });
+            }
+        }
+        if create_clicked {
+            actions.push(UiAction::CreateWorkspace {
+                name: workspace_name.clone(),
+                icon: workspace_icon,
+                color: workspace_color,
+            });
+        }
+        if delete_clicked {
+            if let Some(workspace) = &active_workspace {
+                actions.push(UiAction::DeleteWorkspace {
+                    workspace_id: workspace.id,
+                });
+            }
+        }
+        actions.extend(workspace_actions);
+        // Creating or deleting a workspace changes which workspace is active;
+        // close the editor so its captured workspace is not stale next frame.
+        if create_clicked || delete_clicked {
+            state.close_settings();
         }
 
         let outside_click = ctx.input(|i| {
@@ -2247,7 +2724,7 @@ impl ChromeOverlayRenderer {
         let palette_open = state.command_palette_open && !menu_open && !settings_open;
         let focus_before = state.command_palette_focus_requested && palette_open;
         let select_all_before = state.command_palette_select_all_requested && palette_open;
-        state.theme.apply_visuals(&self.egui_ctx);
+        state.apply_visuals(&self.egui_ctx);
 
         // Focus is requested while building the input widget, and egui handles
         // key events before that point in the same frame. Select all on the
@@ -2468,11 +2945,11 @@ impl TooltipRenderer {
         &mut self,
         window: &winit::window::Window,
         tooltip: &RailTooltip,
-        theme: ChromeTheme,
+        state: &ChromeState,
     ) {
         self.resize(window.inner_size());
-        theme.apply_visuals(&self.egui_ctx);
-        let palette = theme.palette();
+        state.apply_visuals(&self.egui_ctx);
+        let palette = state.palette();
         let raw_input = self.egui_state.take_egui_input(window);
         let card = tooltip.clone();
         let egui_ctx = self.egui_ctx.clone();
@@ -2592,8 +3069,10 @@ impl TooltipRenderer {
 /// consistent, familiar icon language.
 fn paint_rail_icon(ui: &Ui, rect: egui::Rect, icon: RailIcon, color: Color32) {
     use egui_material_icons::icons::{
-        ICON_ADD, ICON_BEDTIME, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_CODE,
-        ICON_MEMORY, ICON_PIN, ICON_PUBLIC, ICON_PUSH_PIN, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD,
+        ICON_ADD, ICON_BEDTIME, ICON_BOOK, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT, ICON_CLOSE,
+        ICON_CODE, ICON_MEMORY, ICON_MUSIC_NOTE, ICON_PALETTE, ICON_PIN, ICON_PUBLIC,
+        ICON_PUSH_PIN, ICON_ROCKET, ICON_SCHOOL, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD,
+        ICON_WORK,
     };
 
     let glyph = match icon {
@@ -2610,6 +3089,14 @@ fn paint_rail_icon(ui: &Ui, rect: egui::Rect, icon: RailIcon, color: Color32) {
         RailIcon::Pin => ICON_PUSH_PIN,
         RailIcon::PinOff => ICON_PIN,
         RailIcon::Settings => ICON_SETTINGS,
+        RailIcon::WorkspaceWork => ICON_WORK,
+        RailIcon::WorkspaceCode => ICON_CODE,
+        RailIcon::WorkspaceStudy => ICON_SCHOOL,
+        RailIcon::WorkspaceLaunch => ICON_ROCKET,
+        RailIcon::WorkspaceDesign => ICON_PALETTE,
+        RailIcon::WorkspaceMusic => ICON_MUSIC_NOTE,
+        RailIcon::WorkspaceReading => ICON_BOOK,
+        RailIcon::WorkspaceWeb => ICON_PUBLIC,
     };
 
     let size = rect.width().min(rect.height()) * 1.08;
@@ -2680,10 +3167,14 @@ pub fn rail_menu_click_outside(
 
 /// Build the context-menu rows for the right-clicked tab.
 pub fn rail_menu_items(state: &ChromeState, tab_id: u64) -> Vec<RailMenuItem> {
-    let index = state.tabs.iter().position(|tab| tab.id == tab_id);
-    let tab_count = state.tabs.len();
-    let is_pinned = state
+    let workspace_tabs: Vec<&TabInfo> = state
         .tabs
+        .iter()
+        .filter(|tab| tab.workspace_id == state.active_workspace_id)
+        .collect();
+    let index = workspace_tabs.iter().position(|tab| tab.id == tab_id);
+    let tab_count = workspace_tabs.len();
+    let is_pinned = workspace_tabs
         .iter()
         .find(|tab| tab.id == tab_id)
         .is_some_and(|tab| tab.is_pinned);
@@ -2911,7 +3402,7 @@ pub fn command_palette_items(
         } else {
             tab.title.clone()
         },
-        subtitle: tab.url.clone(),
+        subtitle: format!("{} · {}", tab.workspace_name, tab.url),
         action: CommandAction::SelectTab(tab.id),
     };
 
@@ -3141,18 +3632,20 @@ mod tests {
         rail_menu_click_outside, rail_menu_items, rail_menu_metrics, rail_menu_ui_action,
         rail_tooltip_enabled, rail_tooltip_metrics, resolve_omnibox, resolve_omnibox_with_search,
         tab_close_center, tab_status_center, truncate_title, ChromePalette, ChromeState,
-        ChromeTheme, CommandAction, RailMenuAction, TabDisplayState, TabInfo,
+        ChromeTheme, CommandAction, RailMenuAction, TabDisplayState, TabInfo, WorkspaceInfo,
         TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
     };
     use crate::config::{
-        BrowserPreferences, SearchEngine, ThemePreference, DEFAULT_HOME_URL,
-        DEFAULT_SEARCH_URL_PREFIX,
+        BrowserPreferences, SearchEngine, ThemePreference, WorkspaceColor, WorkspaceIcon,
+        DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX,
     };
     use crate::events::UiAction;
 
     fn tab(id: u64, title: &str, url: &str) -> TabInfo {
         TabInfo {
             id,
+            workspace_id: 1,
+            workspace_name: "Personal".to_string(),
             url: url.to_string(),
             title: title.to_string(),
             is_loading: false,
@@ -3434,6 +3927,25 @@ mod tests {
         // Selected rows need a visible fill in both themes.
         assert_ne!(light.palette_row_selected, Color32::TRANSPARENT);
         assert_ne!(light.palette_row_hover, Color32::TRANSPARENT);
+    }
+
+    #[test]
+    fn workspace_color_tints_native_chrome_accents() {
+        let mut state = ChromeState::default();
+        let before = state.palette().rail_accent;
+        state.workspaces = vec![WorkspaceInfo {
+            id: 7,
+            name: "Studio".to_string(),
+            icon: WorkspaceIcon::Palette,
+            color: WorkspaceColor::Green,
+            is_active: true,
+        }];
+        state.active_workspace_id = 7;
+
+        let tinted = state.palette();
+        assert_ne!(tinted.rail_accent, before);
+        assert_ne!(tinted.rail_row_active, ChromePalette::DARK.rail_row_active);
+        assert_eq!(tinted.rail_bg, ChromePalette::DARK.rail_bg);
     }
 
     #[test]

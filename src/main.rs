@@ -487,7 +487,7 @@ fn install_macos_main_menu() {
     let app_menu = NSMenu::new(mtm);
     let app_version = NSMenuItem::new(mtm);
     unsafe {
-        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.5.2"));
+        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.6.0"));
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
@@ -1055,6 +1055,8 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
         let storage_mgr = StorageManager::new(db_path.clone());
         let storage_handle = storage_mgr.start_worker();
         let restored_tabs = StorageManager::load_session(&db_path).unwrap_or_default();
+        let restored_workspaces = StorageManager::load_workspaces(&db_path).unwrap_or_default();
+        let restored_bookmarks = StorageManager::load_bookmarks(&db_path).unwrap_or_default();
 
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut tab_manager = TabManager::new(
@@ -1064,6 +1066,8 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             rect,
             Some(storage_handle.clone()),
             &preferences,
+            restored_workspaces,
+            restored_bookmarks,
         );
         tab_manager.restore_session(restored_tabs);
 
@@ -1163,7 +1167,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                         (self.tooltip_window.as_ref(), self.tooltip.as_mut())
                     {
                         if let Some(tooltip) = self.chrome_state.tooltip.clone() {
-                            renderer.render(window, &tooltip, self.chrome_state.theme);
+                            renderer.render(window, &tooltip, &self.chrome_state);
                         }
                     }
                 }

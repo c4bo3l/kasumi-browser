@@ -15,15 +15,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::config::{BrowserPreferences, PREFERENCES_DB_KEY};
+use crate::config::{
+    BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, PREFERENCES_DB_KEY,
+};
 
 #[derive(Debug, Clone)]
 pub struct SessionTabSnapshot {
+    pub workspace_id: u64,
     pub url: String,
     pub title: String,
     pub is_active: bool,
     pub is_hibernated: bool,
     pub is_pinned: bool,
+}
+
+/// A globally visible bookmark. `folder` is the owning workspace's name, so a
+/// saved page stays reachable from every other workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookmarkItem {
+    pub id: i64,
+    pub workspace_id: u64,
+    pub url: String,
+    pub title: String,
+    pub folder: String,
 }
 
 #[derive(Debug, Clone)]
@@ -43,10 +57,19 @@ pub enum DbCommand {
     SaveSession {
         tabs: Vec<SessionTabSnapshot>,
     },
+    SaveWorkspaces {
+        workspaces: Vec<Workspace>,
+    },
     AddBookmark {
+        workspace_id: u64,
         url: String,
         title: String,
         folder: String,
+    },
+    RenameBookmarkFolder {
+        workspace_id: u64,
+        from: String,
+        to: String,
     },
     SavePreferences {
         preferences: BrowserPreferences,
@@ -72,8 +95,25 @@ impl StorageHandle {
         self.send(DbCommand::SaveSession { tabs });
     }
 
-    pub fn add_bookmark(&self, url: String, title: String, folder: String) {
-        self.send(DbCommand::AddBookmark { url, title, folder });
+    pub fn save_workspaces(&self, workspaces: Vec<Workspace>) {
+        self.send(DbCommand::SaveWorkspaces { workspaces });
+    }
+
+    pub fn add_bookmark(&self, workspace_id: u64, url: String, title: String, folder: String) {
+        self.send(DbCommand::AddBookmark {
+            workspace_id,
+            url,
+            title,
+            folder,
+        });
+    }
+
+    pub fn rename_bookmark_folder(&self, workspace_id: u64, from: String, to: String) {
+        self.send(DbCommand::RenameBookmarkFolder {
+            workspace_id,
+            from,
+            to,
+        });
     }
 
     pub fn save_preferences(&self, preferences: BrowserPreferences) {
@@ -94,7 +134,8 @@ impl StorageManager {
         Self { db_path }
     }
 
-    /// Initialize SQLite connection and apply WAL schema.
+    /// Initialize SQLite connection and apply WAL schema, including in-place
+    /// migrations for databases created before workspaces existed.
     pub fn init_db(db_path: &Path) -> Result<Connection, rusqlite::Error> {
         if let Some(parent) = db_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -103,25 +144,82 @@ impl StorageManager {
         let conn = Connection::open(db_path)?;
         conn.execute_batch(include_str!("schema.sql"))?;
 
-        // `CREATE TABLE IF NOT EXISTS` does not update databases created by
-        // older releases, so add the pin column in place when needed.
-        let has_is_pinned = {
-            let mut stmt = conn.prepare("PRAGMA table_info(session_tabs)")?;
-            let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            let mut found = false;
-            for column in columns {
-                if column? == "is_pinned" {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        };
-        if !has_is_pinned {
+        // Every database, fresh or legacy, gets a stable default workspace.
+        // Existing tabs and bookmarks are assigned to it below.
+        conn.execute(
+            "INSERT OR IGNORE INTO workspaces
+             (id, name, icon, color, is_active, sort_index)
+             VALUES (?1, ?2, ?3, ?4, 1, 0)",
+            params![
+                Workspace::DEFAULT_ID as i64,
+                Workspace::DEFAULT_NAME,
+                WorkspaceIcon::default().storage_key(),
+                WorkspaceColor::default().storage_key(),
+            ],
+        )?;
+
+        if !table_has_column(&conn, "session_tabs", "is_pinned")? {
             conn.execute_batch(
                 "ALTER TABLE session_tabs ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
+        if !table_has_column(&conn, "session_tabs", "workspace_id")? {
+            conn.execute_batch(
+                "ALTER TABLE session_tabs ADD COLUMN workspace_id INTEGER NOT NULL DEFAULT 1;",
+            )?;
+        }
+
+        if !table_has_column(&conn, "bookmarks", "workspace_id")? {
+            // Legacy bookmarks used a global UNIQUE(url) constraint. Recreate
+            // the table so the same URL can be saved once per workspace.
+            let _ = conn.execute_batch("DROP INDEX IF EXISTS idx_bookmarks_folder;");
+            conn.execute_batch("ALTER TABLE bookmarks RENAME TO bookmarks_legacy;")?;
+            conn.execute_batch(
+                "CREATE TABLE bookmarks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    workspace_id INTEGER NOT NULL DEFAULT 1,
+                    url TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    folder TEXT NOT NULL DEFAULT 'Personal',
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(workspace_id, url)
+                 );
+                 INSERT OR REPLACE INTO bookmarks
+                    (workspace_id, url, title, folder, created_at)
+                 SELECT 1, url, title, 'Personal', created_at FROM bookmarks_legacy;
+                 DROP TABLE bookmarks_legacy;
+                 CREATE INDEX IF NOT EXISTS idx_bookmarks_folder ON bookmarks(folder);",
+            )?;
+        }
+
+        // Older releases used a "Toolbar" folder; workspaces use the workspace
+        // name as the folder so bookmarks remain globally browsable.
+        conn.execute(
+            "UPDATE bookmarks SET folder = ?1
+             WHERE workspace_id = ?2 AND folder = 'Toolbar'",
+            params![Workspace::DEFAULT_NAME, Workspace::DEFAULT_ID as i64],
+        )?;
+
+        // Keep exactly one active workspace even if an older session wrote
+        // several active flags or none at all.
+        let active_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM workspaces WHERE is_active = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if active_count != 1 {
+            conn.execute_batch("UPDATE workspaces SET is_active = 0;")?;
+            conn.execute(
+                "UPDATE workspaces SET is_active = 1 WHERE id = ?1",
+                params![Workspace::DEFAULT_ID as i64],
+            )?;
+        }
+
+        // Created after migrations so legacy databases gain the column first.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_session_tabs_workspace
+             ON session_tabs(workspace_id, tab_index);",
+        )?;
 
         Ok(conn)
     }
@@ -130,17 +228,18 @@ impl StorageManager {
     pub fn load_session(db_path: &Path) -> Result<Vec<SessionTabSnapshot>, rusqlite::Error> {
         let conn = Self::init_db(db_path)?;
         let mut stmt = conn.prepare(
-            "SELECT url, title, is_active, is_hibernated, is_pinned
-             FROM session_tabs ORDER BY tab_index ASC",
+            "SELECT workspace_id, url, title, is_active, is_hibernated, is_pinned
+             FROM session_tabs ORDER BY workspace_id ASC, tab_index ASC",
         )?;
 
         let rows = stmt.query_map([], |row| {
             Ok(SessionTabSnapshot {
-                url: row.get(0)?,
-                title: row.get(1)?,
-                is_active: row.get::<_, i32>(2)? != 0,
-                is_hibernated: row.get::<_, i32>(3)? != 0,
-                is_pinned: row.get::<_, i32>(4)? != 0,
+                workspace_id: row.get::<_, i64>(0)? as u64,
+                url: row.get(1)?,
+                title: row.get(2)?,
+                is_active: row.get::<_, i32>(3)? != 0,
+                is_hibernated: row.get::<_, i32>(4)? != 0,
+                is_pinned: row.get::<_, i32>(5)? != 0,
             })
         })?;
 
@@ -151,6 +250,61 @@ impl StorageManager {
             }
         }
         Ok(snapshots)
+    }
+
+    /// Load all workspaces. A missing database still yields the default workspace.
+    pub fn load_workspaces(db_path: &Path) -> Result<Vec<Workspace>, rusqlite::Error> {
+        let conn = Self::init_db(db_path)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, icon, color, is_active
+             FROM workspaces ORDER BY sort_index ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Workspace {
+                id: row.get::<_, i64>(0)? as u64,
+                name: row.get(1)?,
+                icon: WorkspaceIcon::from_storage_key(&row.get::<_, String>(2)?),
+                color: WorkspaceColor::from_storage_key(&row.get::<_, String>(3)?),
+                is_active: row.get::<_, i32>(4)? != 0,
+            })
+        })?;
+
+        let mut workspaces = Vec::new();
+        for row in rows {
+            if let Ok(workspace) = row {
+                workspaces.push(workspace);
+            }
+        }
+        if workspaces.is_empty() {
+            workspaces.push(Workspace::default_workspace());
+        }
+        Ok(workspaces)
+    }
+
+    /// Load bookmarks across every workspace folder.
+    pub fn load_bookmarks(db_path: &Path) -> Result<Vec<BookmarkItem>, rusqlite::Error> {
+        let conn = Self::init_db(db_path)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, workspace_id, url, title, folder
+             FROM bookmarks ORDER BY folder ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(BookmarkItem {
+                id: row.get(0)?,
+                workspace_id: row.get::<_, i64>(1)? as u64,
+                url: row.get(2)?,
+                title: row.get(3)?,
+                folder: row.get(4)?,
+            })
+        })?;
+
+        let mut bookmarks = Vec::new();
+        for row in rows {
+            if let Ok(bookmark) = row {
+                bookmarks.push(bookmark);
+            }
+        }
+        Ok(bookmarks)
     }
 
     /// Load persisted preferences. Corrupt or legacy data falls back to the
@@ -224,6 +378,17 @@ impl StorageManager {
     }
 }
 
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, rusqlite::Error> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in columns {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -264,10 +429,11 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
             for (idx, tab) in tabs.iter().enumerate() {
                 let _ = tx.execute(
                     "INSERT INTO session_tabs
-                     (tab_index, url, title, is_active, is_hibernated, is_pinned)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (tab_index, workspace_id, url, title, is_active, is_hibernated, is_pinned)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         idx as i64,
+                        tab.workspace_id as i64,
                         tab.url,
                         tab.title,
                         if tab.is_active { 1 } else { 0 },
@@ -281,16 +447,63 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
                 tracing::warn!("Failed to commit session save transaction: {}", e);
             }
         }
-        DbCommand::AddBookmark { url, title, folder } => {
+        DbCommand::SaveWorkspaces { workspaces } => {
+            let tx = match conn.transaction() {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("Failed to begin workspace save transaction: {}", e);
+                    return;
+                }
+            };
+            let _ = tx.execute("DELETE FROM workspaces", []);
+            for workspace in &workspaces {
+                let _ = tx.execute(
+                    "INSERT INTO workspaces
+                     (id, name, icon, color, is_active, sort_index)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        workspace.id as i64,
+                        Workspace::normalize_name(&workspace.name),
+                        workspace.icon.storage_key(),
+                        workspace.color.storage_key(),
+                        if workspace.is_active { 1 } else { 0 },
+                        workspace.id as i64,
+                    ],
+                );
+            }
+            if let Err(e) = tx.commit() {
+                tracing::warn!("Failed to commit workspace save transaction: {}", e);
+            }
+        }
+        DbCommand::AddBookmark {
+            workspace_id,
+            url,
+            title,
+            folder,
+        } => {
             let now = now_epoch_secs();
             let res = conn.execute(
-                "INSERT INTO bookmarks (url, title, folder, created_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(url) DO UPDATE SET title = ?2, folder = ?3",
-                params![url, title, folder, now],
+                "INSERT INTO bookmarks (workspace_id, url, title, folder, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(workspace_id, url) DO UPDATE SET title = ?3, folder = ?4",
+                params![workspace_id as i64, url, title, folder, now],
             );
             if let Err(e) = res {
                 tracing::warn!("Failed to add bookmark: {}", e);
+            }
+        }
+        DbCommand::RenameBookmarkFolder {
+            workspace_id,
+            from,
+            to,
+        } => {
+            let res = conn.execute(
+                "UPDATE bookmarks SET folder = ?3
+                 WHERE workspace_id = ?1 AND folder = ?2",
+                params![workspace_id as i64, from, to],
+            );
+            if let Err(e) = res {
+                tracing::warn!("Failed to rename bookmark folder: {}", e);
             }
         }
         DbCommand::SavePreferences { preferences } => {
@@ -338,7 +551,7 @@ fn run_worker_loop(db_path: PathBuf, mut rx: UnboundedReceiver<DbCommand>) {
 #[cfg(test)]
 mod tests {
     use super::{apply_command, DbCommand, SessionTabSnapshot, StorageManager};
-    use crate::config::BrowserPreferences;
+    use crate::config::{BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon};
     use rusqlite::params;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -389,7 +602,13 @@ mod tests {
             .collect();
         assert_eq!(
             tables,
-            vec!["bookmarks", "history", "preferences", "session_tabs"]
+            vec![
+                "bookmarks",
+                "history",
+                "preferences",
+                "session_tabs",
+                "workspaces",
+            ]
         );
 
         drop(conn);
@@ -436,6 +655,7 @@ mod tests {
             DbCommand::SaveSession {
                 tabs: vec![
                     SessionTabSnapshot {
+                        workspace_id: 1,
                         url: "https://active.example".to_string(),
                         title: "Active".to_string(),
                         is_active: true,
@@ -443,6 +663,7 @@ mod tests {
                         is_pinned: true,
                     },
                     SessionTabSnapshot {
+                        workspace_id: 1,
                         url: "view-source:https://example.com".to_string(),
                         title: "Source".to_string(),
                         is_active: false,
@@ -468,6 +689,7 @@ mod tests {
             &mut conn,
             DbCommand::SaveSession {
                 tabs: vec![SessionTabSnapshot {
+                    workspace_id: 1,
                     url: "https://only.example".to_string(),
                     title: "Only".to_string(),
                     is_active: true,
@@ -479,6 +701,103 @@ mod tests {
         let replaced = StorageManager::load_session(&path).expect("replaced session load");
         assert_eq!(replaced.len(), 1);
         assert_eq!(replaced[0].url, "https://only.example");
+
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn workspaces_save_and_load_with_active_state() {
+        let (path, mut conn) = fresh_db("workspaces");
+        let default = StorageManager::load_workspaces(&path).expect("default workspace");
+        assert_eq!(default.len(), 1);
+        assert_eq!(default[0].name, Workspace::DEFAULT_NAME);
+        assert!(default[0].is_active);
+
+        apply_command(
+            &mut conn,
+            DbCommand::SaveWorkspaces {
+                workspaces: vec![
+                    Workspace {
+                        id: 1,
+                        name: "Personal".to_string(),
+                        icon: WorkspaceIcon::Work,
+                        color: WorkspaceColor::Blue,
+                        is_active: false,
+                    },
+                    Workspace {
+                        id: 2,
+                        name: "Studio".to_string(),
+                        icon: WorkspaceIcon::Palette,
+                        color: WorkspaceColor::Purple,
+                        is_active: true,
+                    },
+                ],
+            },
+        );
+
+        let saved = StorageManager::load_workspaces(&path).expect("saved workspaces");
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[1].name, "Studio");
+        assert_eq!(saved[1].icon, WorkspaceIcon::Palette);
+        assert_eq!(saved[1].color, WorkspaceColor::Purple);
+        assert!(saved[1].is_active);
+        assert!(!saved[0].is_active);
+
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn bookmarks_are_grouped_by_workspace_folder() {
+        let (path, mut conn) = fresh_db("bookmark-folders");
+        apply_command(
+            &mut conn,
+            DbCommand::AddBookmark {
+                workspace_id: 2,
+                url: "https://one.example".to_string(),
+                title: "One".to_string(),
+                folder: "Work".to_string(),
+            },
+        );
+        apply_command(
+            &mut conn,
+            DbCommand::AddBookmark {
+                workspace_id: 1,
+                url: "https://two.example".to_string(),
+                title: "Two".to_string(),
+                folder: "Personal".to_string(),
+            },
+        );
+        apply_command(
+            &mut conn,
+            DbCommand::AddBookmark {
+                workspace_id: 1,
+                url: "https://archived.example".to_string(),
+                title: "Archived".to_string(),
+                folder: "Archived Work".to_string(),
+            },
+        );
+        apply_command(
+            &mut conn,
+            DbCommand::RenameBookmarkFolder {
+                workspace_id: 2,
+                from: "Work".to_string(),
+                to: "Studio".to_string(),
+            },
+        );
+
+        let bookmarks = StorageManager::load_bookmarks(&path).expect("bookmarks");
+        assert_eq!(bookmarks.len(), 3);
+        assert!(bookmarks.iter().any(|bookmark| {
+            bookmark.folder == "Studio" && bookmark.url == "https://one.example"
+        }));
+        assert!(bookmarks.iter().any(|bookmark| {
+            bookmark.folder == "Personal" && bookmark.url == "https://two.example"
+        }));
+        assert!(bookmarks.iter().any(|bookmark| {
+            bookmark.folder == "Archived Work" && bookmark.url == "https://archived.example"
+        }));
 
         drop(conn);
         remove_test_db(&path);
@@ -574,6 +893,7 @@ mod tests {
         apply_command(
             &mut conn,
             DbCommand::AddBookmark {
+                workspace_id: 1,
                 url: "https://example.com".to_string(),
                 title: "First".to_string(),
                 folder: "Toolbar".to_string(),
@@ -582,6 +902,7 @@ mod tests {
         apply_command(
             &mut conn,
             DbCommand::AddBookmark {
+                workspace_id: 1,
                 url: "https://example.com".to_string(),
                 title: "Updated".to_string(),
                 folder: "Reading".to_string(),

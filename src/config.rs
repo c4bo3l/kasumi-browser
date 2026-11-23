@@ -89,6 +89,201 @@ impl Default for SearchEngine {
     }
 }
 
+/// Material Symbols icon chosen by the user for a workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceIcon {
+    Work,
+    Code,
+    School,
+    Rocket,
+    Palette,
+    Music,
+    Book,
+    Public,
+}
+
+impl WorkspaceIcon {
+    pub const ALL: [Self; 8] = [
+        Self::Work,
+        Self::Code,
+        Self::School,
+        Self::Rocket,
+        Self::Palette,
+        Self::Music,
+        Self::Book,
+        Self::Public,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Work => "Work",
+            Self::Code => "Code",
+            Self::School => "Study",
+            Self::Rocket => "Launch",
+            Self::Palette => "Design",
+            Self::Music => "Music",
+            Self::Book => "Reading",
+            Self::Public => "Web",
+        }
+    }
+
+    pub fn storage_key(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::Code => "code",
+            Self::School => "school",
+            Self::Rocket => "rocket",
+            Self::Palette => "palette",
+            Self::Music => "music",
+            Self::Book => "book",
+            Self::Public => "public",
+        }
+    }
+
+    pub fn from_storage_key(key: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|icon| icon.storage_key() == key)
+            .unwrap_or_default()
+    }
+}
+
+impl Default for WorkspaceIcon {
+    fn default() -> Self {
+        Self::Work
+    }
+}
+
+/// Accent colour chosen by the user for a workspace. It tints the native
+/// chrome only; page content keeps Chromium's own colours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceColor {
+    Blue,
+    Purple,
+    Green,
+    Orange,
+    Red,
+    Teal,
+    Pink,
+    Slate,
+}
+
+impl WorkspaceColor {
+    pub const ALL: [Self; 8] = [
+        Self::Blue,
+        Self::Purple,
+        Self::Green,
+        Self::Orange,
+        Self::Red,
+        Self::Teal,
+        Self::Pink,
+        Self::Slate,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Blue => "Blue",
+            Self::Purple => "Purple",
+            Self::Green => "Green",
+            Self::Orange => "Orange",
+            Self::Red => "Red",
+            Self::Teal => "Teal",
+            Self::Pink => "Pink",
+            Self::Slate => "Slate",
+        }
+    }
+
+    pub fn storage_key(self) -> &'static str {
+        match self {
+            Self::Blue => "blue",
+            Self::Purple => "purple",
+            Self::Green => "green",
+            Self::Orange => "orange",
+            Self::Red => "red",
+            Self::Teal => "teal",
+            Self::Pink => "pink",
+            Self::Slate => "slate",
+        }
+    }
+
+    pub fn rgb(self) -> (u8, u8, u8) {
+        match self {
+            Self::Blue => (96, 165, 250),
+            Self::Purple => (167, 139, 250),
+            Self::Green => (74, 222, 128),
+            Self::Orange => (251, 146, 60),
+            Self::Red => (248, 113, 113),
+            Self::Teal => (45, 212, 191),
+            Self::Pink => (244, 114, 182),
+            Self::Slate => (148, 163, 184),
+        }
+    }
+
+    pub fn from_storage_key(key: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|color| color.storage_key() == key)
+            .unwrap_or_default()
+    }
+}
+
+impl Default for WorkspaceColor {
+    fn default() -> Self {
+        Self::Blue
+    }
+}
+
+/// A native workspace. Workspaces own their tab lists, pinned tabs, and a
+/// bookmark folder named after the workspace. Bookmarks stay globally visible
+/// so a page saved in one workspace can be opened from another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Workspace {
+    pub id: u64,
+    pub name: String,
+    pub icon: WorkspaceIcon,
+    pub color: WorkspaceColor,
+    pub is_active: bool,
+}
+
+impl Workspace {
+    pub const DEFAULT_ID: u64 = 1;
+    pub const DEFAULT_NAME: &'static str = "Personal";
+    pub const MAX_NAME_LEN: usize = 32;
+
+    pub fn default_workspace() -> Self {
+        Self {
+            id: Self::DEFAULT_ID,
+            name: Self::DEFAULT_NAME.to_string(),
+            icon: WorkspaceIcon::Work,
+            color: WorkspaceColor::Blue,
+            is_active: true,
+        }
+    }
+
+    /// Trim and clamp names coming from the UI or persisted storage.
+    pub fn normalize_name(name: &str) -> String {
+        let trimmed = name.trim();
+        let mut normalized = String::with_capacity(trimmed.len().min(Self::MAX_NAME_LEN));
+        for (index, ch) in trimmed.chars().enumerate() {
+            if index >= Self::MAX_NAME_LEN {
+                break;
+            }
+            normalized.push(ch);
+        }
+        if normalized.is_empty() {
+            Self::DEFAULT_NAME.to_string()
+        } else {
+            normalized
+        }
+    }
+
+    pub fn archived_folder(name: &str) -> String {
+        format!("Archived {name}")
+    }
+}
+
 /// User-configurable browser preferences. The whole document is persisted as
 /// JSON by the background SQLite worker so adding a field never requires a
 /// schema migration or writes from a CEF callback.

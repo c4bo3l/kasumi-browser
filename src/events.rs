@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::config::BrowserPreferences;
+use crate::config::{BrowserPreferences, WorkspaceColor, WorkspaceIcon};
 
 /// Events sent from CEF handler callbacks (TID_UI / TID_IO) to the main UI thread
 #[derive(Clone)]
@@ -210,6 +210,36 @@ pub enum UiAction {
     HibernateAllBackground,
     OpenDevTools {
         tab_id: u64,
+    },
+    /// Switch the visible native workspace and its active tab.
+    SwitchWorkspace {
+        workspace_id: u64,
+    },
+    /// Create a workspace with the user's chosen name, icon, and accent colour.
+    CreateWorkspace {
+        name: String,
+        icon: WorkspaceIcon,
+        color: WorkspaceColor,
+    },
+    /// Update the name, icon, and accent colour of an existing workspace.
+    UpdateWorkspace {
+        workspace_id: u64,
+        name: String,
+        icon: WorkspaceIcon,
+        color: WorkspaceColor,
+    },
+    /// Delete a workspace. Its tabs move to another workspace and its bookmark
+    /// folder is archived rather than discarded.
+    DeleteWorkspace {
+        workspace_id: u64,
+    },
+    /// Save the active tab in a folder named after the active workspace.
+    AddBookmark {
+        tab_id: u64,
+    },
+    /// Open a bookmark in the current workspace, regardless of its folder.
+    OpenBookmark {
+        url: String,
     },
     /// Apply preferences changed in the native Settings overlay.
     ApplyPreferences(BrowserPreferences),
