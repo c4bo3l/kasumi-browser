@@ -4,6 +4,27 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
+## v0.5.2 — 2026-11-24
+
+### Changed
+
+- Expanded **Future Development** with Google Meet/WebRTC research notes: CEF-to-egui permission callback bridge, media-access and site-permission prompts, screen-share source selection, macOS camera/microphone entitlements, and persisted permission decisions.
+- Added tiny local AI research notes covering sub-0.4B on-device model candidates (`LFM2.5-230M`, `Gemma-3-270M-it`, `SmolLM2-360M-Instruct`), `Q8_0` quantization, grammar-constrained output, and a 2048-token context cap.
+- Documented a proposed CEF/Chromium engine update process: scheduled crates.io check, review PR with coordinated version bump, full three-platform CI plus runtime smoke test, and delivery through signed GitHub Releases rather than runtime binary swaps.
+- Gated the macOS-only `KasumiEvent` variants behind `cfg(target_os = "macos")` so Windows and Linux no longer emit dead-code warnings.
+- Bumped the project, macOS bundle, About-menu version, docs, and lockfile from `0.5.1` to `0.5.2`.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser` — 103 tests
+- `cargo build --release`
+- PR CI checks formatting, binaries, and unit tests on macOS 15 Intel, Windows, and Linux.
+- No user-visible behavior changed in this release.
+
+---
+
 ## v0.5.1 — 2026-11-23
 
 ### Fixed
