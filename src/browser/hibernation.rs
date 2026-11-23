@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,9 +20,8 @@ use sysinfo::{ProcessesToUpdate, System};
 use crate::browser::favicon::create_favicon_download_callback;
 use crate::browser::{adblocker, client};
 use crate::config::{
-    DEFAULT_HOME_URL, RAM_CHECK_INTERVAL, RAM_CRITICAL_PRESSURE_THRESHOLD,
-    RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_NORMAL, TAB_IDLE_TIMEOUT_PRESSURE,
-    TAB_WATCHDOG_TICK_INTERVAL,
+    BrowserPreferences, RAM_CHECK_INTERVAL, RAM_CRITICAL_PRESSURE_THRESHOLD,
+    RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_PRESSURE, TAB_WATCHDOG_TICK_INTERVAL,
 };
 use crate::events::{BrowserEvent, BrowserShortcut, UiAction};
 use crate::storage::db::{SessionTabSnapshot, StorageHandle};
@@ -88,11 +88,12 @@ pub fn is_critical_pressure(ratio: f32) -> bool {
     ratio >= RAM_CRITICAL_PRESSURE_THRESHOLD
 }
 
-pub fn idle_timeout_for_pressure(ratio: f32) -> Duration {
+pub fn idle_timeout_for_pressure(ratio: f32, normal_timeout: Duration) -> Duration {
     if ratio >= RAM_HIGH_PRESSURE_THRESHOLD {
-        TAB_IDLE_TIMEOUT_PRESSURE
+        // Pressure must never make the timeout longer than the user's choice.
+        TAB_IDLE_TIMEOUT_PRESSURE.min(normal_timeout)
     } else {
-        TAB_IDLE_TIMEOUT_NORMAL
+        normal_timeout
     }
 }
 
@@ -248,8 +249,17 @@ pub struct TabManager {
     pub ram_total_bytes: u64,
     pub ram_process_mb: u64,
 
-    // Brave adblock engine shared across all tabs
+    // Brave adblock engine shared across all tabs. The enabled flag is shared
+    // with CEF handlers so Settings can toggle blocking without recreating
+    // browsers or touching CEF from the UI thread.
     adblock_engine: Arc<adblock::Engine>,
+    adblock_enabled: Arc<AtomicBool>,
+
+    // User-configurable idle timeout for the normal-pressure watchdog.
+    idle_timeout: Duration,
+
+    // Landing page for fresh tabs, derived from the selected search provider.
+    home_url: String,
 
     // SQLite persistence worker & closed tab stack
     pub storage: Option<StorageHandle>,
@@ -270,6 +280,9 @@ pub struct TabManager {
     // Set when CEF forwards Cmd/Ctrl+K; consumed by the winit handler.
     command_palette_requested: bool,
 
+    // Set when CEF forwards Cmd/Ctrl+,; consumed by the winit handler.
+    settings_requested: bool,
+
     // Favicon URLs already requested, and URLs seen before the browser exists.
     requested_favicons: HashSet<(u64, String)>,
     pending_favicon_urls: HashMap<u64, Vec<String>>,
@@ -288,12 +301,14 @@ impl TabManager {
         parent_window_view: *mut std::ffi::c_void,
         content_rect: ContentRect,
         storage: Option<StorageHandle>,
+        preferences: &BrowserPreferences,
     ) -> Self {
         let mut sys = System::new();
         sys.refresh_memory();
         let total = sys.total_memory();
         let used = sys.used_memory();
         let adblock_engine = adblocker::create_adblock_engine();
+        let adblock_enabled = Arc::new(AtomicBool::new(preferences.adblock_enabled));
 
         Self {
             tabs: Vec::new(),
@@ -310,18 +325,32 @@ impl TabManager {
             ram_total_bytes: total,
             ram_process_mb: 0,
             adblock_engine,
+            adblock_enabled,
+            idle_timeout: preferences.idle_timeout(),
+            home_url: preferences.home_url().to_string(),
             storage,
             recently_closed: Vec::new(),
             pending_browser_closes: 0,
             pending_browser_spawns: VecDeque::new(),
             pending_navigation_checks: HashMap::new(),
             command_palette_requested: false,
+            settings_requested: false,
             requested_favicons: HashSet::new(),
             pending_favicon_urls: HashMap::new(),
             resolved_favicons: HashSet::new(),
             last_favicon_urls: HashMap::new(),
             favicon_preferences: HashMap::new(),
         }
+    }
+
+    /// Apply live preference changes. Shared CEF state uses atomics so no CEF
+    /// handler ever waits on a UI lock.
+    pub fn apply_preferences(&mut self, preferences: &BrowserPreferences) {
+        let preferences = preferences.clone().normalized();
+        self.adblock_enabled
+            .store(preferences.adblock_enabled, Ordering::Release);
+        self.idle_timeout = preferences.idle_timeout();
+        self.home_url = preferences.home_url().to_string();
     }
 
     /// Restore previous session tabs (instant startup: active tab live, all others hibernated).
@@ -450,7 +479,7 @@ impl TabManager {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
 
-        let target_url = url.unwrap_or_else(|| DEFAULT_HOME_URL.to_string());
+        let target_url = url.unwrap_or_else(|| self.home_url.clone());
         let at = index.map_or(self.tabs.len(), |i| {
             restore_insert_index(i, self.tabs.len())
         });
@@ -730,6 +759,7 @@ impl TabManager {
             tab_id,
             self.event_sender.clone(),
             self.adblock_engine.clone(),
+            Arc::clone(&self.adblock_enabled),
         );
         let mut window_info = cef::WindowInfo::default();
 
@@ -874,6 +904,11 @@ impl TabManager {
         std::mem::take(&mut self.command_palette_requested)
     }
 
+    /// Consume a Cmd/Ctrl+, request forwarded from the CEF web view.
+    pub fn consume_settings_request(&mut self) -> bool {
+        std::mem::take(&mut self.settings_requested)
+    }
+
     fn handle_browser_event(&mut self, event: BrowserEvent) {
         match event {
             BrowserEvent::BrowserCreated { tab_id, browser } => {
@@ -985,6 +1020,9 @@ impl TabManager {
                 }
                 BrowserShortcut::OpenDevTools => {
                     self.show_dev_tools(tab_id);
+                }
+                BrowserShortcut::OpenSettings => {
+                    self.settings_requested = true;
                 }
             },
             BrowserEvent::ViewSource { url, .. } => {
@@ -1185,6 +1223,9 @@ impl TabManager {
             UiAction::OpenDevTools { tab_id } => {
                 self.show_dev_tools(tab_id);
             }
+            UiAction::ApplyPreferences(preferences) => {
+                self.apply_preferences(&preferences);
+            }
         }
     }
 
@@ -1232,7 +1273,7 @@ impl TabManager {
         }
 
         // High memory pressure: shrink timeout to 30s
-        let idle_timeout = idle_timeout_for_pressure(ram_ratio);
+        let idle_timeout = idle_timeout_for_pressure(ram_ratio, self.idle_timeout);
 
         let active = self.active_tab_id;
         let expired_ids: Vec<u64> = self
@@ -1335,14 +1376,28 @@ mod tests {
         assert!(is_critical_pressure(0.9));
         assert!(is_critical_pressure(1.0));
 
-        assert_eq!(idle_timeout_for_pressure(0.0), TAB_IDLE_TIMEOUT_NORMAL);
         assert_eq!(
-            idle_timeout_for_pressure(0.799_999),
+            idle_timeout_for_pressure(0.0, TAB_IDLE_TIMEOUT_NORMAL),
             TAB_IDLE_TIMEOUT_NORMAL
         );
-        assert_eq!(idle_timeout_for_pressure(0.8), TAB_IDLE_TIMEOUT_PRESSURE);
-        assert_eq!(idle_timeout_for_pressure(0.95), TAB_IDLE_TIMEOUT_PRESSURE);
+        assert_eq!(
+            idle_timeout_for_pressure(0.799_999, TAB_IDLE_TIMEOUT_NORMAL),
+            TAB_IDLE_TIMEOUT_NORMAL
+        );
+        assert_eq!(
+            idle_timeout_for_pressure(0.8, TAB_IDLE_TIMEOUT_NORMAL),
+            TAB_IDLE_TIMEOUT_PRESSURE
+        );
+        assert_eq!(
+            idle_timeout_for_pressure(0.95, TAB_IDLE_TIMEOUT_NORMAL),
+            TAB_IDLE_TIMEOUT_PRESSURE
+        );
         assert_ne!(TAB_IDLE_TIMEOUT_NORMAL, Duration::from_secs(30));
+
+        // A shorter user timeout is never lengthened by RAM pressure.
+        let short = Duration::from_secs(20);
+        assert_eq!(idle_timeout_for_pressure(0.95, short), short);
+        assert_eq!(idle_timeout_for_pressure(0.1, short), short);
     }
 
     #[test]

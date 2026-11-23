@@ -193,6 +193,8 @@ const VK_L: i32 = 0x4C;
 const VK_T: i32 = 0x54;
 const VK_W: i32 = 0x57;
 const VK_Z: i32 = 0x5A;
+const VK_OEM_COMMA: i32 = 0xBC;
+const VK_OEM_PERIOD: i32 = 0xBE;
 const VK_F12: i32 = 0x7B;
 
 /// Classify a key event forwarded from the CEF web view.
@@ -227,7 +229,50 @@ pub(crate) fn browser_shortcut(
         VK_T => Some(BrowserShortcut::NewTab),
         VK_W if !shift => Some(BrowserShortcut::CloseTab),
         VK_L | VK_K if !shift => Some(BrowserShortcut::OpenCommandPalette),
+        VK_OEM_COMMA | VK_OEM_PERIOD if !shift => Some(BrowserShortcut::OpenSettings),
         VK_Z if !shift => Some(BrowserShortcut::ReopenClosedTab),
+        _ => None,
+    }
+}
+
+/// Fallback shortcut classification for platforms where CEF's
+/// `windows_key_code` is not populated reliably (notably `Cmd+,` inside a
+/// native macOS child view). CEF still supplies UTF-16 character data, so
+/// matching that as well makes the shell shortcuts work while a page has
+/// keyboard focus.
+fn browser_shortcut_from_char(
+    key_down: bool,
+    key_char: u16,
+    modifiers: u32,
+) -> Option<BrowserShortcut> {
+    let is_repeat = modifiers & REPEAT_EVENT_FLAG != 0;
+    if !key_down || is_repeat {
+        return None;
+    }
+
+    let primary = modifiers & PRIMARY_MODIFIER_FLAGS != 0;
+    let shift = modifiers & SHIFT_MODIFIER_FLAG != 0;
+    let alt = modifiers & ALT_MODIFIER_FLAG != 0;
+    if !primary || alt {
+        return None;
+    }
+
+    match key_char {
+        c if c == ',' as u16 || c == '<' as u16 || c == '.' as u16 || c == '>' as u16 => {
+            Some(BrowserShortcut::OpenSettings)
+        }
+        c if c == 'T' as u16 || c == 't' as u16 => {
+            if shift {
+                Some(BrowserShortcut::ReopenClosedTab)
+            } else {
+                Some(BrowserShortcut::NewTab)
+            }
+        }
+        c if c == 'W' as u16 || c == 'w' as u16 => Some(BrowserShortcut::CloseTab),
+        c if c == 'L' as u16 || c == 'l' as u16 || c == 'K' as u16 || c == 'k' as u16 => {
+            Some(BrowserShortcut::OpenCommandPalette)
+        }
+        c if c == 'Z' as u16 || c == 'z' as u16 => Some(BrowserShortcut::ReopenClosedTab),
         _ => None,
     }
 }
@@ -249,9 +294,22 @@ wrap_keyboard_handler! {
             if let Some(event) = event {
                 let is_key_down = event.type_ == KeyEventType::KEYDOWN
                     || event.type_ == KeyEventType::RAWKEYDOWN;
-                if let Some(shortcut) =
-                    browser_shortcut(is_key_down, event.windows_key_code, event.modifiers)
-                {
+                let shortcut = browser_shortcut(is_key_down, event.windows_key_code, event.modifiers)
+                    .or_else(|| {
+                        browser_shortcut_from_char(
+                            is_key_down,
+                            event.unmodified_character,
+                            event.modifiers,
+                        )
+                    })
+                    .or_else(|| {
+                        browser_shortcut_from_char(
+                            is_key_down,
+                            event.character,
+                            event.modifiers,
+                        )
+                    });
+                if let Some(shortcut) = shortcut {
                     let _ = self.event_sender.send(BrowserEvent::BrowserShortcut {
                         tab_id: self.tab_id,
                         shortcut,
@@ -338,14 +396,19 @@ pub fn create_tab_client(
     tab_id: u64,
     event_sender: Sender<BrowserEvent>,
     adblock_engine: std::sync::Arc<adblock::Engine>,
+    adblock_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Client {
     let life_span_handler = TabLifeSpanHandler::new(tab_id, event_sender.clone());
     let load_handler = TabLoadHandler::new(tab_id, event_sender.clone());
     let display_handler = TabDisplayHandler::new(tab_id, event_sender.clone());
     let keyboard_handler = TabKeyboardHandler::new(tab_id, event_sender.clone());
     let context_menu_handler = TabContextMenuHandler::new(tab_id, event_sender.clone());
-    let request_handler =
-        super::adblocker::create_tab_request_handler(tab_id, event_sender, adblock_engine);
+    let request_handler = super::adblocker::create_tab_request_handler(
+        tab_id,
+        event_sender,
+        adblock_engine,
+        adblock_enabled,
+    );
 
     TabClient::new(
         life_span_handler.into(),
@@ -359,7 +422,7 @@ pub fn create_tab_client(
 
 #[cfg(test)]
 mod tests {
-    use super::browser_shortcut;
+    use super::{browser_shortcut, browser_shortcut_from_char};
     use crate::events::BrowserShortcut;
 
     #[test]
@@ -395,6 +458,45 @@ mod tests {
         assert_eq!(
             browser_shortcut(true, 0x7B, 0),
             Some(BrowserShortcut::OpenDevTools)
+        );
+        assert_eq!(
+            browser_shortcut(true, 0xBC, 128),
+            Some(BrowserShortcut::OpenSettings)
+        );
+        assert_eq!(
+            browser_shortcut(true, 0xBE, 128),
+            Some(BrowserShortcut::OpenSettings)
+        );
+    }
+
+    #[test]
+    fn web_view_falls_back_to_utf16_characters_for_settings_shortcut() {
+        // CEF's Windows key code is not always populated for `Cmd+,` in a
+        // native macOS child view, so the UTF-16 character must also work.
+        assert_eq!(
+            browser_shortcut_from_char(true, ',' as u16, 128),
+            Some(BrowserShortcut::OpenSettings)
+        );
+        assert_eq!(
+            browser_shortcut_from_char(true, '<' as u16, 128),
+            Some(BrowserShortcut::OpenSettings)
+        );
+        assert_eq!(
+            browser_shortcut_from_char(true, '.' as u16, 4),
+            Some(BrowserShortcut::OpenSettings)
+        );
+        assert_eq!(
+            browser_shortcut_from_char(true, 'T' as u16, 128 | 2),
+            Some(BrowserShortcut::ReopenClosedTab)
+        );
+        assert_eq!(
+            browser_shortcut_from_char(true, 't' as u16, 128),
+            Some(BrowserShortcut::NewTab)
+        );
+        assert_eq!(browser_shortcut_from_char(false, ',' as u16, 128), None);
+        assert_eq!(
+            browser_shortcut_from_char(true, ',' as u16, 128 | 8_192),
+            None
         );
     }
 

@@ -25,7 +25,9 @@ use egui::{
 use egui_wgpu::ScreenDescriptor;
 
 use crate::config::{
-    rail_width, COMMAND_PALETTE_TOP_OFFSET, COMMAND_PALETTE_WIDTH, DEFAULT_SEARCH_URL_PREFIX,
+    rail_width, BrowserPreferences, SearchEngine, ThemePreference, COMMAND_PALETTE_TOP_OFFSET,
+    COMMAND_PALETTE_WIDTH, DEFAULT_SEARCH_URL_PREFIX, MAX_IDLE_TIMEOUT_MINUTES,
+    MIN_IDLE_TIMEOUT_MINUTES,
 };
 use crate::events::UiAction;
 
@@ -192,12 +194,25 @@ impl ChromeTheme {
     }
 }
 
-const TOOLTIP_WIDTH: f32 = 240.0;
-const TOOLTIP_HEIGHT_EXPANDED: f32 = 52.0;
-const TOOLTIP_HEIGHT_COLLAPSED: f32 = 40.0;
+/// Resolve the user's appearance preference against the current OS theme.
+/// Keeping this pure makes the Settings override easy to test.
+pub fn effective_theme(preference: ThemePreference, system: ChromeTheme) -> ChromeTheme {
+    match preference {
+        ThemePreference::System => system,
+        ThemePreference::Light => ChromeTheme::Light,
+        ThemePreference::Dark => ChromeTheme::Dark,
+    }
+}
+
+const TOOLTIP_WIDTH: f32 = 280.0;
+const TOOLTIP_HEIGHT_EXPANDED: f32 = 64.0;
+const TOOLTIP_HEIGHT_COLLAPSED: f32 = 52.0;
 const RAIL_MENU_WIDTH: f32 = 224.0;
 const RAIL_MENU_ROW_HEIGHT: f32 = 28.0;
 const RAIL_MENU_PADDING: f32 = 7.0;
+const RAIL_STATUS_HEIGHT: f32 = 112.0;
+const SETTINGS_WIDTH: f32 = 660.0;
+const SETTINGS_MAX_CONTENT_HEIGHT: f32 = 560.0;
 
 /// Prefer egui's recommended non-sRGB surface formats. Some drivers only list
 /// `Bgra8UnormSrgb` first, which makes `egui_wgpu` warn about linear sRGB
@@ -231,6 +246,7 @@ enum RailIcon {
     Chip,
     Globe,
     Close,
+    Settings,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +292,7 @@ pub enum CommandAction {
     HibernateAll,
     ToggleRail,
     OpenDevTools,
+    OpenSettings,
 }
 
 /// One row in the floating command palette.
@@ -360,8 +377,12 @@ pub struct ChromeState {
     pub command_palette_query: String,
     /// Currently highlighted command palette row.
     pub command_selection: usize,
-    /// Set when the palette should focus and select its query on next render.
+    /// Set when the palette should focus its query input on next render.
     pub command_palette_focus_requested: bool,
+    /// Set when the focused palette input should select all text on next render.
+    /// Selection is deferred one frame because egui processes key events before
+    /// a widget that requests focus during that same frame exists.
+    pub command_palette_select_all_requested: bool,
     /// Latest rail tooltip; consumed by the overlay window on each frame.
     pub tooltip: Option<RailTooltip>,
     /// Open tab context menu; consumed by the shared full-window overlay.
@@ -370,8 +391,16 @@ pub struct ChromeState {
     pub menu_selection: usize,
     /// True when at least one closed tab can be restored with Cmd/Ctrl+Z.
     pub can_reopen_tab: bool,
-    /// Current OS light/dark appearance used by every native chrome surface.
+    /// Current OS light/dark appearance. The user preference may override it.
+    pub system_theme: ChromeTheme,
+    /// Effective appearance used by every native chrome surface.
     pub theme: ChromeTheme,
+    /// Persisted user preferences mirrored into the chrome state.
+    pub preferences: BrowserPreferences,
+    /// True while the native Settings overlay is visible.
+    pub settings_open: bool,
+    /// Working copy edited by the Settings overlay; committed on every change.
+    pub settings_draft: BrowserPreferences,
 }
 
 impl Default for ChromeState {
@@ -392,11 +421,16 @@ impl Default for ChromeState {
             command_palette_query: String::new(),
             command_selection: 0,
             command_palette_focus_requested: false,
+            command_palette_select_all_requested: false,
             tooltip: None,
             menu: None,
             menu_selection: 0,
             can_reopen_tab: false,
+            system_theme: ChromeTheme::default(),
             theme: ChromeTheme::default(),
+            preferences: BrowserPreferences::default(),
+            settings_open: false,
+            settings_draft: BrowserPreferences::default(),
         }
     }
 }
@@ -408,9 +442,11 @@ impl ChromeState {
             self.command_palette_query = self.omnibox_text.clone();
             self.command_selection = 0;
             self.command_palette_focus_requested = true;
+            self.command_palette_select_all_requested = false;
         }
         self.command_palette_open = true;
         self.close_tab_menu();
+        self.settings_open = false;
     }
 
     pub fn close_command_palette(&mut self) {
@@ -418,6 +454,7 @@ impl ChromeState {
         self.command_palette_query.clear();
         self.command_selection = 0;
         self.command_palette_focus_requested = false;
+        self.command_palette_select_all_requested = false;
         self.tooltip = None;
         self.close_tab_menu();
     }
@@ -435,6 +472,7 @@ impl ChromeState {
         self.command_palette_query.clear();
         self.command_selection = 0;
         self.command_palette_focus_requested = false;
+        self.command_palette_select_all_requested = false;
 
         let (width, height) = rail_menu_metrics();
         self.menu = Some(RailMenu {
@@ -445,11 +483,68 @@ impl ChromeState {
         });
         self.menu_selection = 0;
         self.tooltip = None;
+        self.settings_open = false;
     }
 
     pub fn close_tab_menu(&mut self) {
         self.menu = None;
         self.menu_selection = 0;
+    }
+
+    /// Open the native Settings overlay, seeded from committed preferences.
+    pub fn open_settings(&mut self) {
+        self.command_palette_open = false;
+        self.command_palette_query.clear();
+        self.command_selection = 0;
+        self.command_palette_focus_requested = false;
+        self.command_palette_select_all_requested = false;
+        self.close_tab_menu();
+        self.tooltip = None;
+        self.settings_draft = self.preferences.clone();
+        self.settings_open = true;
+    }
+
+    pub fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.settings_draft = self.preferences.clone();
+    }
+
+    /// Close whichever shared overlay is currently visible.
+    pub fn close_active_overlay(&mut self) {
+        if self.settings_open {
+            self.close_settings();
+        } else if self.menu.is_some() {
+            self.close_tab_menu();
+        } else if self.command_palette_open {
+            self.close_command_palette();
+        }
+    }
+
+    pub fn has_overlay(&self) -> bool {
+        self.command_palette_open || self.menu.is_some() || self.settings_open
+    }
+
+    /// Update the OS appearance and recompute the effective chrome theme.
+    pub fn set_system_theme(&mut self, system: ChromeTheme) {
+        self.system_theme = system;
+        self.refresh_theme();
+    }
+
+    /// Install preference changes and immediately update derived UI state.
+    ///
+    /// The rail's `rail_expanded` preference is a *startup default*, not a live
+    /// mirror of the current rail. The winit handler applies it only when the
+    /// preference itself changes, so editing an unrelated setting never
+    /// expands a rail the user collapsed manually.
+    pub fn set_preferences(&mut self, preferences: BrowserPreferences) {
+        let preferences = preferences.normalized();
+        self.preferences = preferences.clone();
+        self.settings_draft = preferences;
+        self.refresh_theme();
+    }
+
+    fn refresh_theme(&mut self) {
+        self.theme = effective_theme(self.preferences.theme, self.system_theme);
     }
 }
 
@@ -795,8 +890,11 @@ impl ChromeRenderer {
                         ui.separator();
                         ui.add_space(5.0);
 
+                        let tab_area_height =
+                            (ui.available_height() - RAIL_STATUS_HEIGHT - 6.0).max(44.0);
                         egui::ScrollArea::vertical()
                             .id_salt("favicon_rail_tabs")
+                            .max_height(tab_area_height)
                             .show(ui, |ui| {
                                 for tab in &state.tabs {
                                     let tab_id = tab.id;
@@ -872,6 +970,75 @@ impl ChromeRenderer {
                                     );
                                 }
                             });
+
+                        // The collapsed rail keeps the same bottom action
+                        // block as the expanded rail, using icon-only buttons.
+                        let status_rect = egui::Rect::from_min_max(
+                            pos2(0.0, ui.clip_rect().bottom() - RAIL_STATUS_HEIGHT),
+                            pos2(width, ui.clip_rect().bottom()),
+                        );
+                        ui.allocate_new_ui(UiBuilder::new().max_rect(status_rect), |ui| {
+                            ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+                                ui.add_space(6.0);
+                                let hibernate = Self::rail_icon_button(
+                                    ui,
+                                    vec2(34.0, 30.0),
+                                    RailIcon::Moon,
+                                    palette,
+                                );
+                                if hibernate.clicked() {
+                                    actions.push(UiAction::HibernateAllBackground);
+                                }
+                                Self::chrome_tooltip(
+                                    tooltip_slot,
+                                    ui,
+                                    &hibernate,
+                                    "Hibernate all background tabs (Alt+H)",
+                                    state.rail_expanded,
+                                );
+
+                                ui.add_space(4.0);
+                                let settings = Self::rail_icon_button(
+                                    ui,
+                                    vec2(34.0, 30.0),
+                                    RailIcon::Settings,
+                                    palette,
+                                );
+                                if settings.clicked() {
+                                    state.open_settings();
+                                }
+                                Self::chrome_tooltip(
+                                    tooltip_slot,
+                                    ui,
+                                    &settings,
+                                    "Settings (Cmd/Ctrl+,)",
+                                    state.rail_expanded,
+                                );
+
+                                ui.add_space(5.0);
+                                ui.horizontal(|ui| {
+                                    let (icon_rect, _) =
+                                        ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
+                                    paint_rail_icon(
+                                        ui,
+                                        icon_rect,
+                                        RailIcon::Shield,
+                                        palette.text_dim,
+                                    );
+                                });
+                                ui.add_space(3.0);
+                                ui.horizontal(|ui| {
+                                    let (icon_rect, _) =
+                                        ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
+                                    paint_rail_icon(
+                                        ui,
+                                        icon_rect,
+                                        RailIcon::Chip,
+                                        palette.text_dim,
+                                    );
+                                });
+                            });
+                        });
                     });
                     return;
                 }
@@ -1080,7 +1247,7 @@ impl ChromeRenderer {
 
                 // Status block stays at the bottom of the rail.
                 let status_rect = egui::Rect::from_min_max(
-                    pos2(0.0, ui.clip_rect().bottom() - 78.0),
+                    pos2(0.0, ui.clip_rect().bottom() - RAIL_STATUS_HEIGHT),
                     pos2(width, ui.clip_rect().bottom()),
                 );
                 ui.allocate_new_ui(UiBuilder::new().max_rect(status_rect), |ui| {
@@ -1102,6 +1269,26 @@ impl ChromeRenderer {
                             ui,
                             &hibernate,
                             "Hibernate all background tabs (Alt+H)",
+                            state.rail_expanded,
+                        );
+
+                        ui.add_space(4.0);
+                        let settings = Self::rail_action_button(
+                            ui,
+                            width - 12.0,
+                            30.0,
+                            RailIcon::Settings,
+                            "Settings",
+                            palette,
+                        );
+                        if settings.clicked() {
+                            state.open_settings();
+                        }
+                        Self::chrome_tooltip(
+                            tooltip_slot,
+                            ui,
+                            &settings,
+                            "Settings (Cmd/Ctrl+,)",
                             state.rail_expanded,
                         );
 
@@ -1166,6 +1353,7 @@ impl ChromeRenderer {
             &state.command_palette_query,
             &state.tabs,
             state.active_tab_id,
+            &state.preferences,
         );
         state.command_selection = clamp_command_selection(state.command_selection, items.len());
 
@@ -1432,6 +1620,200 @@ impl ChromeRenderer {
         }
     }
 
+    /// Draw the native Settings card in the shared transparent overlay.
+    ///
+    /// Controls commit immediately to `ChromeState` and emit one
+    /// `UiAction::ApplyPreferences`; the winit handler persists the document and
+    /// updates the CEF-backed runtime. No CEF thread is touched here.
+    pub fn build_settings(
+        ctx: &egui::Context,
+        state: &mut ChromeState,
+        actions: &mut Vec<UiAction>,
+    ) {
+        let mut draft = state.settings_draft.clone();
+        let palette = state.theme.palette();
+        let screen = ctx.screen_rect();
+        let width = SETTINGS_WIDTH.min((screen.width() - 24.0).max(280.0));
+        let mut card_rect = egui::Rect::from_min_size(screen.center(), vec2(width, 0.0));
+        let mut done_clicked = false;
+        let requested_close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+        // Center the card inside the overlay, which is aligned to the main
+        // window. This makes Settings behave like a dialog on whichever display
+        // currently contains the browser, rather than near the primary screen.
+        egui::Area::new(egui::Id::new("kasumi_settings"))
+            .order(Order::Foreground)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .fixed_pos(screen.center())
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                card_rect = Frame::none()
+                    .fill(palette.palette_bg)
+                    .stroke(Stroke::new(1.0_f32, palette.palette_border))
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(egui::Margin::symmetric(20.0, 18.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Settings")
+                                    .size(16.0)
+                                    .strong()
+                                    .color(palette.text_strong),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                done_clicked = ui.button("Done").clicked();
+                            });
+                        });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+
+                        let available_height =
+                            SETTINGS_MAX_CONTENT_HEIGHT.min((screen.height() - 120.0).max(160.0));
+                        egui::ScrollArea::vertical()
+                            .id_salt("kasumi_settings_scroll")
+                            .max_height(available_height)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("APPEARANCE")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(palette.section_label),
+                                );
+                                ui.add_space(3.0);
+                                ui.radio_value(
+                                    &mut draft.theme,
+                                    ThemePreference::System,
+                                    "Follow system appearance",
+                                );
+                                ui.radio_value(&mut draft.theme, ThemePreference::Light, "Light");
+                                ui.radio_value(&mut draft.theme, ThemePreference::Dark, "Dark");
+
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("SEARCH")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(palette.section_label),
+                                );
+                                ui.add_space(3.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    for engine in SearchEngine::ALL {
+                                        ui.radio_value(
+                                            &mut draft.search_engine,
+                                            engine,
+                                            engine.label(),
+                                        );
+                                    }
+                                });
+                                ui.label(
+                                    RichText::new("Used for omnibox text that is not a URL.")
+                                        .size(10.0)
+                                        .color(palette.palette_hint),
+                                );
+
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("PRIVACY")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(palette.section_label),
+                                );
+                                ui.add_space(3.0);
+                                ui.checkbox(
+                                    &mut draft.adblock_enabled,
+                                    "Block ads and trackers before page scripts load",
+                                );
+
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("PERFORMANCE")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(palette.section_label),
+                                );
+                                ui.add_space(3.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Hibernate idle background tabs after");
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut draft.idle_timeout_minutes,
+                                            MIN_IDLE_TIMEOUT_MINUTES..=MAX_IDLE_TIMEOUT_MINUTES,
+                                        )
+                                        .suffix(" min"),
+                                    );
+                                });
+                                ui.label(
+                                    RichText::new(
+                                        "Critical RAM pressure still hibernates immediately.",
+                                    )
+                                    .size(10.0)
+                                    .color(palette.palette_hint),
+                                );
+
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("WORKSPACE")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(palette.section_label),
+                                );
+                                ui.add_space(3.0);
+                                ui.checkbox(
+                                    &mut draft.rail_expanded,
+                                    "Expand the workspace rail on startup",
+                                );
+                            });
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Changes save automatically")
+                                    .size(10.0)
+                                    .color(palette.palette_hint),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.button("Reset to defaults").clicked() {
+                                    draft = BrowserPreferences::default();
+                                }
+                            });
+                        });
+                    })
+                    .response
+                    .rect
+                    .expand(8.0);
+            });
+
+        let next = draft.normalized();
+        state.settings_draft = next.clone();
+        if next != state.preferences {
+            actions.push(UiAction::ApplyPreferences(next.clone()));
+            state.set_preferences(next);
+        }
+
+        let outside_click = ctx.input(|i| {
+            command_palette_click_outside(
+                card_rect,
+                i.pointer.latest_pos(),
+                i.pointer.primary_clicked(),
+            )
+        });
+        if requested_close || done_clicked || outside_click {
+            state.close_settings();
+        }
+    }
+
     /// Record a tooltip for the hovered rail row. It is painted later by a
     /// transparent overlay window so it appears above the native CEF view.
     fn chrome_tooltip(
@@ -1460,6 +1842,8 @@ impl ChromeRenderer {
     }
 
     /// Draw a cached favicon into an explicit rect, or a vector globe fallback.
+    /// Loading tabs use the same slot for an animated spinner so the favicon
+    /// itself communicates navigation progress.
     fn paint_favicon_in_rect(
         &self,
         ui: &mut Ui,
@@ -1468,6 +1852,11 @@ impl ChromeRenderer {
         palette: &ChromePalette,
     ) {
         if !ui.is_rect_visible(rect) {
+            return;
+        }
+
+        if tab.is_loading {
+            paint_loading_spinner(ui, rect, palette);
             return;
         }
 
@@ -1608,8 +1997,10 @@ impl ChromeRenderer {
         }
     }
 
-    /// Loading/hibernated marker anchored inside the tab row. It shifts left
-    /// while the close button is visible so the two never overlap.
+    /// Hibernated marker anchored inside the tab row. Loading is now shown by
+    /// the spinner in the favicon slot, so the row no longer duplicates it.
+    /// The marker shifts left while the close button is visible so the two
+    /// never overlap.
     fn paint_tab_status(
         ui: &Ui,
         row_rect: egui::Rect,
@@ -1617,17 +2008,17 @@ impl ChromeRenderer {
         close_visible: bool,
         palette: &ChromePalette,
     ) {
-        let center = tab_status_center(row_rect, close_visible);
-        if tab.is_loading {
-            ui.painter().circle_filled(center, 3.5, palette.loading);
-        } else if tab.display_state == TabDisplayState::Hibernated {
-            paint_rail_icon(
-                ui,
-                egui::Rect::from_center_size(center, vec2(12.0, 12.0)),
-                RailIcon::Moon,
-                palette.text_dim,
-            );
+        if tab.display_state != TabDisplayState::Hibernated {
+            return;
         }
+
+        let center = tab_status_center(row_rect, close_visible);
+        paint_rail_icon(
+            ui,
+            egui::Rect::from_center_size(center, vec2(12.0, 12.0)),
+            RailIcon::Moon,
+            palette.text_dim,
+        );
     }
 }
 
@@ -1750,11 +2141,20 @@ impl ChromeOverlayRenderer {
     ) -> Vec<UiAction> {
         let mut actions = Vec::new();
         let mut raw_input = self.egui_state.take_egui_input(window);
-        let menu_open = state.menu.is_some();
-        let focus_before = state.command_palette_focus_requested && !menu_open;
+        // Only one surface may own the shared overlay. Settings has priority,
+        // then the context menu, then the command palette.
+        let settings_open = state.settings_open;
+        let menu_open = state.menu.is_some() && !settings_open;
+        let palette_open = state.command_palette_open && !menu_open && !settings_open;
+        let focus_before = state.command_palette_focus_requested && palette_open;
+        let select_all_before = state.command_palette_select_all_requested && palette_open;
         state.theme.apply_visuals(&self.egui_ctx);
 
-        if focus_before {
+        // Focus is requested while building the input widget, and egui handles
+        // key events before that point in the same frame. Select all on the
+        // following frame, once the input is reliably focused, so typing a
+        // search replaces the active URL instead of appending to it.
+        if select_all_before {
             raw_input.events.push(egui::Event::Key {
                 key: egui::Key::A,
                 physical_key: Some(egui::Key::A),
@@ -1767,16 +2167,20 @@ impl ChromeOverlayRenderer {
 
         let egui_ctx = self.egui_ctx.clone();
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            if menu_open {
+            if settings_open {
+                ChromeRenderer::build_settings(ctx, state, &mut actions);
+            } else if menu_open {
                 ChromeRenderer::build_tab_menu(ctx, state, &mut actions);
-            } else {
+            } else if palette_open {
                 ChromeRenderer::build_command_palette(ctx, state, &mut actions, focus_command);
             }
         });
         // The rail button raises this flag during the main window's render,
         // which happens before this overlay's first frame. Consume it here.
+        let select_all_next = focus_before && palette_open;
         state.command_palette_focus_requested =
             focus_request_after_render(focus_before, state.command_palette_focus_requested);
+        state.command_palette_select_all_requested = select_all_next;
 
         self.egui_state
             .handle_platform_output(window, full_output.platform_output.clone());
@@ -1980,20 +2384,20 @@ impl TooltipRenderer {
                     Frame::none()
                         .fill(palette.tooltip_bg)
                         .stroke(Stroke::new(1.0_f32, palette.tooltip_border))
-                        .rounding(Rounding::same(7.0))
-                        .inner_margin(egui::Margin::symmetric(8.0, 7.0))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(egui::Margin::symmetric(10.0, 9.0))
                         .show(ui, |ui| {
                             // Fill the whole overlay window so the visible card is
                             // vertically centered on the hovered tab row. A plain
                             // label sizes the frame to its text and leaves the card
                             // pinned near the top of the taller transparent window.
                             let inner_size = vec2(
-                                (card.width - 16.0).max(80.0),
-                                (card.height - 14.0).max(12.0),
+                                (card.width - 20.0).max(80.0),
+                                (card.height - 18.0).max(12.0),
                             );
                             let (rect, _) = ui.allocate_exact_size(inner_size, Sense::hover());
                             let lines: Vec<&str> = card.text.lines().collect();
-                            let line_height = 14.0_f32;
+                            let line_height = 17.0_f32;
                             let total_height = lines.len() as f32 * line_height;
                             let first_line_y =
                                 rect.center().y - total_height * 0.5 + line_height * 0.5;
@@ -2005,7 +2409,7 @@ impl TooltipRenderer {
                                     ),
                                     Align2::CENTER_CENTER,
                                     *line,
-                                    FontId::proportional(11.0),
+                                    FontId::proportional(12.0),
                                     palette.tooltip_text,
                                 );
                             }
@@ -2090,7 +2494,7 @@ impl TooltipRenderer {
 fn paint_rail_icon(ui: &Ui, rect: egui::Rect, icon: RailIcon, color: Color32) {
     use egui_material_icons::icons::{
         ICON_ADD, ICON_BEDTIME, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_CODE,
-        ICON_MEMORY, ICON_PUBLIC, ICON_SEARCH, ICON_SHIELD,
+        ICON_MEMORY, ICON_PUBLIC, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD,
     };
 
     let glyph = match icon {
@@ -2104,6 +2508,7 @@ fn paint_rail_icon(ui: &Ui, rect: egui::Rect, icon: RailIcon, color: Color32) {
         RailIcon::Chip => ICON_MEMORY,
         RailIcon::Globe => ICON_PUBLIC,
         RailIcon::Close => ICON_CLOSE,
+        RailIcon::Settings => ICON_SETTINGS,
     };
 
     let size = rect.width().min(rect.height()) * 1.08;
@@ -2225,6 +2630,52 @@ pub fn rail_menu_ui_action(action: RailMenuAction, tab_id: u64) -> Option<UiActi
     }
 }
 
+const LOADING_SPINNER_SEGMENTS: usize = 12;
+const LOADING_SPINNER_BRIGHT_SEGMENTS: usize = 4;
+const LOADING_SPINNER_ROTATIONS_PER_SECOND: f32 = 1.1;
+
+/// Angle of one spinner segment. Keeping this pure makes the rotation easy to
+/// verify without rendering a wgpu frame.
+fn loading_spinner_angle(time_seconds: f32, index: usize, segments: usize) -> f32 {
+    std::f32::consts::TAU
+        * (time_seconds * LOADING_SPINNER_ROTATIONS_PER_SECOND + index as f32 / segments as f32)
+}
+
+fn loading_spinner_point(center: egui::Pos2, radius: f32, angle: f32) -> egui::Pos2 {
+    pos2(
+        center.x + angle.cos() * radius,
+        center.y + angle.sin() * radius,
+    )
+}
+
+/// Draw the native loading indicator in the favicon slot. A short bright arc
+/// rotates around a faint full ring; `request_repaint` keeps it animated only
+/// while a loading tab is actually being rendered.
+fn paint_loading_spinner(ui: &Ui, rect: egui::Rect, palette: &ChromePalette) {
+    let center = rect.center();
+    let radius = (rect.width().min(rect.height()) * 0.5 - 2.0).max(3.0);
+    let span = std::f32::consts::TAU / LOADING_SPINNER_SEGMENTS as f32;
+    let gap = span * 0.3;
+    let time = ui.input(|input| input.time) as f32;
+
+    for index in 0..LOADING_SPINNER_SEGMENTS {
+        let angle = loading_spinner_angle(time, index, LOADING_SPINNER_SEGMENTS);
+        let start = loading_spinner_point(center, radius, angle + gap);
+        let end = loading_spinner_point(center, radius, angle + span - gap);
+        let intensity = if index < LOADING_SPINNER_BRIGHT_SEGMENTS {
+            1.0 - 0.65 * index as f32 / LOADING_SPINNER_BRIGHT_SEGMENTS as f32
+        } else {
+            0.14
+        };
+        ui.painter().line_segment(
+            [start, end],
+            egui::Stroke::new(2.0_f32, palette.loading.gamma_multiply(intensity)),
+        );
+    }
+
+    ui.ctx().request_repaint();
+}
+
 /// Center of the hover-only close button for a tab row.
 pub fn tab_close_center(row: egui::Rect, expanded: bool) -> egui::Pos2 {
     if expanded {
@@ -2333,6 +2784,7 @@ pub fn command_palette_items(
     query: &str,
     tabs: &[TabInfo],
     active_tab_id: Option<u64>,
+    preferences: &BrowserPreferences,
 ) -> Vec<CommandPaletteItem> {
     let trimmed = query.trim();
     let mut items = Vec::new();
@@ -2371,11 +2823,54 @@ pub fn command_palette_items(
             subtitle: "Expand or collapse the left rail".to_string(),
             action: CommandAction::ToggleRail,
         });
+        items.push(CommandPaletteItem {
+            icon: "⚙",
+            label: "Open Settings".to_string(),
+            subtitle: "Theme, search, privacy, and performance".to_string(),
+            action: CommandAction::OpenSettings,
+        });
         items.extend(tabs.iter().take(12).map(tab_item));
         return items;
     }
 
     let needle = trimmed.to_lowercase();
+    let url = resolve_omnibox_with_search(trimmed, preferences.search_url_prefix());
+    let looks_like_address = trimmed.contains('.')
+        || trimmed.contains("://")
+        || trimmed.starts_with("view-source:")
+        || trimmed.starts_with("data:");
+
+    // Put the navigation choices first. A typed query is most often a search,
+    // and the new-tab variant must be visible without scrolling past matches.
+    if let Some(tab_id) = active_tab_id {
+        items.push(CommandPaletteItem {
+            icon: "↗",
+            label: if looks_like_address {
+                "Open in this tab".to_string()
+            } else {
+                "Search in this tab".to_string()
+            },
+            subtitle: url.clone(),
+            action: CommandAction::Navigate {
+                tab_id,
+                url: url.clone(),
+            },
+        });
+    }
+    items.push(CommandPaletteItem {
+        icon: "＋",
+        label: if looks_like_address {
+            "Open in a new tab".to_string()
+        } else {
+            "Search in a new tab".to_string()
+        },
+        subtitle: url,
+        action: CommandAction::NewTab(Some(resolve_omnibox_with_search(
+            trimmed,
+            preferences.search_url_prefix(),
+        ))),
+    });
+
     for tab in tabs {
         if tab.title.to_lowercase().contains(&needle) || tab.url.to_lowercase().contains(&needle) {
             items.push(tab_item(tab));
@@ -2394,35 +2889,14 @@ pub fn command_palette_items(
         }
     }
 
-    let url = resolve_omnibox(trimmed);
-    let looks_like_address = trimmed.contains('.')
-        || trimmed.contains("://")
-        || trimmed.starts_with("view-source:")
-        || trimmed.starts_with("data:");
-
-    let label = if looks_like_address {
-        format!("Go to {trimmed}")
-    } else {
-        format!("Search the web for “{trimmed}”")
-    };
-
-    if let Some(tab_id) = active_tab_id {
+    if needle.contains("setting") || needle.contains("preference") {
         items.push(CommandPaletteItem {
-            icon: "↗",
-            label,
-            subtitle: url.clone(),
-            action: CommandAction::Navigate {
-                tab_id,
-                url: url.clone(),
-            },
+            icon: "⚙",
+            label: "Open Settings".to_string(),
+            subtitle: "Theme, search, privacy, and performance".to_string(),
+            action: CommandAction::OpenSettings,
         });
     }
-    items.push(CommandPaletteItem {
-        icon: "＋",
-        label: "Open in a new tab".to_string(),
-        subtitle: url,
-        action: CommandAction::NewTab(Some(resolve_omnibox(trimmed))),
-    });
 
     items
 }
@@ -2446,6 +2920,7 @@ fn apply_command_item(
                 actions.push(UiAction::OpenDevTools { tab_id });
             }
         }
+        CommandAction::OpenSettings => state.open_settings(),
     }
     state.close_command_palette();
 }
@@ -2478,6 +2953,11 @@ fn apply_menu_item(
 
 /// Convert omnibox input to a navigable URL per AGENTS.md spec.
 pub fn resolve_omnibox(input: &str) -> String {
+    resolve_omnibox_with_search(input, DEFAULT_SEARCH_URL_PREFIX)
+}
+
+/// Same resolution logic with a configurable search provider prefix.
+pub fn resolve_omnibox_with_search(input: &str, search_url_prefix: &str) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return crate::config::DEFAULT_HOME_URL.to_string();
@@ -2503,7 +2983,7 @@ pub fn resolve_omnibox(input: &str) -> String {
     }
 
     let encoded = url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect::<String>();
-    format!("{}{}", DEFAULT_SEARCH_URL_PREFIX, encoded)
+    format!("{}{}", search_url_prefix, encoded)
 }
 
 #[cfg(test)]
@@ -2512,15 +2992,19 @@ mod tests {
 
     use super::{
         advance_command_selection, apply_command_item, clamp_command_selection,
-        command_palette_click_outside, command_palette_items, focus_request_after_render,
+        command_palette_click_outside, command_palette_items, effective_theme,
+        focus_request_after_render, loading_spinner_angle, loading_spinner_point,
         page_tooltip_anchor, palette_row_fill, preferred_surface_format, rail_menu_anchor,
         rail_menu_click_outside, rail_menu_items, rail_menu_metrics, rail_menu_ui_action,
-        rail_tooltip_enabled, rail_tooltip_metrics, resolve_omnibox, tab_close_center,
-        tab_status_center, truncate_title, ChromePalette, ChromeState, ChromeTheme, CommandAction,
-        RailMenuAction, TabDisplayState, TabInfo, TOOLTIP_HEIGHT_COLLAPSED,
-        TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
+        rail_tooltip_enabled, rail_tooltip_metrics, resolve_omnibox, resolve_omnibox_with_search,
+        tab_close_center, tab_status_center, truncate_title, ChromePalette, ChromeState,
+        ChromeTheme, CommandAction, RailMenuAction, TabDisplayState, TabInfo,
+        TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
     };
-    use crate::config::{DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX};
+    use crate::config::{
+        BrowserPreferences, SearchEngine, ThemePreference, DEFAULT_HOME_URL,
+        DEFAULT_SEARCH_URL_PREFIX,
+    };
     use crate::events::UiAction;
 
     fn tab(id: u64, title: &str, url: &str) -> TabInfo {
@@ -2650,7 +3134,8 @@ mod tests {
         let (width, height) = rail_tooltip_metrics(false);
         assert_eq!(width, TOOLTIP_WIDTH);
         assert_eq!(height, TOOLTIP_HEIGHT_COLLAPSED);
-        assert!(width >= 200.0);
+        assert!(width >= 260.0);
+        assert!(height >= 48.0);
 
         let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(44.0, 800.0));
         let row = egui::Rect::from_min_size(pos2(3.0, 120.0), vec2(38.0, 44.0));
@@ -2714,7 +3199,10 @@ mod tests {
         let row = egui::Rect::from_min_size(pos2(6.0, 200.0), vec2(168.0, 36.0));
         let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
         let anchor = page_tooltip_anchor(rail, row, screen, TOOLTIP_WIDTH, TOOLTIP_HEIGHT_EXPANDED);
-        assert_eq!(anchor, pos2(188.0, 192.0));
+        assert_eq!(
+            anchor,
+            pos2(188.0, row.center().y - TOOLTIP_HEIGHT_EXPANDED * 0.5)
+        );
         assert_eq!(anchor.y + TOOLTIP_HEIGHT_EXPANDED * 0.5, row.center().y);
         assert!(anchor.x >= rail.right());
         assert!(anchor.x + TOOLTIP_WIDTH <= screen.right());
@@ -2727,7 +3215,7 @@ mod tests {
         let row = egui::Rect::from_min_size(pos2(6.0, 790.0), vec2(168.0, 36.0));
         let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
         let anchor = page_tooltip_anchor(rail, row, screen, TOOLTIP_WIDTH, TOOLTIP_HEIGHT_EXPANDED);
-        assert_eq!(anchor.y, 742.0);
+        assert_eq!(anchor.y, 800.0 - TOOLTIP_HEIGHT_EXPANDED - 6.0);
         assert!(anchor.y + TOOLTIP_HEIGHT_EXPANDED <= screen.bottom());
     }
 
@@ -2829,11 +3317,18 @@ mod tests {
 
     #[test]
     fn empty_palette_offers_actions_then_open_tabs() {
-        let items = command_palette_items("", &[tab(1, "Rust", "https://rust-lang.org")], Some(1));
+        let prefs = BrowserPreferences::default();
+        let items = command_palette_items(
+            "",
+            &[tab(1, "Rust", "https://rust-lang.org")],
+            Some(1),
+            &prefs,
+        );
         assert_eq!(items[0].action, CommandAction::NewTab(None));
         assert_eq!(items[1].action, CommandAction::HibernateAll);
         assert_eq!(items[2].action, CommandAction::ToggleRail);
-        assert_eq!(items[3].action, CommandAction::SelectTab(1));
+        assert_eq!(items[3].action, CommandAction::OpenSettings);
+        assert_eq!(items[4].action, CommandAction::SelectTab(1));
     }
 
     #[test]
@@ -2842,7 +3337,7 @@ mod tests {
             tab(1, "Rust Language", "https://rust-lang.org"),
             tab(2, "Docs", "https://docs.rs"),
         ];
-        let items = command_palette_items("RUST", &tabs, Some(1));
+        let items = command_palette_items("RUST", &tabs, Some(1), &BrowserPreferences::default());
         assert!(items
             .iter()
             .any(|item| item.action == CommandAction::SelectTab(1)));
@@ -2853,7 +3348,9 @@ mod tests {
 
     #[test]
     fn palette_offers_navigation_and_new_tab_for_queries() {
-        let items = command_palette_items("hello world", &[], Some(7));
+        let items =
+            command_palette_items("hello world", &[], Some(7), &BrowserPreferences::default());
+        assert_eq!(items[0].label, "Search in this tab");
         assert_eq!(
             items[0].action,
             CommandAction::Navigate {
@@ -2861,6 +3358,7 @@ mod tests {
                 url: format!("{DEFAULT_SEARCH_URL_PREFIX}hello+world"),
             }
         );
+        assert_eq!(items[1].label, "Search in a new tab");
         assert_eq!(
             items[1].action,
             CommandAction::NewTab(Some(format!("{DEFAULT_SEARCH_URL_PREFIX}hello+world")))
@@ -2868,8 +3366,27 @@ mod tests {
     }
 
     #[test]
+    fn palette_labels_address_navigation_for_this_and_new_tabs() {
+        let items =
+            command_palette_items("example.com", &[], Some(7), &BrowserPreferences::default());
+        assert_eq!(items[0].label, "Open in this tab");
+        assert_eq!(
+            items[0].action,
+            CommandAction::Navigate {
+                tab_id: 7,
+                url: "https://example.com".to_string(),
+            }
+        );
+        assert_eq!(items[1].label, "Open in a new tab");
+        assert_eq!(
+            items[1].action,
+            CommandAction::NewTab(Some("https://example.com".to_string()))
+        );
+    }
+
+    #[test]
     fn palette_offers_devtools_action() {
-        let items = command_palette_items("devtools", &[], Some(7));
+        let items = command_palette_items("devtools", &[], Some(7), &BrowserPreferences::default());
         assert!(items
             .iter()
             .any(|item| item.action == CommandAction::OpenDevTools));
@@ -2892,6 +3409,32 @@ mod tests {
     }
 
     #[test]
+    fn loading_spinner_rotates_and_spaces_its_segments() {
+        let start = loading_spinner_angle(0.0, 0, 12);
+        assert_eq!(start, 0.0);
+
+        let next_segment = loading_spinner_angle(0.0, 1, 12);
+        assert!((next_segment - start - std::f32::consts::TAU / 12.0).abs() < 0.0001);
+
+        let later = loading_spinner_angle(0.5, 0, 12);
+        assert!(later > start);
+        assert!((later - std::f32::consts::TAU * 0.55).abs() < 0.0001);
+    }
+
+    #[test]
+    fn loading_spinner_points_stay_on_its_circle() {
+        let center = pos2(10.0, 20.0);
+        let radius = 8.0;
+        let point = loading_spinner_point(center, radius, 0.0);
+        assert!((point.x - 18.0).abs() < 0.0001);
+        assert!((point.y - 20.0).abs() < 0.0001);
+
+        let point = loading_spinner_point(center, radius, std::f32::consts::FRAC_PI_2);
+        assert!((point.x - 10.0).abs() < 0.0001);
+        assert!((point.y - 28.0).abs() < 0.0001);
+    }
+
+    #[test]
     fn state_open_palette_seeds_query_and_close_resets_it() {
         let mut state = ChromeState::default();
         state.omnibox_text = "https://example.com".to_string();
@@ -2899,11 +3442,133 @@ mod tests {
         assert!(state.command_palette_open);
         assert_eq!(state.command_palette_query, "https://example.com");
         assert!(state.command_palette_focus_requested);
+        assert!(!state.command_palette_select_all_requested);
 
         state.close_command_palette();
         assert!(!state.command_palette_open);
         assert!(state.command_palette_query.is_empty());
         assert!(!state.command_palette_focus_requested);
+        assert!(!state.command_palette_select_all_requested);
+    }
+
+    #[test]
+    fn palette_text_selection_is_deferred_until_input_has_focus() {
+        let mut state = ChromeState::default();
+        state.omnibox_text = "https://duckduckgo.com".to_string();
+        state.open_command_palette();
+
+        // First overlay frame requests focus; the selection must wait.
+        let focus_before = state.command_palette_focus_requested;
+        let select_all_before = state.command_palette_select_all_requested;
+        assert!(focus_before);
+        assert!(!select_all_before);
+
+        state.command_palette_focus_requested =
+            focus_request_after_render(focus_before, state.command_palette_focus_requested);
+        state.command_palette_select_all_requested = focus_before;
+        assert!(!state.command_palette_focus_requested);
+        assert!(state.command_palette_select_all_requested);
+
+        // Second overlay frame consumes the selection request.
+        state.command_palette_select_all_requested = false;
+        assert!(!state.command_palette_select_all_requested);
+    }
+
+    #[test]
+    fn theme_preference_overrides_live_system_theme() {
+        assert_eq!(
+            effective_theme(ThemePreference::System, ChromeTheme::Light),
+            ChromeTheme::Light
+        );
+        assert_eq!(
+            effective_theme(ThemePreference::Dark, ChromeTheme::Light),
+            ChromeTheme::Dark
+        );
+        assert_eq!(
+            effective_theme(ThemePreference::Light, ChromeTheme::Dark),
+            ChromeTheme::Light
+        );
+
+        let mut state = ChromeState::default();
+        state.set_system_theme(ChromeTheme::Light);
+        assert_eq!(state.theme, ChromeTheme::Light);
+
+        state.set_preferences(BrowserPreferences {
+            theme: ThemePreference::Dark,
+            ..BrowserPreferences::default()
+        });
+        assert_eq!(state.theme, ChromeTheme::Dark);
+        state.set_system_theme(ChromeTheme::Light);
+        assert_eq!(state.theme, ChromeTheme::Dark);
+
+        state.set_preferences(BrowserPreferences {
+            theme: ThemePreference::System,
+            ..BrowserPreferences::default()
+        });
+        assert_eq!(state.theme, ChromeTheme::Light);
+    }
+
+    #[test]
+    fn preferences_do_not_override_a_manual_rail_toggle() {
+        let mut state = ChromeState::default();
+        state.rail_expanded = false;
+        state.set_preferences(BrowserPreferences {
+            rail_expanded: true,
+            search_engine: SearchEngine::Google,
+            ..BrowserPreferences::default()
+        });
+
+        assert!(!state.rail_expanded);
+        assert_eq!(state.preferences.search_engine, SearchEngine::Google);
+    }
+
+    #[test]
+    fn settings_overlay_is_exclusive_and_dismissable() {
+        let mut state = ChromeState::default();
+        state.omnibox_text = "https://example.com".to_string();
+        state.open_command_palette();
+        state.open_tab_menu(1, pos2(190.0, 200.0));
+        state.open_settings();
+
+        assert!(state.settings_open);
+        assert!(state.has_overlay());
+        assert!(!state.command_palette_open);
+        assert!(state.menu.is_none());
+        assert!(!state.command_palette_focus_requested);
+        assert_eq!(state.settings_draft, state.preferences);
+
+        state.close_settings();
+        assert!(!state.has_overlay());
+    }
+
+    #[test]
+    fn command_palette_uses_selected_search_provider() {
+        let prefs = BrowserPreferences {
+            search_engine: SearchEngine::Bing,
+            ..BrowserPreferences::default()
+        };
+        let items = command_palette_items("hello world", &[], Some(7), &prefs);
+        assert_eq!(
+            items[0].action,
+            CommandAction::Navigate {
+                tab_id: 7,
+                url: "https://www.bing.com/search?q=hello+world".to_string(),
+            }
+        );
+        assert_eq!(
+            resolve_omnibox_with_search("rust async", prefs.search_url_prefix()),
+            "https://www.bing.com/search?q=rust+async"
+        );
+    }
+
+    #[test]
+    fn command_palette_open_settings_action_opens_native_overlay() {
+        let mut state = ChromeState::default();
+        let mut actions = Vec::new();
+        apply_command_item(&CommandAction::OpenSettings, &mut state, &mut actions);
+
+        assert!(state.settings_open);
+        assert!(actions.is_empty());
     }
 
     #[test]

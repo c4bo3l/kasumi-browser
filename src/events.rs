@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use crate::config::BrowserPreferences;
+
 /// Events sent from CEF handler callbacks (TID_UI / TID_IO) to the main UI thread
 #[derive(Clone)]
 pub enum BrowserEvent {
@@ -72,6 +74,7 @@ pub enum BrowserShortcut {
     ReopenClosedTab,
     OpenCommandPalette,
     OpenDevTools,
+    OpenSettings,
 }
 
 impl std::fmt::Debug for BrowserEvent {
@@ -153,18 +156,46 @@ impl std::fmt::Debug for BrowserEvent {
 /// Actions initiated by the native Rust UI or keyboard shortcuts, dispatched to TabManager
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiAction {
-    NewTab { url: Option<String> },
+    NewTab {
+        url: Option<String>,
+    },
     ReopenClosedTab,
-    CloseTab { tab_id: u64 },
-    CloseOtherTabs { tab_id: u64 },
-    CloseTabsToRight { tab_id: u64 },
-    DuplicateTab { tab_id: u64 },
-    SelectTab { tab_id: u64 },
-    Navigate { tab_id: u64, url: String },
-    GoBack { tab_id: u64 },
-    GoForward { tab_id: u64 },
-    Reload { tab_id: u64, ignore_cache: bool },
-    Stop { tab_id: u64 },
+    CloseTab {
+        tab_id: u64,
+    },
+    CloseOtherTabs {
+        tab_id: u64,
+    },
+    CloseTabsToRight {
+        tab_id: u64,
+    },
+    DuplicateTab {
+        tab_id: u64,
+    },
+    SelectTab {
+        tab_id: u64,
+    },
+    Navigate {
+        tab_id: u64,
+        url: String,
+    },
+    GoBack {
+        tab_id: u64,
+    },
+    GoForward {
+        tab_id: u64,
+    },
+    Reload {
+        tab_id: u64,
+        ignore_cache: bool,
+    },
+    Stop {
+        tab_id: u64,
+    },
     HibernateAllBackground,
-    OpenDevTools { tab_id: u64 },
+    OpenDevTools {
+        tab_id: u64,
+    },
+    /// Apply preferences changed in the native Settings overlay.
+    ApplyPreferences(BrowserPreferences),
 }

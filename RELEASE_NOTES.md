@@ -4,6 +4,46 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
+## v0.4.0 — 2026-11-23
+
+### Added
+
+- Native Settings overlay opened with `Cmd/Ctrl+,`, the bottom rail **Settings** button, the macOS **File → Settings…** menu, or the command palette. It renders in the existing transparent, always-on-top native overlay so the CEF page remains visible behind it.
+- Persisted preferences in SQLite WAL: theme preference (`System`/`Light`/`Dark`), rail startup state, search provider, ad-block enabled state, and normal-pressure hibernation idle timeout.
+- Theme override layered over the live OS theme: `System` tracks `ThemeChanged` events, while `Light`/`Dark` stay fixed until changed in Settings.
+- Configurable omnibox search provider with DuckDuckGo, Google, and Bing choices. The command palette and omnibox both use the selected provider for non-URL text, and fresh tabs now open that provider's homepage.
+- The command palette now offers explicit **Search in this tab** and **Search in a new tab** choices for queries (and **Open in this tab** / **Open in a new tab** for addresses), listed ahead of matching tabs.
+- Loading tabs show an animated native spinner in the favicon slot, replacing the static favicon until navigation completes; the duplicate row loading dot was removed.
+- Settings entry points in the bottom action block of the expanded/collapsed rail, the macOS native **File → Settings…** menu, command palette quick action, CEF web-view shortcut forwarding, and the main-window keyboard handler. The web view also recognizes `Cmd/Ctrl+.` as an alias and falls back to CEF's UTF-16 character fields when `windows_key_code` is not populated for `Cmd+,`.
+- On macOS, a local NSEvent monitor now captures shell shortcuts before AppKit/CEF can consume them, so `Cmd+,`, `Cmd+.`, and the other browser shortcuts work even while a web page has keyboard focus. The CEF-forwarded Settings request is also consumed by the main event loop instead of being left set.
+
+### Changed
+
+- The shared overlay now dispatches Settings, tab menu, and command palette input with clear priority; opening one closes the others.
+- Changing the ad-block preference flips a shared atomic read by CEF request handlers, so blocking starts or stops without recreating browsers.
+- Changing the hibernation timeout updates the live watchdog; high RAM pressure still shortens the timeout and critical pressure still hibernates all background tabs immediately.
+- The rail startup preference is applied only when it changes: editing an unrelated setting no longer overrides a rail the user collapsed manually.
+- Rail tooltip cards are wider and taller with more padding and larger text, and the Settings card has a roomier layout.
+- The Settings card is now centered in the main browser window instead of pinned near the top, and the shared overlay follows the main window when it is moved to another display.
+- Bumped the project and macOS bundle version from `0.3.0` to `0.4.0`.
+
+### Fixed
+
+- New tabs now use the selected search provider's homepage; choosing Google or Bing no longer leaves DuckDuckGo as the new-tab landing page.
+- The command palette now selects its seeded active URL on the frame after the input gains focus, so typed searches replace the old URL instead of appending to a DuckDuckGo address.
+- The Settings overlay is repositioned after it becomes visible and on main-window moves, so it opens on the same display as the browser rather than the primary display.
+- Shutdown now finalizes CEF teardown once instead of re-logging readiness and rescheduling the one-shot observer on every reentrant tick; the app still exits cleanly with the SQLite WAL flushed.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser` — 91 tests, including preference defaults/normalization/JSON round-trip, SQLite preference save/load fallback, theme override resolution, search-provider URL mapping and homepages, explicit this-tab/new-tab palette actions, loading-spinner rotation geometry, Settings overlay exclusivity, web-view settings shortcut forwarding with UTF-16 fallback, macOS native shortcut classification, secondary-display overlay positioning, deferred palette text selection, tooltip geometry, and pressure-aware custom idle timeouts.
+- `cargo build --release`
+- Manual macOS verification confirmed by the user: Settings opens centered on the current display, Google is used for new tabs and command-box searches, explicit this-tab/new-tab palette actions work, loading tabs show the favicon spinner, page-focus shortcuts work, the bottom-rail and File-menu Settings entry points work, tooltips are readable, preferences persist, and the browser quits cleanly.
+
+---
+
 ## v0.3.0 — 2026-11-23
 
 ### Added

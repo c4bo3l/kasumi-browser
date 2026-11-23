@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 /// Default landing page URL
 pub const DEFAULT_HOME_URL: &str = "https://duckduckgo.com";
 
@@ -19,6 +21,132 @@ pub const COMMAND_PALETTE_WIDTH: f32 = 560.0;
 
 /// Vertical offset of the command palette from the top of the window.
 pub const COMMAND_PALETTE_TOP_OFFSET: f32 = 72.0;
+
+/// SQLite key under which the full preferences JSON document is stored.
+pub const PREFERENCES_DB_KEY: &str = "browser_preferences";
+
+/// Range accepted by the hibernation timeout setting.
+pub const MIN_IDLE_TIMEOUT_MINUTES: u32 = 1;
+pub const MAX_IDLE_TIMEOUT_MINUTES: u32 = 60;
+
+/// Whether the browser follows the OS appearance or forces one appearance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePreference {
+    System,
+    Light,
+    Dark,
+}
+
+impl Default for ThemePreference {
+    fn default() -> Self {
+        Self::System
+    }
+}
+
+/// Search provider used for omnibox text that is not a URL or domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchEngine {
+    DuckDuckGo,
+    Google,
+    Bing,
+}
+
+impl SearchEngine {
+    pub const ALL: [Self; 3] = [Self::DuckDuckGo, Self::Google, Self::Bing];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DuckDuckGo => "DuckDuckGo",
+            Self::Google => "Google",
+            Self::Bing => "Bing",
+        }
+    }
+
+    pub fn search_url_prefix(self) -> &'static str {
+        match self {
+            Self::DuckDuckGo => DEFAULT_SEARCH_URL_PREFIX,
+            Self::Google => "https://www.google.com/search?q=",
+            Self::Bing => "https://www.bing.com/search?q=",
+        }
+    }
+
+    /// Landing page used by a fresh tab. It follows the selected provider so
+    /// changing the default search engine changes both search and new tabs.
+    pub fn home_url(self) -> &'static str {
+        match self {
+            Self::DuckDuckGo => DEFAULT_HOME_URL,
+            Self::Google => "https://www.google.com",
+            Self::Bing => "https://www.bing.com",
+        }
+    }
+}
+
+impl Default for SearchEngine {
+    fn default() -> Self {
+        Self::DuckDuckGo
+    }
+}
+
+/// User-configurable browser preferences. The whole document is persisted as
+/// JSON by the background SQLite worker so adding a field never requires a
+/// schema migration or writes from a CEF callback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BrowserPreferences {
+    pub theme: ThemePreference,
+    pub rail_expanded: bool,
+    pub adblock_enabled: bool,
+    pub idle_timeout_minutes: u32,
+    pub search_engine: SearchEngine,
+}
+
+impl Default for BrowserPreferences {
+    fn default() -> Self {
+        Self {
+            theme: ThemePreference::default(),
+            rail_expanded: true,
+            adblock_enabled: true,
+            idle_timeout_minutes: 10,
+            search_engine: SearchEngine::default(),
+        }
+    }
+}
+
+impl BrowserPreferences {
+    /// Clamp values that could have been edited outside the Settings UI.
+    pub fn normalized(self) -> Self {
+        Self {
+            idle_timeout_minutes: normalize_idle_timeout_minutes(self.idle_timeout_minutes),
+            ..self
+        }
+    }
+
+    pub fn idle_timeout(&self) -> Duration {
+        Duration::from_secs(self.idle_timeout_minutes as u64 * 60)
+    }
+
+    pub fn search_url_prefix(&self) -> &'static str {
+        self.search_engine.search_url_prefix()
+    }
+
+    pub fn home_url(&self) -> &'static str {
+        self.search_engine.home_url()
+    }
+
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json).map(Self::normalized)
+    }
+}
+
+pub fn normalize_idle_timeout_minutes(minutes: u32) -> u32 {
+    minutes.clamp(MIN_IDLE_TIMEOUT_MINUTES, MAX_IDLE_TIMEOUT_MINUTES)
+}
 
 /// Default idle timeout before a background tab is eligible for hibernation
 pub const TAB_IDLE_TIMEOUT_NORMAL: Duration = Duration::from_secs(600); // 10 minutes
@@ -88,5 +216,73 @@ mod tests {
         assert_eq!(COMMAND_PALETTE_WIDTH, 560.0);
         assert_eq!(COMMAND_PALETTE_TOP_OFFSET, 72.0);
         assert!(COMMAND_PALETTE_WIDTH < RAIL_WIDTH_EXPANDED * 4.0);
+    }
+
+    #[test]
+    fn default_preferences_match_shipped_behavior() {
+        let prefs = BrowserPreferences::default();
+        assert_eq!(prefs.theme, ThemePreference::System);
+        assert!(prefs.rail_expanded);
+        assert!(prefs.adblock_enabled);
+        assert_eq!(prefs.idle_timeout(), TAB_IDLE_TIMEOUT_NORMAL);
+        assert_eq!(prefs.search_engine, SearchEngine::DuckDuckGo);
+        assert_eq!(prefs.search_url_prefix(), DEFAULT_SEARCH_URL_PREFIX);
+    }
+
+    #[test]
+    fn preferences_json_round_trip_and_normalize_values() {
+        let prefs = BrowserPreferences {
+            theme: ThemePreference::Light,
+            rail_expanded: false,
+            adblock_enabled: false,
+            idle_timeout_minutes: 500,
+            search_engine: SearchEngine::Bing,
+        };
+        let json = prefs.to_json().unwrap_or_default();
+        let loaded = BrowserPreferences::from_json(&json).unwrap_or_default();
+        assert_eq!(loaded.theme, ThemePreference::Light);
+        assert!(!loaded.rail_expanded);
+        assert!(!loaded.adblock_enabled);
+        assert_eq!(loaded.idle_timeout_minutes, MAX_IDLE_TIMEOUT_MINUTES);
+        assert_eq!(loaded.search_engine, SearchEngine::Bing);
+        assert_eq!(loaded.idle_timeout(), Duration::from_secs(3600));
+
+        assert_eq!(normalize_idle_timeout_minutes(0), MIN_IDLE_TIMEOUT_MINUTES);
+        assert_eq!(normalize_idle_timeout_minutes(12), 12);
+        assert_eq!(
+            normalize_idle_timeout_minutes(u32::MAX),
+            MAX_IDLE_TIMEOUT_MINUTES
+        );
+        assert!(BrowserPreferences::from_json("not json").is_err());
+    }
+
+    #[test]
+    fn search_engines_have_distinct_query_prefixes_and_homepages() {
+        let prefixes: Vec<_> = SearchEngine::ALL
+            .iter()
+            .map(|engine| engine.search_url_prefix())
+            .collect();
+        let homepages: Vec<_> = SearchEngine::ALL
+            .iter()
+            .map(|engine| engine.home_url())
+            .collect();
+        assert_eq!(prefixes.len(), 3);
+        assert!(prefixes.iter().all(|prefix| prefix.ends_with("?q=")));
+        for (index, prefix) in prefixes.iter().enumerate() {
+            assert!(!prefixes[index + 1..].contains(prefix));
+        }
+        assert_eq!(homepages.len(), 3);
+        for (index, homepage) in homepages.iter().enumerate() {
+            assert!(!homepages[index + 1..].contains(homepage));
+            assert!(prefixes[index].starts_with(homepage));
+        }
+        assert_eq!(
+            BrowserPreferences {
+                search_engine: SearchEngine::Google,
+                ..BrowserPreferences::default()
+            }
+            .home_url(),
+            "https://www.google.com"
+        );
     }
 }

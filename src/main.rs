@@ -15,8 +15,8 @@ use std::sync::{Arc, OnceLock};
 use app::KasumiBrowserApp;
 use browser::hibernation::TabManager;
 use cef::CefString;
-use config::{rail_width, SHUTDOWN_MAX_WAIT_TICKS};
-use events::UiAction;
+use config::{rail_width, BrowserPreferences, SHUTDOWN_MAX_WAIT_TICKS};
+use events::{BrowserShortcut, UiAction};
 use storage::db::{StorageHandle, StorageManager};
 use ui::chrome::{
     ChromeOverlayRenderer, ChromeRenderer, ChromeState, ChromeTheme, TooltipRenderer,
@@ -33,6 +33,10 @@ use winit::window::{Window, WindowId, WindowLevel};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KasumiEvent {
     ShutdownComplete,
+    /// A shell shortcut captured by a macOS local NSEvent monitor before the
+    /// key reaches the CEF child view. Re-dispatched through the winit event
+    /// loop so all UI mutations stay on the main thread.
+    NativeShortcut(BrowserShortcut),
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +200,9 @@ static CEF_SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_PROXY: OnceLock<winit::event_loop::EventLoopProxy<KasumiEvent>> = OnceLock::new();
 
 #[cfg(target_os = "macos")]
+static SHORTCUT_PROXY: OnceLock<winit::event_loop::EventLoopProxy<KasumiEvent>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn cef_shutdown_observer_callback(
     _observer: cf::CFRunLoopObserverRef,
     _activity: u32,
@@ -267,6 +274,102 @@ impl CefShutdownObserver {
 }
 
 // ---------------------------------------------------------------------------
+// macOS native shortcut monitor.
+//
+// CEF's `on_pre_key_event` is not a reliable place for browser-chrome
+// shortcuts on macOS: AppKit/CEF can consume `Cmd+,` before CEF sees it. An
+// NSEvent local monitor runs earlier in the same main-thread event dispatch,
+// so it can recognize shell shortcuts even while the CEF child view has focus
+// and forward them to the winit event loop.
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "macos")]
+mod native_shortcuts {
+    use crate::events::BrowserShortcut;
+    use block2::RcBlock;
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSKeyDownMask};
+    use std::ptr::NonNull;
+
+    use super::{KasumiEvent, SHORTCUT_PROXY};
+
+    const MAC_KEYCODE_F12: u16 = 0x58;
+
+    /// Install the monitor and return it so the handler can keep it alive for
+    /// the lifetime of the event loop.
+    pub(crate) fn install() -> Option<Retained<AnyObject>> {
+        let Some(proxy) = SHORTCUT_PROXY.get().cloned() else {
+            tracing::warn!("Native shortcut monitor skipped: event loop proxy unavailable");
+            return None;
+        };
+
+        let handler: RcBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> =
+            RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+                let event_ref = unsafe { event.as_ref() };
+                let Some(shortcut) = shortcut_from_event(event_ref) else {
+                    return event.as_ptr();
+                };
+                if proxy
+                    .send_event(KasumiEvent::NativeShortcut(shortcut))
+                    .is_ok()
+                {
+                    tracing::info!("Native shortcut captured: {:?}", shortcut);
+                    // Returning nil stops AppKit from also delivering this
+                    // key equivalent to winit or the web page.
+                    std::ptr::null_mut()
+                } else {
+                    event.as_ptr()
+                }
+            });
+
+        // SAFETY: the block's signature matches NSEvent's declared API, and the
+        // returned monitor is retained by the caller for the app's lifetime.
+        unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSKeyDownMask, &handler) }
+    }
+
+    fn shortcut_from_event(event: &NSEvent) -> Option<BrowserShortcut> {
+        if unsafe { event.isARepeat() } {
+            return None;
+        }
+        let flags = unsafe { event.modifierFlags() };
+        let key_code = unsafe { event.keyCode() };
+        let characters = unsafe { event.charactersIgnoringModifiers() }?.to_string();
+        let key = characters.chars().next()?.to_ascii_lowercase();
+        shortcut_from_parts(key, key_code, flags)
+    }
+
+    /// Pure classifier so the shortcut mapping is unit-testable without
+    /// constructing native NSEvents.
+    pub(crate) fn shortcut_from_parts(
+        key: char,
+        key_code: u16,
+        flags: NSEventModifierFlags,
+    ) -> Option<BrowserShortcut> {
+        if key_code == MAC_KEYCODE_F12 {
+            return Some(BrowserShortcut::OpenDevTools);
+        }
+
+        let primary = flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand)
+            || flags.contains(NSEventModifierFlags::NSEventModifierFlagControl);
+        let shift = flags.contains(NSEventModifierFlags::NSEventModifierFlagShift);
+        let option = flags.contains(NSEventModifierFlags::NSEventModifierFlagOption);
+        if !primary || option {
+            return None;
+        }
+
+        match key {
+            't' if shift => Some(BrowserShortcut::ReopenClosedTab),
+            't' => Some(BrowserShortcut::NewTab),
+            'w' if !shift => Some(BrowserShortcut::CloseTab),
+            'l' | 'k' if !shift => Some(BrowserShortcut::OpenCommandPalette),
+            ',' | '.' if !shift => Some(BrowserShortcut::OpenSettings),
+            'z' if !shift => Some(BrowserShortcut::ReopenClosedTab),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // macOS CrAppControlProtocol – required before CEF initialization
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "macos")]
@@ -290,6 +393,24 @@ fn setup_mac_application() {
         HANDLING_SEND_EVENT.store(val.as_raw() != 0, Ordering::Relaxed);
     }
 
+    fn send_menu_shortcut(shortcut: BrowserShortcut) {
+        if let Some(proxy) = SHORTCUT_PROXY.get() {
+            let _ = proxy.send_event(KasumiEvent::NativeShortcut(shortcut));
+        }
+    }
+
+    extern "C" fn menu_new_tab(_this: *mut c_void, _cmd: *mut c_void) {
+        send_menu_shortcut(BrowserShortcut::NewTab);
+    }
+
+    extern "C" fn menu_close_tab(_this: *mut c_void, _cmd: *mut c_void) {
+        send_menu_shortcut(BrowserShortcut::CloseTab);
+    }
+
+    extern "C" fn menu_open_settings(_this: *mut c_void, _cmd: *mut c_void) {
+        send_menu_shortcut(BrowserShortcut::OpenSettings);
+    }
+
     unsafe {
         let cls_name = CString::new("NSApplication").unwrap();
         let cls = objc2::ffi::objc_getClass(cls_name.as_ptr());
@@ -310,6 +431,19 @@ fn setup_mac_application() {
                 Some(std::mem::transmute(set_handling_send_event as *const ()));
             objc2::ffi::class_addMethod(cls_mut, set_sel, imp_set, types_set.as_ptr());
 
+            // Target/action selectors for the native macOS File menu. The menu
+            // is installed later, once the winit event loop proxy is ready.
+            let register_action = |name: &str, imp: extern "C" fn(*mut c_void, *mut c_void)| {
+                let sel =
+                    objc2::ffi::sel_registerName(CString::new(name).unwrap_or_default().as_ptr());
+                let types = CString::new("v@:").unwrap_or_default();
+                let imp: objc2::ffi::IMP = Some(std::mem::transmute(imp as *const ()));
+                objc2::ffi::class_addMethod(cls_mut, sel, imp, types.as_ptr());
+            };
+            register_action("kasumiNewTab:", menu_new_tab);
+            register_action("kasumiCloseTab:", menu_close_tab);
+            register_action("kasumiOpenSettings:", menu_open_settings);
+
             let proto_name = CString::new("CrAppControlProtocol").unwrap();
             let proto = objc2::ffi::objc_getProtocol(proto_name.as_ptr());
             if !proto.is_null() {
@@ -324,6 +458,59 @@ fn setup_mac_application() {
             let _ = msg_send(cls as *mut c_void, shared_sel as *const c_void);
         }
     }
+}
+
+/// Build the native macOS menu bar. The File menu mirrors the shell shortcuts
+/// so Settings is discoverable without knowing `Cmd+,`.
+#[cfg(target_os = "macos")]
+fn install_macos_main_menu() {
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
+    use objc2_foundation::{MainThreadMarker, NSString};
+
+    // This function is only called from the main thread in `resumed()`.
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let app = NSApplication::sharedApplication(mtm);
+
+    let main_menu = NSMenu::new(mtm);
+    unsafe { main_menu.setTitle(&NSString::from_str("Kasumi Browser")) };
+
+    let app_item = NSMenuItem::new(mtm);
+    unsafe { app_item.setTitle(&NSString::from_str("Kasumi Browser")) };
+    let app_menu = NSMenu::new(mtm);
+    let app_version = NSMenuItem::new(mtm);
+    unsafe {
+        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.4.0"));
+        app_version.setEnabled(false);
+    }
+    app_menu.addItem(&app_version);
+    app_item.setSubmenu(Some(&app_menu));
+    main_menu.addItem(&app_item);
+
+    let file_item = NSMenuItem::new(mtm);
+    unsafe { file_item.setTitle(&NSString::from_str("File")) };
+    let file_menu = NSMenu::new(mtm);
+    file_item.setSubmenu(Some(&file_menu));
+    main_menu.addItem(&file_item);
+
+    let target: &AnyObject = app.as_ref();
+    let add_item = |title: &str, selector: objc2::runtime::Sel, key: &str| {
+        let item = unsafe {
+            file_menu.addItemWithTitle_action_keyEquivalent(
+                &NSString::from_str(title),
+                Some(selector),
+                &NSString::from_str(key),
+            )
+        };
+        unsafe { item.setTarget(Some(target)) };
+    };
+
+    add_item("New Tab", objc2::sel!(kasumiNewTab:), "t");
+    add_item("Close Tab", objc2::sel!(kasumiCloseTab:), "w");
+    file_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add_item("Settings…", objc2::sel!(kasumiOpenSettings:), ",");
+
+    app.setMainMenu(Some(&main_menu));
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +556,14 @@ struct KasumiBrowserHandler {
     shutdown_requested: bool,
     shutdown_browsers_closed: bool,
     shutdown_ticks: u32,
+    // Set once CEF shutdown is ready so reentrant `about_to_wait` ticks do not
+    // re-log the same decision or reschedule the one-shot run-loop observer.
+    shutdown_finalization_requested: bool,
+
+    // Kept alive so macOS continues intercepting shell shortcuts while the
+    // CEF child view owns keyboard focus.
+    #[cfg(target_os = "macos")]
+    shortcut_monitor: Option<objc2::rc::Retained<objc2::runtime::AnyObject>>,
 }
 
 impl KasumiBrowserHandler {
@@ -401,6 +596,9 @@ impl KasumiBrowserHandler {
             shutdown_requested: false,
             shutdown_browsers_closed: false,
             shutdown_ticks: 0,
+            shutdown_finalization_requested: false,
+            #[cfg(target_os = "macos")]
+            shortcut_monitor: None,
         }
     }
 
@@ -409,7 +607,7 @@ impl KasumiBrowserHandler {
             self.hide_chrome_overlay();
             return;
         }
-        if self.chrome_state.command_palette_open || self.chrome_state.menu.is_some() {
+        if self.chrome_state.has_overlay() {
             self.ensure_chrome_overlay(event_loop);
         } else {
             self.hide_chrome_overlay();
@@ -465,6 +663,10 @@ impl KasumiBrowserHandler {
         if let Some(window) = self.overlay_window.as_ref() {
             if !self.overlay_visible {
                 window.set_visible(true);
+                // AppKit can re-center a newly visible window on the primary
+                // display, so reapply the main window's current position after
+                // the overlay is visible as well as before it is shown.
+                self.position_chrome_overlay();
                 window.focus_window();
                 self.overlay_visible = true;
             }
@@ -479,16 +681,31 @@ impl KasumiBrowserHandler {
         };
         let _ = overlay.request_inner_size(main.inner_size());
         // The overlay is undecorated, so its outer origin is its content origin.
-        // Anchor it to the main window's content origin to account for the
-        // macOS title bar; egui coordinates are relative to that content area.
-        let origin = main.inner_position().or_else(|_| main.outer_position());
-        if let Ok(origin) = origin {
-            overlay.set_outer_position(overlay_screen_position(
-                origin,
-                (0.0, 0.0),
-                main.scale_factor(),
-            ));
-        }
+        // Anchor it to the main window's current content origin to account for
+        // macOS title bars and for windows moved to another display; egui
+        // coordinates are relative to that content area.
+        let target = match main.inner_position().or_else(|_| main.outer_position()) {
+            Ok(origin) => overlay_screen_position(origin, (0.0, 0.0), main.scale_factor()),
+            Err(_) => {
+                // Last-resort fallback for platforms that cannot report a
+                // window origin: center the overlay on the monitor containing
+                // the main window so a multi-display move never leaves it on
+                // the primary screen.
+                let Some(monitor) = main.current_monitor() else {
+                    return;
+                };
+                let monitor_origin = monitor.position();
+                let monitor_size = monitor.size();
+                let window_size = main.outer_size();
+                winit::dpi::PhysicalPosition::new(
+                    monitor_origin.x
+                        + (monitor_size.width.saturating_sub(window_size.width) / 2) as i32,
+                    monitor_origin.y
+                        + (monitor_size.height.saturating_sub(window_size.height) / 2) as i32,
+                )
+            }
+        };
+        overlay.set_outer_position(target);
     }
 
     fn hide_chrome_overlay(&mut self) {
@@ -505,10 +722,7 @@ impl KasumiBrowserHandler {
     }
 
     fn sync_tooltip_overlay(&mut self, event_loop: &ActiveEventLoop) {
-        if self.shutdown_requested
-            || self.chrome_state.command_palette_open
-            || self.chrome_state.menu.is_some()
-        {
+        if self.shutdown_requested || self.chrome_state.has_overlay() {
             self.hide_tooltip_overlay();
             return;
         }
@@ -599,6 +813,101 @@ impl KasumiBrowserHandler {
         }
         self.tooltip_size = None;
     }
+
+    /// Dispatch a browser shortcut once, regardless of whether it came from
+    /// winit, CEF, or the macOS native event monitor.
+    fn handle_browser_shortcut(&mut self, shortcut: BrowserShortcut) {
+        match shortcut {
+            BrowserShortcut::NewTab => {
+                if let Some(tm) = self.tab_manager.as_mut() {
+                    tm.handle_ui_action(UiAction::NewTab { url: None });
+                }
+            }
+            BrowserShortcut::CloseTab => {
+                if let Some(tm) = self.tab_manager.as_mut() {
+                    if let Some(id) = tm.active_tab_id {
+                        tm.handle_ui_action(UiAction::CloseTab { tab_id: id });
+                    }
+                }
+            }
+            BrowserShortcut::ReopenClosedTab => {
+                if let Some(tm) = self.tab_manager.as_mut() {
+                    tm.reopen_closed_tab();
+                }
+            }
+            BrowserShortcut::OpenCommandPalette => {
+                self.chrome_state.open_command_palette();
+            }
+            BrowserShortcut::OpenDevTools => {
+                if let Some(tm) = self.tab_manager.as_mut() {
+                    if let Some(id) = tm.active_tab_id {
+                        tm.handle_ui_action(UiAction::OpenDevTools { tab_id: id });
+                    }
+                }
+            }
+            BrowserShortcut::OpenSettings => {
+                self.chrome_state.open_settings();
+            }
+        }
+    }
+
+    /// Persist and apply a preference document emitted by the Settings UI.
+    fn apply_preferences(&mut self, preferences: BrowserPreferences) {
+        let preferences = preferences.normalized();
+        let rail_default_changed =
+            self.chrome_state.preferences.rail_expanded != preferences.rail_expanded;
+        self.chrome_state.set_preferences(preferences.clone());
+        tracing::info!(
+            "Applied preferences: search={}, home={}, theme={:?}, adblock={}, idle={}m",
+            preferences.search_engine.label(),
+            preferences.home_url(),
+            preferences.theme,
+            preferences.adblock_enabled,
+            preferences.idle_timeout_minutes
+        );
+
+        if let Some(storage) = self.storage_handle.as_ref() {
+            storage.save_preferences(preferences.clone());
+        }
+
+        if rail_default_changed {
+            self.chrome_state.rail_expanded = preferences.rail_expanded;
+            self.resize_content_to_rail();
+        }
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    /// Recompute the CEF child-view rect after a rail width change.
+    fn resize_content_to_rail(&mut self) {
+        let (Some(window), Some(tm)) = (self.window.as_ref(), self.tab_manager.as_mut()) else {
+            return;
+        };
+        let size = window.inner_size();
+        let scale = window.scale_factor();
+        let rect = ContentRect::from_window(
+            size.width,
+            size.height,
+            scale,
+            rail_width(self.chrome_state.rail_expanded),
+        );
+        tracing::info!("Workspace rail width changed; CEF content rect: {:?}", rect);
+        tm.resize(rect);
+    }
+
+    /// Dispatch UI actions once, including preference persistence, so both the
+    /// main window and the overlay window apply settings identically.
+    fn handle_ui_actions(&mut self, actions: Vec<UiAction>) {
+        for action in actions {
+            if let UiAction::ApplyPreferences(preferences) = &action {
+                self.apply_preferences(preferences.clone());
+            }
+            if let Some(tm) = self.tab_manager.as_mut() {
+                tm.handle_ui_action(action);
+            }
+        }
+    }
 }
 
 /// True when a main-window pointer position is over the CEF content area
@@ -647,6 +956,11 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                 tracing::info!("CEF shutdown complete — exiting event loop");
                 event_loop.exit();
             }
+            KasumiEvent::NativeShortcut(shortcut) => {
+                self.handle_browser_shortcut(shortcut);
+                self.sync_chrome_overlay(event_loop);
+                self.sync_tooltip_overlay(event_loop);
+            }
         }
     }
 
@@ -654,6 +968,12 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
         if self.window.is_some() {
             return; // already created
         }
+
+        let db_path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/target/kasumi_browser.db"
+        ));
+        let preferences = StorageManager::load_preferences(&db_path);
 
         let attrs = Window::default_attributes()
             .with_title("Kasumi Browser")
@@ -680,11 +1000,18 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             return;
         };
 
-        // Follow the OS appearance from the very first frame, not only after
-        // the first `ThemeChanged` event arrives.
-        self.chrome_state.theme =
-            ChromeTheme::from_winit(event_loop.system_theme().or_else(|| window.theme()));
-        tracing::info!("Chrome theme: {:?}", self.chrome_state.theme);
+        // Follow the OS appearance and stored preferences from the very first
+        // frame, not only after the first `ThemeChanged` event arrives.
+        self.chrome_state.set_system_theme(ChromeTheme::from_winit(
+            event_loop.system_theme().or_else(|| window.theme()),
+        ));
+        self.chrome_state.set_preferences(preferences.clone());
+        self.chrome_state.rail_expanded = preferences.rail_expanded;
+        tracing::info!(
+            "System theme: {:?}, chrome theme: {:?}",
+            self.chrome_state.system_theme,
+            self.chrome_state.theme
+        );
 
         let parent_view: *mut std::ffi::c_void = {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -714,23 +1041,33 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
         );
         tracing::info!("CEF content rect (logical): {:?}", rect);
 
-        let db_path = PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/target/kasumi_browser.db"
-        ));
         let storage_mgr = StorageManager::new(db_path.clone());
         let storage_handle = storage_mgr.start_worker();
         let restored_tabs = StorageManager::load_session(&db_path).unwrap_or_default();
 
         let (tx, rx) = crossbeam_channel::unbounded();
-        let mut tab_manager =
-            TabManager::new(tx, rx, parent_view, rect, Some(storage_handle.clone()));
+        let mut tab_manager = TabManager::new(
+            tx,
+            rx,
+            parent_view,
+            rect,
+            Some(storage_handle.clone()),
+            &preferences,
+        );
         tab_manager.restore_session(restored_tabs);
 
         self.window = Some(Arc::clone(&window));
         self.chrome = Some(chrome);
         self.tab_manager = Some(tab_manager);
         self.storage_handle = Some(storage_handle);
+
+        // Capture shell shortcuts before AppKit can hand them to the CEF child
+        // view. The monitor is owned by this handler and removed on shutdown.
+        #[cfg(target_os = "macos")]
+        {
+            install_macos_main_menu();
+            self.shortcut_monitor = native_shortcuts::install();
+        }
 
         tracing::info!("Window, chrome renderer, storage, and TabManager initialized successfully");
     }
@@ -753,7 +1090,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
 
             match event {
                 WindowEvent::CloseRequested => {
-                    self.chrome_state.close_command_palette();
+                    self.chrome_state.close_active_overlay();
                     self.sync_chrome_overlay(event_loop);
                 }
                 WindowEvent::Resized(new_size) => {
@@ -775,11 +1112,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                     {
                         actions = overlay.render(window, &mut self.chrome_state);
                     }
-                    for action in actions {
-                        if let Some(tm) = self.tab_manager.as_mut() {
-                            tm.handle_ui_action(action);
-                        }
-                    }
+                    self.handle_ui_actions(actions);
                     self.sync_chrome_overlay(event_loop);
                 }
                 _ => {}
@@ -843,9 +1176,14 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             }
             WindowEvent::ThemeChanged(theme) => {
                 let next = ChromeTheme::from_winit(Some(*theme));
-                if next != self.chrome_state.theme {
-                    tracing::info!("System theme changed to {:?}", next);
-                    self.chrome_state.theme = next;
+                let before = self.chrome_state.theme;
+                self.chrome_state.set_system_theme(next);
+                if before != self.chrome_state.theme {
+                    tracing::info!(
+                        "System theme changed to {:?}; chrome theme is {:?}",
+                        next,
+                        self.chrome_state.theme
+                    );
                     if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
                     }
@@ -903,27 +1241,20 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                 } else {
                     match logical_key {
                         Key::Named(NamedKey::F12) => {
-                            if let Some(tm) = self.tab_manager.as_mut() {
-                                if let Some(id) = tm.active_tab_id {
-                                    tm.handle_ui_action(UiAction::OpenDevTools { tab_id: id });
-                                }
-                            }
+                            self.handle_browser_shortcut(BrowserShortcut::OpenDevTools);
                         }
                         Key::Character(c) if ctrl => match c.as_str() {
                             "l" | "L" | "k" | "K" => {
-                                self.chrome_state.open_command_palette();
+                                self.handle_browser_shortcut(BrowserShortcut::OpenCommandPalette);
+                            }
+                            "," | "<" | "." | ">" => {
+                                self.handle_browser_shortcut(BrowserShortcut::OpenSettings);
                             }
                             "t" | "T" => {
-                                if let Some(tm) = self.tab_manager.as_mut() {
-                                    tm.handle_ui_action(UiAction::NewTab { url: None });
-                                }
+                                self.handle_browser_shortcut(BrowserShortcut::NewTab);
                             }
                             "w" | "W" => {
-                                if let Some(tm) = self.tab_manager.as_mut() {
-                                    if let Some(id) = tm.active_tab_id {
-                                        tm.handle_ui_action(UiAction::CloseTab { tab_id: id });
-                                    }
-                                }
+                                self.handle_browser_shortcut(BrowserShortcut::CloseTab);
                             }
                             _ => {}
                         },
@@ -937,6 +1268,13 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                 // event callback. On macOS, do_message_loop_work() dispatches
                 // NSApp events that can re-enter winit's single-entry handler.
                 self.shutdown_requested = true;
+            }
+            WindowEvent::Moved(_) => {
+                // Keep helper windows on the same display as the browser when
+                // the user drags the main window between monitors.
+                self.position_chrome_overlay();
+                self.chrome_state.tooltip = None;
+                self.hide_tooltip_overlay();
             }
             WindowEvent::Resized(new_size) => {
                 if let Some(chrome) = self.chrome.as_mut() {
@@ -957,20 +1295,13 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             }
             WindowEvent::RedrawRequested => {
                 let rail_before = self.chrome_state.rail_expanded;
-                if let (Some(window), Some(chrome), Some(tm)) = (
-                    self.window.as_ref(),
-                    self.chrome.as_mut(),
-                    self.tab_manager.as_mut(),
-                ) {
+                if let (Some(window), Some(chrome)) = (self.window.as_ref(), self.chrome.as_mut()) {
                     // CEF events and the watchdog are processed once per loop
                     // iteration in `about_to_wait`, never here. This keeps all
                     // CEF work in one non-window-event callback and prevents
                     // double-processing.
                     let actions = chrome.render(window, &mut self.chrome_state);
-
-                    for action in actions {
-                        tm.handle_ui_action(action);
-                    }
+                    self.handle_ui_actions(actions);
                 }
 
                 if rail_before != self.chrome_state.rail_expanded {
@@ -1033,6 +1364,9 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             if tm.consume_command_palette_request() {
                 self.chrome_state.open_command_palette();
             }
+            if tm.consume_settings_request() {
+                self.chrome_state.open_settings();
+            }
             if !self.shutdown_requested {
                 tm.tick();
             }
@@ -1043,6 +1377,12 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
         self.sync_tooltip_overlay(event_loop);
 
         if self.shutdown_requested {
+            // The one-shot observer may not fire until the run loop is allowed
+            // to wait. Until then, this state is final; just wait quietly.
+            if self.shutdown_finalization_requested {
+                return;
+            }
+
             self.shutdown_ticks += 1;
             let pending = self
                 .tab_manager
@@ -1060,6 +1400,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                     "CEF shutdown ready (waited {} ticks) — exiting event loop",
                     self.shutdown_ticks
                 );
+                self.shutdown_finalization_requested = true;
                 // On macOS winit installs CFRunLoop observers that are torn
                 // down when run_app() returns, so CEF shutdown must happen
                 // before returning from run_app(). It also dispatches NSApp
@@ -1290,6 +1631,11 @@ fn main() {
         tracing::warn!("Shutdown event proxy was already initialized");
     }
 
+    #[cfg(target_os = "macos")]
+    if SHORTCUT_PROXY.set(event_loop.create_proxy()).is_err() {
+        tracing::warn!("Native shortcut event proxy was already initialized");
+    }
+
     let mut handler = KasumiBrowserHandler::new(wgpu_instance, adapter, device, queue);
 
     if let Err(e) = event_loop.run_app(&mut handler) {
@@ -1312,10 +1658,15 @@ fn main() {
 mod tests {
     use super::{
         is_primary_shortcut_modifier, is_reopen_tab_shortcut, overlay_screen_position,
-        pointer_is_past_rail,
+        pointer_is_past_rail, BrowserShortcut,
     };
     use winit::dpi::PhysicalPosition;
     use winit::keyboard::{Key, ModifiersState};
+
+    #[cfg(target_os = "macos")]
+    use {
+        super::native_shortcuts::shortcut_from_parts, objc2_app_kit::NSEventModifierFlags as Flags,
+    };
 
     #[test]
     fn shortcuts_accept_ctrl_or_cmd_without_conflicting_modifiers() {
@@ -1376,5 +1727,69 @@ mod tests {
 
         let position = overlay_screen_position(PhysicalPosition::new(100, 40), (52.0, 120.5), 1.0);
         assert_eq!((position.x, position.y), (152, 161));
+    }
+
+    #[test]
+    fn overlay_position_follows_secondary_display_origins() {
+        // Displays to the left/above the primary display use negative physical
+        // coordinates; the overlay must preserve those, not clamp to zero.
+        let position =
+            overlay_screen_position(PhysicalPosition::new(-1920, -1080), (0.0, 0.0), 2.0);
+        assert_eq!((position.x, position.y), (-1920, -1080));
+
+        let position =
+            overlay_screen_position(PhysicalPosition::new(-1920, -1080), (100.0, 50.0), 2.0);
+        assert_eq!((position.x, position.y), (-1720, -980));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_monitor_captures_settings_shortcuts_while_page_has_focus() {
+        let cmd = Flags::NSEventModifierFlagCommand;
+        assert_eq!(
+            shortcut_from_parts(',', 0x2B, cmd),
+            Some(BrowserShortcut::OpenSettings)
+        );
+        assert_eq!(
+            shortcut_from_parts('.', 0x2F, cmd),
+            Some(BrowserShortcut::OpenSettings)
+        );
+        assert_eq!(
+            shortcut_from_parts('<', 0x2B, cmd | Flags::NSEventModifierFlagShift),
+            None,
+            "Shift+Cmd+, is not a shell shortcut"
+        );
+        assert_eq!(
+            shortcut_from_parts('a', 0x00, Flags::empty()),
+            None,
+            "plain typing must pass through to the page"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_monitor_maps_all_shell_shortcuts() {
+        let cmd = Flags::NSEventModifierFlagCommand;
+        let shift = Flags::NSEventModifierFlagShift;
+        assert_eq!(
+            shortcut_from_parts('t', 0x11, cmd),
+            Some(BrowserShortcut::NewTab)
+        );
+        assert_eq!(
+            shortcut_from_parts('w', 0x13, cmd),
+            Some(BrowserShortcut::CloseTab)
+        );
+        assert_eq!(
+            shortcut_from_parts('l', 0x25, cmd),
+            Some(BrowserShortcut::OpenCommandPalette)
+        );
+        assert_eq!(
+            shortcut_from_parts('t', 0x11, cmd | shift),
+            Some(BrowserShortcut::ReopenClosedTab)
+        );
+        assert_eq!(
+            shortcut_from_parts('\0', 0x58, cmd),
+            Some(BrowserShortcut::OpenDevTools)
+        );
     }
 }
