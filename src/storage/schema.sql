@@ -27,3 +27,8 @@ CREATE TABLE IF NOT EXISTS session_tabs (
     is_active INTEGER NOT NULL DEFAULT 0,
     is_hibernated INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS preferences (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);

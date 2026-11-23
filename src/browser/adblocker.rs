@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use adblock::lists::{FilterSet, ParseOptions};
@@ -110,6 +111,7 @@ wrap_resource_request_handler! {
         tab_id: u64,
         event_sender: Sender<BrowserEvent>,
         engine: Arc<Engine>,
+        enabled: Arc<AtomicBool>,
     }
 
     impl ResourceRequestHandler {
@@ -120,6 +122,10 @@ wrap_resource_request_handler! {
             request: Option<&mut cef::Request>,
             _callback: Option<&mut Callback>,
         ) -> ReturnValue {
+            if !self.enabled.load(Ordering::Acquire) {
+                return ReturnValue::CONTINUE;
+            }
+
             let req = match request {
                 Some(r) => r,
                 None => return ReturnValue::CONTINUE,
@@ -185,8 +191,9 @@ pub fn create_tab_request_handler(
     tab_id: u64,
     event_sender: Sender<BrowserEvent>,
     engine: Arc<Engine>,
+    enabled: Arc<AtomicBool>,
 ) -> RequestHandler {
-    let res_handler = TabResourceRequestHandler::new(tab_id, event_sender, engine);
+    let res_handler = TabResourceRequestHandler::new(tab_id, event_sender, engine, enabled);
     TabRequestHandler::new(res_handler.into())
 }
 

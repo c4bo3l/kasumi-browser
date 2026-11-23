@@ -59,7 +59,7 @@ Use these exact crate versions and release profile settings:
 ```toml
 [package]
 name = "kasumi-browser"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 
 [dependencies]
@@ -103,8 +103,12 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Wind
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
-objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow"] }
+# NSEvent's local monitor lets shell shortcuts work even when the CEF child
+# view has keyboard focus; NSMenu/NSMenuItem build the native File menu;
+# block2 is required by the Objective-C block API.
+objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow", "NSEvent", "NSMenu", "NSMenuItem", "block2"] }
 objc2-foundation = { version = "0.2", features = ["NSGeometry"] }
+block2 = "0.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = "0.13"

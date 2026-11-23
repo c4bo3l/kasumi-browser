@@ -15,6 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+use crate::config::{BrowserPreferences, PREFERENCES_DB_KEY};
+
 #[derive(Debug, Clone)]
 pub struct SessionTabSnapshot {
     pub url: String,
@@ -45,6 +47,9 @@ pub enum DbCommand {
         title: String,
         folder: String,
     },
+    SavePreferences {
+        preferences: BrowserPreferences,
+    },
     FlushWal,
 }
 
@@ -68,6 +73,10 @@ impl StorageHandle {
 
     pub fn add_bookmark(&self, url: String, title: String, folder: String) {
         self.send(DbCommand::AddBookmark { url, title, folder });
+    }
+
+    pub fn save_preferences(&self, preferences: BrowserPreferences) {
+        self.send(DbCommand::SavePreferences { preferences });
     }
 
     pub fn flush_wal(&self) {
@@ -118,6 +127,29 @@ impl StorageManager {
             }
         }
         Ok(snapshots)
+    }
+
+    /// Load persisted preferences. Corrupt or legacy data falls back to the
+    /// shipped defaults instead of blocking startup.
+    pub fn load_preferences(db_path: &Path) -> BrowserPreferences {
+        let Ok(conn) = Self::init_db(db_path) else {
+            return BrowserPreferences::default();
+        };
+        let Ok(json) = conn.query_row(
+            "SELECT value FROM preferences WHERE key = ?1",
+            params![PREFERENCES_DB_KEY],
+            |row| row.get::<_, String>(0),
+        ) else {
+            return BrowserPreferences::default();
+        };
+
+        match BrowserPreferences::from_json(&json) {
+            Ok(preferences) => preferences,
+            Err(e) => {
+                tracing::warn!("Ignoring invalid stored preferences: {e}");
+                BrowserPreferences::default()
+            }
+        }
     }
 
     /// Search history by prefix for omnibox autocomplete.
@@ -235,6 +267,23 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
                 tracing::warn!("Failed to add bookmark: {}", e);
             }
         }
+        DbCommand::SavePreferences { preferences } => {
+            let json = match preferences.to_json() {
+                Ok(json) => json,
+                Err(e) => {
+                    tracing::warn!("Failed to serialize preferences: {e}");
+                    return;
+                }
+            };
+            let res = conn.execute(
+                "INSERT INTO preferences (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![PREFERENCES_DB_KEY, json],
+            );
+            if let Err(e) = res {
+                tracing::warn!("Failed to save preferences: {e}");
+            }
+        }
         DbCommand::FlushWal => {
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         }
@@ -263,6 +312,7 @@ fn run_worker_loop(db_path: PathBuf, mut rx: UnboundedReceiver<DbCommand>) {
 #[cfg(test)]
 mod tests {
     use super::{apply_command, DbCommand, SessionTabSnapshot, StorageManager};
+    use crate::config::BrowserPreferences;
     use rusqlite::params;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -311,7 +361,10 @@ mod tests {
             .expect("table rows")
             .filter_map(Result::ok)
             .collect();
-        assert_eq!(tables, vec!["bookmarks", "history", "session_tabs"]);
+        assert_eq!(
+            tables,
+            vec!["bookmarks", "history", "preferences", "session_tabs"]
+        );
 
         drop(conn);
         remove_test_db(&path);
@@ -367,6 +420,43 @@ mod tests {
         let replaced = StorageManager::load_session(&path).expect("replaced session load");
         assert_eq!(replaced.len(), 1);
         assert_eq!(replaced[0].url, "https://only.example");
+
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn preferences_save_and_load_with_fallback() {
+        let (path, mut conn) = fresh_db("preferences");
+        assert_eq!(
+            StorageManager::load_preferences(&path),
+            BrowserPreferences::default()
+        );
+
+        let prefs = BrowserPreferences {
+            theme: crate::config::ThemePreference::Dark,
+            rail_expanded: false,
+            adblock_enabled: false,
+            idle_timeout_minutes: 15,
+            search_engine: crate::config::SearchEngine::Google,
+        };
+        apply_command(
+            &mut conn,
+            DbCommand::SavePreferences {
+                preferences: prefs.clone(),
+            },
+        );
+        assert_eq!(StorageManager::load_preferences(&path), prefs);
+
+        conn.execute(
+            "UPDATE preferences SET value = 'not json' WHERE key = ?1",
+            params![crate::config::PREFERENCES_DB_KEY],
+        )
+        .expect("corrupt preferences row");
+        assert_eq!(
+            StorageManager::load_preferences(&path),
+            BrowserPreferences::default()
+        );
 
         drop(conn);
         remove_test_db(&path);

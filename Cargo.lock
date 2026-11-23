@@ -1459,9 +1459,10 @@ dependencies = [
 
 [[package]]
 name = "kasumi-browser"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "adblock",
+ "block2",
  "cef",
  "crossbeam-channel",
  "egui",
