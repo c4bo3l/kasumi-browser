@@ -1,8 +1,8 @@
-use std::path::PathBuf;
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     {
+        use std::path::PathBuf;
+
         use cef::build_util::mac::{bundle, BundleInfo};
         let target_dir = PathBuf::from("target/release");
         let output_dir = PathBuf::from("target/bundle");

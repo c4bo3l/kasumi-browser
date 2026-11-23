@@ -302,6 +302,28 @@ fn browser_shortcut_from_char(
     }
 }
 
+fn handle_pre_key_event(
+    tab_id: u64,
+    event_sender: &Sender<BrowserEvent>,
+    event: Option<&KeyEvent>,
+) -> i32 {
+    let Some(event) = event else {
+        return 0;
+    };
+    let is_key_down =
+        event.type_ == KeyEventType::KEYDOWN || event.type_ == KeyEventType::RAWKEYDOWN;
+    let shortcut = browser_shortcut(is_key_down, event.windows_key_code, event.modifiers)
+        .or_else(|| {
+            browser_shortcut_from_char(is_key_down, event.unmodified_character, event.modifiers)
+        })
+        .or_else(|| browser_shortcut_from_char(is_key_down, event.character, event.modifiers));
+    if let Some(shortcut) = shortcut {
+        let _ = event_sender.send(BrowserEvent::BrowserShortcut { tab_id, shortcut });
+        return 1;
+    }
+    0
+}
+
 wrap_keyboard_handler! {
     pub struct TabKeyboardHandler {
         tab_id: u64,
@@ -309,6 +331,7 @@ wrap_keyboard_handler! {
     }
 
     impl KeyboardHandler {
+        #[cfg(target_os = "macos")]
         fn on_pre_key_event(
             &self,
             _browser: Option<&mut Browser>,
@@ -316,33 +339,29 @@ wrap_keyboard_handler! {
             _os_event: *mut u8,
             _is_keyboard_shortcut: Option<&mut ::std::os::raw::c_int>,
         ) -> i32 {
-            if let Some(event) = event {
-                let is_key_down = event.type_ == KeyEventType::KEYDOWN
-                    || event.type_ == KeyEventType::RAWKEYDOWN;
-                let shortcut = browser_shortcut(is_key_down, event.windows_key_code, event.modifiers)
-                    .or_else(|| {
-                        browser_shortcut_from_char(
-                            is_key_down,
-                            event.unmodified_character,
-                            event.modifiers,
-                        )
-                    })
-                    .or_else(|| {
-                        browser_shortcut_from_char(
-                            is_key_down,
-                            event.character,
-                            event.modifiers,
-                        )
-                    });
-                if let Some(shortcut) = shortcut {
-                    let _ = self.event_sender.send(BrowserEvent::BrowserShortcut {
-                        tab_id: self.tab_id,
-                        shortcut,
-                    });
-                    return 1;
-                }
-            }
-            0
+            handle_pre_key_event(self.tab_id, &self.event_sender, event)
+        }
+
+        #[cfg(windows)]
+        fn on_pre_key_event(
+            &self,
+            _browser: Option<&mut Browser>,
+            event: Option<&KeyEvent>,
+            _os_event: Option<&mut cef::sys::MSG>,
+            _is_keyboard_shortcut: Option<&mut ::std::os::raw::c_int>,
+        ) -> i32 {
+            handle_pre_key_event(self.tab_id, &self.event_sender, event)
+        }
+
+        #[cfg(target_os = "linux")]
+        fn on_pre_key_event(
+            &self,
+            _browser: Option<&mut Browser>,
+            event: Option<&KeyEvent>,
+            _os_event: Option<&mut cef::sys::XEvent>,
+            _is_keyboard_shortcut: Option<&mut ::std::os::raw::c_int>,
+        ) -> i32 {
+            handle_pre_key_event(self.tab_id, &self.event_sender, event)
         }
     }
 }

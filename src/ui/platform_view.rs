@@ -68,12 +68,18 @@ impl ContentRect {
 
 use cef::sys::cef_window_handle_t;
 
-/// CEF's native window handle is a pointer on macOS/Windows but an XID
-/// integer on Linux. Every function in this module takes `*mut c_void`, so
-/// these helpers keep that conversion in one audited place.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+/// CEF's native window handle is a raw pointer on macOS, an `HWND` newtype on
+/// Windows, and an XID integer on Linux. Every function in this module takes
+/// `*mut c_void`, so these helpers keep that conversion in one audited place.
+#[cfg(target_os = "macos")]
 pub(crate) fn cef_handle_as_ptr(handle: cef_window_handle_t) -> *mut std::ffi::c_void {
     handle
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn cef_handle_as_ptr(handle: cef_window_handle_t) -> *mut std::ffi::c_void {
+    // Windows CEF uses its own `HWND` newtype rather than a raw pointer.
+    handle.0.cast::<std::ffi::c_void>()
 }
 
 #[cfg(target_os = "linux")]
@@ -81,9 +87,14 @@ pub(crate) fn cef_handle_as_ptr(handle: cef_window_handle_t) -> *mut std::ffi::c
     handle as usize as *mut std::ffi::c_void
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
 pub(crate) fn ptr_as_cef_handle(ptr: *mut std::ffi::c_void) -> cef_window_handle_t {
     ptr
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn ptr_as_cef_handle(ptr: *mut std::ffi::c_void) -> cef_window_handle_t {
+    cef::sys::HWND(ptr.cast())
 }
 
 #[cfg(target_os = "linux")]
@@ -212,7 +223,10 @@ mod win {
     use windows_sys::Win32::Foundation::HWND;
 
     /// Reparent and position the CEF child `HWND`.
-    pub fn show_view(
+    ///
+    /// # Safety
+    /// `parent` and `child` must be valid, live Win32 window handles.
+    pub unsafe fn show_view(
         parent: *mut c_void,
         child: *mut c_void,
         rect: ContentRect,
@@ -238,32 +252,29 @@ mod win {
         Ok(())
     }
 
-    pub fn resize_view(child: *mut c_void, rect: ContentRect) -> Result<(), String> {
+    /// # Safety
+    /// `child` must be a valid, live Win32 window handle.
+    pub unsafe fn resize_view(child: *mut c_void, rect: ContentRect) -> Result<(), String> {
         use windows_sys::Win32::UI::WindowsAndMessaging::*;
         if child.is_null() {
             return Ok(());
         }
         let (x, y, width, height) = rect.to_physical();
         unsafe {
-            MoveWindow(
-                HWND(child),
-                x as i32,
-                y as i32,
-                width as i32,
-                height as i32,
-                1,
-            );
+            MoveWindow(child, x as i32, y as i32, width as i32, height as i32, 1);
         }
         Ok(())
     }
 
-    pub fn hide_view(child: *mut c_void) -> Result<(), String> {
+    /// # Safety
+    /// `child` must be a valid, live Win32 window handle.
+    pub unsafe fn hide_view(child: *mut c_void) -> Result<(), String> {
         use windows_sys::Win32::UI::WindowsAndMessaging::*;
         if child.is_null() {
             return Ok(());
         }
         unsafe {
-            ShowWindow(HWND(child), SW_HIDE);
+            ShowWindow(child, SW_HIDE);
         }
         Ok(())
     }
@@ -276,7 +287,7 @@ mod win {
         use windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow;
         if !child.is_null() {
             unsafe {
-                DestroyWindow(HWND(child));
+                DestroyWindow(child);
             }
         }
     }
@@ -291,28 +302,34 @@ mod linux {
     use std::sync::OnceLock;
 
     use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{ConfigureWindowAux, Window};
+    use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt, Window};
     use x11rb::rust_connection::RustConnection;
 
     use super::ContentRect;
 
     /// X11 window IDs are carried as pointer values by the platform-agnostic
     /// interface. A single connection is reused for every low-frequency
-    /// show/hide/resize operation.
+    /// show/hide/resize operation. Cache the connection *and* any connect
+    /// error so we never retry a failed connection from a CEF callback.
     fn connection() -> Result<&'static RustConnection, String> {
-        static CONNECTION: OnceLock<RustConnection> = OnceLock::new();
-        CONNECTION.get_or_try_init(|| {
-            let (conn, _screen_number) =
-                x11rb::connect(None).map_err(|e| format!("X11 connect failed: {e}"))?;
-            Ok::<RustConnection, String>(conn)
-        })
+        static CONNECTION: OnceLock<Result<RustConnection, String>> = OnceLock::new();
+        CONNECTION
+            .get_or_init(|| {
+                x11rb::connect(None)
+                    .map(|(conn, _screen_number)| conn)
+                    .map_err(|e| format!("X11 connect failed: {e}"))
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     fn xid(handle: *mut c_void) -> Window {
         handle as usize as Window
     }
 
-    pub fn show_view(
+    /// # Safety
+    /// `parent` and `child` must encode valid, live X11 window IDs.
+    pub unsafe fn show_view(
         parent: *mut c_void,
         child: *mut c_void,
         rect: ContentRect,
@@ -341,7 +358,9 @@ mod linux {
         Ok(())
     }
 
-    pub fn resize_view(child: *mut c_void, rect: ContentRect) -> Result<(), String> {
+    /// # Safety
+    /// `child` must encode a valid, live X11 window ID.
+    pub unsafe fn resize_view(child: *mut c_void, rect: ContentRect) -> Result<(), String> {
         if child.is_null() {
             return Ok(());
         }
@@ -360,7 +379,9 @@ mod linux {
         Ok(())
     }
 
-    pub fn hide_view(child: *mut c_void) -> Result<(), String> {
+    /// # Safety
+    /// `child` must encode a valid, live X11 window ID.
+    pub unsafe fn hide_view(child: *mut c_void) -> Result<(), String> {
         if child.is_null() {
             return Ok(());
         }
@@ -373,7 +394,10 @@ mod linux {
 
     /// X11 teardown needs the connection handle, which is owned by the main
     /// loop. Hide/resize are sufficient here; closing the browser still works.
-    pub fn detach_view(_cef_xid: *mut c_void) {
+    ///
+    /// # Safety
+    /// `cef_xid` must encode a valid X11 window ID.
+    pub unsafe fn detach_view(_cef_xid: *mut c_void) {
         tracing::debug!("detach_view is a no-op on X11");
     }
 }

@@ -8,9 +8,13 @@ mod events;
 mod storage;
 mod ui;
 
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 
 use app::KasumiBrowserApp;
 use browser::hibernation::TabManager;
