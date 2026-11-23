@@ -1,0 +1,47 @@
+name: PR checks
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit tests (macOS)
+    runs-on: macos-13
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache CEF binaries
+        uses: actions/cache@v4
+        with:
+          path: .cef
+          key: ${{ runner.os }}-cef-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cef-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check binaries
+        run: cargo check --bins
+
+      - name: Run unit tests
+        run: cargo test --bin kasumi-browser

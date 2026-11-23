@@ -4,6 +4,24 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
+## v0.1.6 — 2026-11-23
+
+### Added
+
+- Added `.github/workflows/pr.yml` for pull requests targeting `main`. It checks formatting, runs `cargo check --bins`, and runs the unit tests with `cargo test --bin kasumi-browser`.
+- Added Cargo and CEF caches to the PR workflow to keep CI runs fast.
+
+### Changed
+
+- Change the versioning policy so a version bump is released when a PR is merged into `main`; PRs include the bump so CI validates the exact release state.
+- Bumped the project and macOS bundle version from `0.1.5` to `0.1.6`.
+
+### Notes
+
+- All future changes should land through pull requests and pass the PR workflow before merge.
+
+---
+
 ## v0.1.5 — 2026-11-23
 
 ### Added

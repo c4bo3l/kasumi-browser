@@ -6,6 +6,8 @@ Kasumi Browser is built from the ground up to eliminate browser bloat while main
 
 Repository: [github.com/c4bo3l/kasumi-browser](https://github.com/c4bo3l/kasumi-browser)
 
+PR checks: [![PR checks](https://github.com/c4bo3l/kasumi-browser/actions/workflows/pr.yml/badge.svg)](https://github.com/c4bo3l/kasumi-browser/actions/workflows/pr.yml)
+
 Release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 Pending UI/navigation bugfix handoff: [BUGFIX_TASKS.md](BUGFIX_TASKS.md)
@@ -14,7 +16,7 @@ Pending UI/navigation bugfix handoff: [BUGFIX_TASKS.md](BUGFIX_TASKS.md)
 
 ## ✅ What Has Been Done
 
-Current version: **0.1.5**. Every batch of changes bumps the version in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, and `Cargo.lock` as required by `AGENTS.md`.
+Current version: **0.1.6**. A version bump is released when a PR is merged into `main`; PRs include the bump in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, `README.md`, `RELEASE_NOTES.md`, and `Cargo.lock` so CI checks the exact release state, as required by `AGENTS.md`.
 
 - Renamed the project from LiteBrowser to **Kasumi Browser** everywhere: package, binary, CEF helper, bundle ID, window title, database path, and docs.
 - Implemented the CEF subprocess fork trap and `mimalloc` global allocator.
