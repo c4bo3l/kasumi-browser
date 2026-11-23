@@ -14,7 +14,7 @@ Release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ## ✅ What Has Been Done
 
-Current version: **0.4.0**. A version bump is released when a PR is merged into `main`; PRs include the bump in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, `README.md`, `RELEASE_NOTES.md`, and `Cargo.lock` so CI checks the exact release state, as required by `AGENTS.md`.
+Current version: **0.4.1**. A version bump is released when a PR is merged into `main`; PRs include the bump in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, `README.md`, `RELEASE_NOTES.md`, and `Cargo.lock` so CI checks the exact release state, as required by `AGENTS.md`.
 
 - Renamed the project from LiteBrowser to **Kasumi Browser** everywhere: package, binary, CEF helper, bundle ID, window title, database path, and docs.
 - Implemented the CEF subprocess fork trap and `mimalloc` global allocator.
@@ -278,21 +278,17 @@ sha256sum kasumi-browser.tar.gz > kasumi-browser.tar.gz.sha256
 
 ## 🚧 Future Development
 
+**Next up: pinned tabs.** It is the smallest feature with immediate daily-driver value, and it is the foundation for per-workspace pinned lists, so it should land before full workspace switching.
+
+- **Pinned tabs:** a compact pinned section in the rail that stays visible across tab switches and browser restarts.
+- **Workspaces:** Arc-style Spaces or an edge workspace strip for grouping tabs by project, task, or context.
+- **Per-workspace pins and bookmarks:** each workspace will own its own pinned-tab list and bookmarks so switching spaces restores the full context without mixing them.
+- **Bookmark manager UI:** a native view for organizing, searching, and editing bookmarks.
+- **Download manager:** a native panel for active and completed downloads.
 - **Windows and Linux testing:** native child-view code exists for `HWND` and `X11`, but full interactive verification is still needed on those platforms.
 - **More integration tests:** unit coverage is in place for omnibox resolution, rail/palette/menu/settings state, closed-tab restoration metadata, tooltips, hibernation thresholds, adblock mapping, preference persistence, storage, and CEF switches; automated end-to-end browser tests are still future work.
 - **Packaged-app verification:** macOS, Windows, and Linux release artifacts still need interactive testing after signing/bundling.
-- **Workspaces:** Arc-style Spaces or an edge workspace strip for grouping tabs by project, task, or context.
-- **Pinned tabs:** a compact pinned section in the rail that stays visible across tab switches and browser restarts.
-- **Per-workspace pins and bookmarks:** each workspace will own its own pinned-tab list and bookmarks so switching spaces restores the full context without mixing them.
-
----
-
-## #will be added later
-
-- Bookmark manager UI
-- Download manager
-- Automated cross-platform integration tests
-- Release CI and signed artifact publishing
+- **Release CI and signed artifact publishing:** extend the existing PR checks to signed release builds and published artifacts.
 
 ---
 

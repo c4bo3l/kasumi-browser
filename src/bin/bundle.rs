@@ -8,7 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let output_dir = PathBuf::from("target/bundle");
         std::fs::create_dir_all(&output_dir)?;
 
-        let version = semver::Version::new(0, 4, 0);
+        let version = semver::Version::new(0, 4, 1);
         let bundle_info = BundleInfo::new(
             "KasumiBrowser",
             "com.kasumi.browser",
