@@ -246,6 +246,8 @@ enum RailIcon {
     Chip,
     Globe,
     Close,
+    Pin,
+    PinOff,
     Settings,
 }
 
@@ -280,6 +282,7 @@ pub struct TabInfo {
     pub blocked_requests: u32,
     pub can_go_back: bool,
     pub can_go_forward: bool,
+    pub is_pinned: bool,
     pub favicon: Option<Favicon>,
 }
 
@@ -289,6 +292,7 @@ pub enum CommandAction {
     SelectTab(u64),
     NewTab(Option<String>),
     Navigate { tab_id: u64, url: String },
+    TogglePinTab(u64),
     HibernateAll,
     ToggleRail,
     OpenDevTools,
@@ -329,6 +333,7 @@ pub struct RailMenu {
 pub enum RailMenuAction {
     NewTab,
     DuplicateTab,
+    TogglePinTab,
     CopyUrl,
     Reload,
     CloseOtherTabs,
@@ -896,77 +901,39 @@ impl ChromeRenderer {
                             .id_salt("favicon_rail_tabs")
                             .max_height(tab_area_height)
                             .show(ui, |ui| {
-                                for tab in &state.tabs {
-                                    let tab_id = tab.id;
-                                    let is_active = state.active_tab_id == Some(tab_id);
-                                    let (row_rect, row_resp) = ui.allocate_exact_size(
-                                        vec2(width - 6.0, 44.0),
-                                        Sense::click(),
-                                    );
-
-                                    Self::paint_tab_row(
+                                for tab in state.tabs.iter().filter(|tab| tab.is_pinned) {
+                                    self.rail_tab_row(
                                         ui,
-                                        row_rect,
-                                        is_active,
-                                        row_resp.hovered(),
+                                        tab,
+                                        state,
+                                        actions,
+                                        tooltip_slot,
+                                        &mut menu_request,
+                                        rail_rect,
                                         palette,
-                                    );
-                                    let icon_rect = egui::Rect::from_center_size(
-                                        row_rect.center(),
-                                        vec2(24.0, 24.0),
-                                    );
-                                    self.paint_favicon_in_rect(ui, tab, icon_rect, palette);
-                                    let close_resp = Self::paint_tab_close(
-                                        ui,
-                                        row_rect,
-                                        row_resp.hovered(),
-                                        tab_id,
+                                        width,
                                         false,
+                                    );
+                                }
+                                if state.tabs.iter().any(|tab| tab.is_pinned)
+                                    && state.tabs.iter().any(|tab| !tab.is_pinned)
+                                {
+                                    ui.add_space(2.0);
+                                    ui.separator();
+                                    ui.add_space(2.0);
+                                }
+                                for tab in state.tabs.iter().filter(|tab| !tab.is_pinned) {
+                                    self.rail_tab_row(
+                                        ui,
+                                        tab,
+                                        state,
+                                        actions,
+                                        tooltip_slot,
+                                        &mut menu_request,
+                                        rail_rect,
                                         palette,
-                                    );
-                                    Self::paint_tab_status(ui, row_rect, tab, false, palette);
-                                    Self::chrome_tooltip(
-                                        tooltip_slot,
-                                        ui,
-                                        &close_resp,
-                                        format!("Close tab: {}", tab.title),
-                                        state.rail_expanded,
-                                    );
-
-                                    if close_resp.clicked() {
-                                        actions.push(UiAction::CloseTab { tab_id });
-                                    } else if row_resp.clicked() {
-                                        actions.push(UiAction::SelectTab { tab_id });
-                                    }
-                                    if row_resp.middle_clicked() {
-                                        actions.push(UiAction::CloseTab { tab_id });
-                                    }
-                                    if row_resp.secondary_clicked() {
-                                        let pointer = ui
-                                            .ctx()
-                                            .pointer_latest_pos()
-                                            .unwrap_or(row_rect.right_top());
-                                        let (menu_width, menu_height) = rail_menu_metrics();
-                                        let anchor = rail_menu_anchor(
-                                            rail_rect,
-                                            pointer,
-                                            ui.ctx().screen_rect(),
-                                            menu_width,
-                                            menu_height,
-                                        );
-                                        menu_request = Some((tab_id, anchor));
-                                    }
-                                    let tooltip_text = if state.rail_expanded {
-                                        format!("{}\n{}", tab.title, tab.url)
-                                    } else {
-                                        tab.title.clone()
-                                    };
-                                    Self::chrome_tooltip(
-                                        tooltip_slot,
-                                        ui,
-                                        &row_resp,
-                                        tooltip_text,
-                                        state.rail_expanded,
+                                        width,
+                                        false,
                                     );
                                 }
                             });
@@ -1146,100 +1113,55 @@ impl ChromeRenderer {
                     });
                     ui.add_space(2.0);
 
+                    if state.tabs.iter().any(|tab| tab.is_pinned) {
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new("PINNED")
+                                    .size(9.0)
+                                    .color(palette.section_label),
+                            );
+                        });
+                        ui.add_space(1.0);
+                    }
+
                     egui::ScrollArea::vertical()
                         .id_salt("rail_tabs")
                         .show(ui, |ui| {
-                            for tab in &state.tabs {
-                                let tab_id = tab.id;
-                                let is_active = state.active_tab_id == Some(tab_id);
-                                let title = if tab.title.is_empty() {
-                                    "New Tab".to_string()
-                                } else {
-                                    truncate_title(&tab.title, 18)
-                                };
-
-                                let (row_rect, row_resp) = ui
-                                    .allocate_exact_size(vec2(width - 12.0, 36.0), Sense::click());
-
-                                // Paint the background and its contents against the
-                                // same rect. Previously the labels were added after
-                                // the row had advanced the cursor, so they appeared
-                                // below the highlight instead of inside it.
-                                Self::paint_tab_row(
+                            for tab in state.tabs.iter().filter(|tab| tab.is_pinned) {
+                                self.rail_tab_row(
                                     ui,
-                                    row_rect,
-                                    is_active,
-                                    row_resp.hovered(),
-                                    palette,
-                                );
-                                let icon_rect = egui::Rect::from_min_size(
-                                    pos2(row_rect.min.x + 8.0, row_rect.center().y - 10.0),
-                                    vec2(20.0, 20.0),
-                                );
-                                self.paint_favicon_in_rect(ui, tab, icon_rect, palette);
-
-                                let text_color = if is_active {
-                                    palette.text_strong
-                                } else {
-                                    palette.text
-                                };
-                                ui.painter().text(
-                                    pos2(row_rect.min.x + 34.0, row_rect.center().y),
-                                    Align2::LEFT_CENTER,
-                                    title,
-                                    FontId::new(12.0, FontFamily::Proportional),
-                                    text_color,
-                                );
-                                let close_resp = Self::paint_tab_close(
-                                    ui,
-                                    row_rect,
-                                    row_resp.hovered(),
-                                    tab_id,
-                                    true,
-                                    palette,
-                                );
-                                Self::paint_tab_status(
-                                    ui,
-                                    row_rect,
                                     tab,
-                                    row_resp.hovered() || close_resp.hovered(),
-                                    palette,
-                                );
-
-                                if close_resp.clicked() {
-                                    actions.push(UiAction::CloseTab { tab_id });
-                                } else if row_resp.clicked() {
-                                    actions.push(UiAction::SelectTab { tab_id });
-                                }
-                                if row_resp.middle_clicked() {
-                                    actions.push(UiAction::CloseTab { tab_id });
-                                }
-                                if row_resp.secondary_clicked() {
-                                    let pointer = ui
-                                        .ctx()
-                                        .pointer_latest_pos()
-                                        .unwrap_or(row_rect.right_top());
-                                    let (menu_width, menu_height) = rail_menu_metrics();
-                                    let anchor = rail_menu_anchor(
-                                        rail_rect,
-                                        pointer,
-                                        ui.ctx().screen_rect(),
-                                        menu_width,
-                                        menu_height,
-                                    );
-                                    menu_request = Some((tab_id, anchor));
-                                }
-                                let tooltip_text = if state.rail_expanded {
-                                    format!("{}\n{}", tab.title, tab.url)
-                                } else {
-                                    tab.title.clone()
-                                };
-                                Self::chrome_tooltip(
+                                    state,
+                                    actions,
                                     tooltip_slot,
+                                    &mut menu_request,
+                                    rail_rect,
+                                    palette,
+                                    width,
+                                    true,
+                                );
+                            }
+                            if state.tabs.iter().any(|tab| tab.is_pinned)
+                                && state.tabs.iter().any(|tab| !tab.is_pinned)
+                            {
+                                ui.add_space(3.0);
+                                ui.separator();
+                                ui.add_space(3.0);
+                            }
+                            for tab in state.tabs.iter().filter(|tab| !tab.is_pinned) {
+                                self.rail_tab_row(
                                     ui,
-                                    &row_resp,
-                                    tooltip_text,
-                                    state.rail_expanded,
+                                    tab,
+                                    state,
+                                    actions,
+                                    tooltip_slot,
+                                    &mut menu_request,
+                                    rail_rect,
+                                    palette,
+                                    width,
+                                    true,
                                 );
                             }
                         });
@@ -2020,6 +1942,183 @@ impl ChromeRenderer {
             palette.text_dim,
         );
     }
+
+    /// Draw one rail tab row. Pinned rows are shorter and replace the hover
+    /// close control with a clickable pin badge, while keeping the same
+    /// click-to-select and right-click menu behavior as normal tabs.
+    #[allow(clippy::too_many_arguments)]
+    fn rail_tab_row(
+        &self,
+        ui: &mut Ui,
+        tab: &TabInfo,
+        state: &ChromeState,
+        actions: &mut Vec<UiAction>,
+        tooltip: &mut Option<RailTooltip>,
+        menu_request: &mut Option<(u64, egui::Pos2)>,
+        rail_rect: egui::Rect,
+        palette: &ChromePalette,
+        width: f32,
+        expanded: bool,
+    ) {
+        let tab_id = tab.id;
+        let is_active = state.active_tab_id == Some(tab_id);
+        let row_height = if tab.is_pinned {
+            if expanded {
+                28.0
+            } else {
+                36.0
+            }
+        } else if expanded {
+            36.0
+        } else {
+            44.0
+        };
+        let horizontal_inset = if expanded { 12.0 } else { 6.0 };
+        let (row_rect, row_resp) =
+            ui.allocate_exact_size(vec2(width - horizontal_inset, row_height), Sense::click());
+
+        Self::paint_tab_row(ui, row_rect, is_active, row_resp.hovered(), palette);
+
+        let icon_size = if tab.is_pinned {
+            if expanded {
+                16.0
+            } else {
+                20.0
+            }
+        } else if expanded {
+            20.0
+        } else {
+            24.0
+        };
+        let icon_rect = if expanded {
+            egui::Rect::from_min_size(
+                pos2(row_rect.min.x + 8.0, row_rect.center().y - icon_size * 0.5),
+                vec2(icon_size, icon_size),
+            )
+        } else {
+            egui::Rect::from_center_size(row_rect.center(), vec2(icon_size, icon_size))
+        };
+        self.paint_favicon_in_rect(ui, tab, icon_rect, palette);
+
+        if expanded {
+            let title = if tab.title.is_empty() {
+                "New Tab".to_string()
+            } else {
+                truncate_title(&tab.title, if tab.is_pinned { 13 } else { 18 })
+            };
+            let text_color = if is_active {
+                palette.text_strong
+            } else {
+                palette.text
+            };
+            ui.painter().text(
+                pos2(
+                    row_rect.min.x + if tab.is_pinned { 30.0 } else { 34.0 },
+                    row_rect.center().y,
+                ),
+                Align2::LEFT_CENTER,
+                title,
+                FontId::new(
+                    if tab.is_pinned { 11.0 } else { 12.0 },
+                    FontFamily::Proportional,
+                ),
+                text_color,
+            );
+        }
+
+        let mut close_resp = None;
+        let mut pin_resp = None;
+        if tab.is_pinned {
+            let size = if expanded { 14.0 } else { 12.0 };
+            let badge_rect = egui::Rect::from_center_size(
+                tab_close_center(row_rect, expanded),
+                vec2(size, size),
+            );
+            let response = ui.interact(
+                badge_rect,
+                egui::Id::new(("kasumi_tab_pin", tab_id, expanded)),
+                Sense::click(),
+            );
+            paint_rail_icon(
+                ui,
+                badge_rect.shrink(1.0),
+                RailIcon::Pin,
+                palette.rail_accent,
+            );
+            Self::chrome_tooltip(
+                tooltip,
+                ui,
+                &response,
+                format!("Unpin tab: {}", tab.title),
+                expanded,
+            );
+            pin_resp = Some(response);
+        } else {
+            let response =
+                Self::paint_tab_close(ui, row_rect, row_resp.hovered(), tab_id, expanded, palette);
+            Self::chrome_tooltip(
+                tooltip,
+                ui,
+                &response,
+                format!("Close tab: {}", tab.title),
+                expanded,
+            );
+            close_resp = Some(response);
+        }
+
+        Self::paint_tab_status(
+            ui,
+            row_rect,
+            tab,
+            tab.is_pinned
+                || row_resp.hovered()
+                || close_resp
+                    .as_ref()
+                    .is_some_and(|response| response.hovered()),
+            palette,
+        );
+
+        if pin_resp.as_ref().is_some_and(|response| response.clicked()) {
+            actions.push(UiAction::TogglePinTab { tab_id });
+        } else if close_resp
+            .as_ref()
+            .is_some_and(|response| response.clicked())
+        {
+            actions.push(UiAction::CloseTab { tab_id });
+        } else if row_resp.clicked() {
+            actions.push(UiAction::SelectTab { tab_id });
+        }
+        if !tab.is_pinned && row_resp.middle_clicked() {
+            actions.push(UiAction::CloseTab { tab_id });
+        }
+        if row_resp.secondary_clicked() {
+            let pointer = ui
+                .ctx()
+                .pointer_latest_pos()
+                .unwrap_or(row_rect.right_top());
+            let (menu_width, menu_height) = rail_menu_metrics();
+            let anchor = rail_menu_anchor(
+                rail_rect,
+                pointer,
+                ui.ctx().screen_rect(),
+                menu_width,
+                menu_height,
+            );
+            *menu_request = Some((tab_id, anchor));
+        }
+
+        let label = if tab.is_pinned {
+            format!("Pinned · {}", tab.title)
+        } else {
+            tab.title.clone()
+        };
+        let tooltip_text = if expanded {
+            format!("{}\n{}", label, tab.url)
+        } else {
+            label
+        };
+        Self::chrome_tooltip(tooltip, ui, &row_resp, tooltip_text, expanded);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2494,7 +2593,7 @@ impl TooltipRenderer {
 fn paint_rail_icon(ui: &Ui, rect: egui::Rect, icon: RailIcon, color: Color32) {
     use egui_material_icons::icons::{
         ICON_ADD, ICON_BEDTIME, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_CODE,
-        ICON_MEMORY, ICON_PUBLIC, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD,
+        ICON_MEMORY, ICON_PIN, ICON_PUBLIC, ICON_PUSH_PIN, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD,
     };
 
     let glyph = match icon {
@@ -2508,6 +2607,8 @@ fn paint_rail_icon(ui: &Ui, rect: egui::Rect, icon: RailIcon, color: Color32) {
         RailIcon::Chip => ICON_MEMORY,
         RailIcon::Globe => ICON_PUBLIC,
         RailIcon::Close => ICON_CLOSE,
+        RailIcon::Pin => ICON_PUSH_PIN,
+        RailIcon::PinOff => ICON_PIN,
         RailIcon::Settings => ICON_SETTINGS,
     };
 
@@ -2543,7 +2644,7 @@ pub fn rail_tooltip_metrics(expanded: bool) -> (f32, f32) {
 
 /// Fixed card size for the rail tab context menu.
 pub fn rail_menu_metrics() -> (f32, f32) {
-    const ITEM_COUNT: usize = 9;
+    const ITEM_COUNT: usize = 10;
     (
         RAIL_MENU_WIDTH,
         ITEM_COUNT as f32 * RAIL_MENU_ROW_HEIGHT + RAIL_MENU_PADDING * 2.0,
@@ -2581,6 +2682,12 @@ pub fn rail_menu_click_outside(
 pub fn rail_menu_items(state: &ChromeState, tab_id: u64) -> Vec<RailMenuItem> {
     let index = state.tabs.iter().position(|tab| tab.id == tab_id);
     let tab_count = state.tabs.len();
+    let is_pinned = state
+        .tabs
+        .iter()
+        .find(|tab| tab.id == tab_id)
+        .is_some_and(|tab| tab.is_pinned);
+    let pin_label = if is_pinned { "Unpin tab" } else { "Pin tab" };
     let item = |label, action, enabled| RailMenuItem {
         label,
         action,
@@ -2589,6 +2696,7 @@ pub fn rail_menu_items(state: &ChromeState, tab_id: u64) -> Vec<RailMenuItem> {
     vec![
         item("New tab", RailMenuAction::NewTab, true),
         item("Duplicate tab", RailMenuAction::DuplicateTab, true),
+        item(pin_label, RailMenuAction::TogglePinTab, true),
         item("Copy URL", RailMenuAction::CopyUrl, true),
         item("Reload tab", RailMenuAction::Reload, true),
         item("Close tab", RailMenuAction::CloseTab, true),
@@ -2617,6 +2725,7 @@ pub fn rail_menu_ui_action(action: RailMenuAction, tab_id: u64) -> Option<UiActi
     match action {
         RailMenuAction::NewTab => Some(UiAction::NewTab { url: None }),
         RailMenuAction::DuplicateTab => Some(UiAction::DuplicateTab { tab_id }),
+        RailMenuAction::TogglePinTab => Some(UiAction::TogglePinTab { tab_id }),
         RailMenuAction::CopyUrl => None,
         RailMenuAction::Reload => Some(UiAction::Reload {
             tab_id,
@@ -2790,7 +2899,9 @@ pub fn command_palette_items(
     let mut items = Vec::new();
 
     let tab_item = |tab: &TabInfo| CommandPaletteItem {
-        icon: if tab.display_state == TabDisplayState::Hibernated {
+        icon: if tab.is_pinned {
+            "📌"
+        } else if tab.display_state == TabDisplayState::Hibernated {
             "💤"
         } else {
             "◧"
@@ -2804,6 +2915,26 @@ pub fn command_palette_items(
         action: CommandAction::SelectTab(tab.id),
     };
 
+    let pin_item = || {
+        active_tab_id.map(|tab_id| {
+            let is_pinned = tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .is_some_and(|tab| tab.is_pinned);
+            CommandPaletteItem {
+                icon: "📌",
+                label: if is_pinned {
+                    "Unpin active tab"
+                } else {
+                    "Pin active tab"
+                }
+                .to_string(),
+                subtitle: "Keep this tab in the compact pinned section".to_string(),
+                action: CommandAction::TogglePinTab(tab_id),
+            }
+        })
+    };
+
     if trimmed.is_empty() {
         items.push(CommandPaletteItem {
             icon: "＋",
@@ -2811,6 +2942,9 @@ pub fn command_palette_items(
             subtitle: "Open a fresh tab".to_string(),
             action: CommandAction::NewTab(None),
         });
+        if let Some(item) = pin_item() {
+            items.push(item);
+        }
         items.push(CommandPaletteItem {
             icon: "💤",
             label: "Hibernate all background tabs".to_string(),
@@ -2898,6 +3032,12 @@ pub fn command_palette_items(
         });
     }
 
+    if needle.contains("pin") {
+        if let Some(item) = pin_item() {
+            items.push(item);
+        }
+    }
+
     items
 }
 
@@ -2913,6 +3053,9 @@ fn apply_command_item(
             tab_id: *tab_id,
             url: url.clone(),
         }),
+        CommandAction::TogglePinTab(tab_id) => {
+            actions.push(UiAction::TogglePinTab { tab_id: *tab_id })
+        }
         CommandAction::HibernateAll => actions.push(UiAction::HibernateAllBackground),
         CommandAction::ToggleRail => state.toggle_rail(),
         CommandAction::OpenDevTools => {
@@ -3017,6 +3160,7 @@ mod tests {
             blocked_requests: 0,
             can_go_back: false,
             can_go_forward: false,
+            is_pinned: false,
             favicon: None,
         }
     }
@@ -3325,10 +3469,11 @@ mod tests {
             &prefs,
         );
         assert_eq!(items[0].action, CommandAction::NewTab(None));
-        assert_eq!(items[1].action, CommandAction::HibernateAll);
-        assert_eq!(items[2].action, CommandAction::ToggleRail);
-        assert_eq!(items[3].action, CommandAction::OpenSettings);
-        assert_eq!(items[4].action, CommandAction::SelectTab(1));
+        assert_eq!(items[1].action, CommandAction::TogglePinTab(1));
+        assert_eq!(items[2].action, CommandAction::HibernateAll);
+        assert_eq!(items[3].action, CommandAction::ToggleRail);
+        assert_eq!(items[4].action, CommandAction::OpenSettings);
+        assert_eq!(items[5].action, CommandAction::SelectTab(1));
     }
 
     #[test]
@@ -3575,7 +3720,7 @@ mod tests {
     fn tab_menu_metrics_and_anchor_stay_beside_rail() {
         let (width, height) = rail_menu_metrics();
         assert_eq!(width, 224.0);
-        assert_eq!(height, 9.0 * 28.0 + 14.0);
+        assert_eq!(height, 10.0 * 28.0 + 14.0);
 
         let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(180.0, 800.0));
         let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
@@ -3591,7 +3736,7 @@ mod tests {
 
     #[test]
     fn tab_menu_click_outside_ignores_missing_pointer_and_inside_clicks() {
-        let card = egui::Rect::from_min_size(pos2(188.0, 92.0), vec2(224.0, 238.0));
+        let card = egui::Rect::from_min_size(pos2(188.0, 92.0), vec2(224.0, 294.0));
         assert!(rail_menu_click_outside(
             card,
             Some(pos2(100.0, 200.0)),
@@ -3621,10 +3766,20 @@ mod tests {
         state.tabs = vec![tab(1, "First", "https://first.example")];
 
         let items = rail_menu_items(&state, 1);
-        assert_eq!(items.len(), 9);
+        assert_eq!(items.len(), 10);
         assert!(items
             .iter()
             .any(|item| item.action == RailMenuAction::NewTab && item.enabled));
+        assert!(items
+            .iter()
+            .any(|item| item.action == RailMenuAction::TogglePinTab && item.enabled));
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.action == RailMenuAction::TogglePinTab)
+                .map(|item| item.label),
+            Some("Pin tab")
+        );
         assert!(items
             .iter()
             .any(|item| item.action == RailMenuAction::CopyUrl && item.enabled));
@@ -3669,6 +3824,46 @@ mod tests {
     }
 
     #[test]
+    fn tab_menu_offers_unpin_for_pinned_tabs() {
+        let mut state = ChromeState::default();
+        let mut pinned = tab(1, "Pinned", "https://pinned.example");
+        pinned.is_pinned = true;
+        state.tabs = vec![pinned];
+
+        let items = rail_menu_items(&state, 1);
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.action == RailMenuAction::TogglePinTab)
+                .map(|item| item.label),
+            Some("Unpin tab")
+        );
+    }
+
+    #[test]
+    fn palette_pin_action_toggles_the_active_tab() {
+        let mut state = ChromeState::default();
+        let mut actions = Vec::new();
+        apply_command_item(&CommandAction::TogglePinTab(7), &mut state, &mut actions);
+
+        assert_eq!(actions, vec![UiAction::TogglePinTab { tab_id: 7 }]);
+        assert!(!state.command_palette_open);
+    }
+
+    #[test]
+    fn palette_offer_pin_action_for_pin_query() {
+        let items = command_palette_items(
+            "pin",
+            &[tab(1, "Rust", "https://rust-lang.org")],
+            Some(1),
+            &BrowserPreferences::default(),
+        );
+        assert!(items.iter().any(|item| {
+            item.action == CommandAction::TogglePinTab(1) && item.label == "Pin active tab"
+        }));
+    }
+
+    #[test]
     fn tab_menu_actions_map_to_tab_manager_commands() {
         assert_eq!(
             rail_menu_ui_action(RailMenuAction::NewTab, 3),
@@ -3677,6 +3872,10 @@ mod tests {
         assert_eq!(
             rail_menu_ui_action(RailMenuAction::DuplicateTab, 3),
             Some(UiAction::DuplicateTab { tab_id: 3 })
+        );
+        assert_eq!(
+            rail_menu_ui_action(RailMenuAction::TogglePinTab, 3),
+            Some(UiAction::TogglePinTab { tab_id: 3 })
         );
         assert_eq!(rail_menu_ui_action(RailMenuAction::CopyUrl, 3), None);
         assert_eq!(

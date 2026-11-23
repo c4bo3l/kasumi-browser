@@ -23,6 +23,7 @@ pub struct SessionTabSnapshot {
     pub title: String,
     pub is_active: bool,
     pub is_hibernated: bool,
+    pub is_pinned: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +102,27 @@ impl StorageManager {
 
         let conn = Connection::open(db_path)?;
         conn.execute_batch(include_str!("schema.sql"))?;
+
+        // `CREATE TABLE IF NOT EXISTS` does not update databases created by
+        // older releases, so add the pin column in place when needed.
+        let has_is_pinned = {
+            let mut stmt = conn.prepare("PRAGMA table_info(session_tabs)")?;
+            let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for column in columns {
+                if column? == "is_pinned" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_is_pinned {
+            conn.execute_batch(
+                "ALTER TABLE session_tabs ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+
         Ok(conn)
     }
 
@@ -108,7 +130,8 @@ impl StorageManager {
     pub fn load_session(db_path: &Path) -> Result<Vec<SessionTabSnapshot>, rusqlite::Error> {
         let conn = Self::init_db(db_path)?;
         let mut stmt = conn.prepare(
-            "SELECT url, title, is_active, is_hibernated FROM session_tabs ORDER BY tab_index ASC",
+            "SELECT url, title, is_active, is_hibernated, is_pinned
+             FROM session_tabs ORDER BY tab_index ASC",
         )?;
 
         let rows = stmt.query_map([], |row| {
@@ -117,6 +140,7 @@ impl StorageManager {
                 title: row.get(1)?,
                 is_active: row.get::<_, i32>(2)? != 0,
                 is_hibernated: row.get::<_, i32>(3)? != 0,
+                is_pinned: row.get::<_, i32>(4)? != 0,
             })
         })?;
 
@@ -239,14 +263,16 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
 
             for (idx, tab) in tabs.iter().enumerate() {
                 let _ = tx.execute(
-                    "INSERT INTO session_tabs (tab_index, url, title, is_active, is_hibernated)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO session_tabs
+                     (tab_index, url, title, is_active, is_hibernated, is_pinned)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         idx as i64,
                         tab.url,
                         tab.title,
                         if tab.is_active { 1 } else { 0 },
                         if tab.is_hibernated { 1 } else { 0 },
+                        if tab.is_pinned { 1 } else { 0 },
                     ],
                 );
             }
@@ -371,6 +397,34 @@ mod tests {
     }
 
     #[test]
+    fn init_db_migrates_legacy_session_tabs_with_pinned_column() {
+        let path = test_db_path("session-migration");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("legacy database");
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE session_tabs (
+                     tab_index INTEGER PRIMARY KEY,
+                     url TEXT NOT NULL,
+                     title TEXT NOT NULL DEFAULT '',
+                     is_active INTEGER NOT NULL DEFAULT 0,
+                     is_hibernated INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO session_tabs (tab_index, url, title, is_active, is_hibernated)
+                 VALUES (0, 'https://legacy.example', 'Legacy', 1, 0);",
+            )
+            .expect("legacy schema");
+        }
+
+        let snapshots = StorageManager::load_session(&path).expect("migrated session load");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].url, "https://legacy.example");
+        assert!(!snapshots[0].is_pinned);
+
+        remove_test_db(&path);
+    }
+
+    #[test]
     fn session_saves_and_loads_flags_in_order() {
         let (path, mut conn) = fresh_db("session");
         assert!(StorageManager::load_session(&path)
@@ -386,12 +440,14 @@ mod tests {
                         title: "Active".to_string(),
                         is_active: true,
                         is_hibernated: false,
+                        is_pinned: true,
                     },
                     SessionTabSnapshot {
                         url: "view-source:https://example.com".to_string(),
                         title: "Source".to_string(),
                         is_active: false,
                         is_hibernated: true,
+                        is_pinned: false,
                     },
                 ],
             },
@@ -402,9 +458,11 @@ mod tests {
         assert_eq!(snapshots[0].url, "https://active.example");
         assert!(snapshots[0].is_active);
         assert!(!snapshots[0].is_hibernated);
+        assert!(snapshots[0].is_pinned);
         assert_eq!(snapshots[1].url, "view-source:https://example.com");
         assert!(!snapshots[1].is_active);
         assert!(snapshots[1].is_hibernated);
+        assert!(!snapshots[1].is_pinned);
 
         apply_command(
             &mut conn,
@@ -414,6 +472,7 @@ mod tests {
                     title: "Only".to_string(),
                     is_active: true,
                     is_hibernated: false,
+                    is_pinned: false,
                 }],
             },
         );
