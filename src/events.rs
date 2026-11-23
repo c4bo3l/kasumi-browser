@@ -33,13 +33,12 @@ pub enum BrowserEvent {
     NewWindow {
         url: String,
     },
-    /// F12 was pressed while the CEF web view had focus.
-    OpenDevTools {
+    /// A browser shortcut was pressed while the CEF web view had focus. It is
+    /// forwarded here because child web views do not propagate key events to
+    /// the native winit parent window.
+    BrowserShortcut {
         tab_id: u64,
-    },
-    /// Cmd/Ctrl+K was pressed while the CEF web view had focus.
-    OpenCommandPalette {
-        tab_id: u64,
+        shortcut: BrowserShortcut,
     },
     /// Context menu "View page source" was selected.
     ViewSource {
@@ -63,6 +62,16 @@ pub enum BrowserEvent {
         tab_id: u64,
         browser: cef::Browser,
     },
+}
+
+/// Native browser shortcuts mirrored from CEF's `on_pre_key_event`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserShortcut {
+    NewTab,
+    CloseTab,
+    ReopenClosedTab,
+    OpenCommandPalette,
+    OpenDevTools,
 }
 
 impl std::fmt::Debug for BrowserEvent {
@@ -104,13 +113,10 @@ impl std::fmt::Debug for BrowserEvent {
                 .field("tab_id", tab_id)
                 .finish(),
             Self::NewWindow { url } => f.debug_struct("NewWindow").field("url", url).finish(),
-            Self::OpenDevTools { tab_id } => f
-                .debug_struct("OpenDevTools")
+            Self::BrowserShortcut { tab_id, shortcut } => f
+                .debug_struct("BrowserShortcut")
                 .field("tab_id", tab_id)
-                .finish(),
-            Self::OpenCommandPalette { tab_id } => f
-                .debug_struct("OpenCommandPalette")
-                .field("tab_id", tab_id)
+                .field("shortcut", shortcut)
                 .finish(),
             Self::ViewSource { tab_id, url } => f
                 .debug_struct("ViewSource")
@@ -145,10 +151,14 @@ impl std::fmt::Debug for BrowserEvent {
 }
 
 /// Actions initiated by the native Rust UI or keyboard shortcuts, dispatched to TabManager
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiAction {
     NewTab { url: Option<String> },
+    ReopenClosedTab,
     CloseTab { tab_id: u64 },
+    CloseOtherTabs { tab_id: u64 },
+    CloseTabsToRight { tab_id: u64 },
+    DuplicateTab { tab_id: u64 },
     SelectTab { tab_id: u64 },
     Navigate { tab_id: u64, url: String },
     GoBack { tab_id: u64 },

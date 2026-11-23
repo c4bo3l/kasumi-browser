@@ -14,7 +14,7 @@ Release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ## ✅ What Has Been Done
 
-Current version: **0.2.0**. A version bump is released when a PR is merged into `main`; PRs include the bump in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, `README.md`, `RELEASE_NOTES.md`, and `Cargo.lock` so CI checks the exact release state, as required by `AGENTS.md`.
+Current version: **0.3.0**. A version bump is released when a PR is merged into `main`; PRs include the bump in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, `README.md`, `RELEASE_NOTES.md`, and `Cargo.lock` so CI checks the exact release state, as required by `AGENTS.md`.
 
 - Renamed the project from LiteBrowser to **Kasumi Browser** everywhere: package, binary, CEF helper, bundle ID, window title, database path, and docs.
 - Implemented the CEF subprocess fork trap and `mimalloc` global allocator.
@@ -25,7 +25,13 @@ Current version: **0.2.0**. A version bump is released when a PR is merged into 
 - Added the `sysinfo` RAM watchdog with normal, pressure, and critical hibernation thresholds.
 - Integrated `adblock-rust` request interception with built-in starter rules plus optional EasyList/EasyPrivacy files.
 - Added SQLite WAL persistence for history, bookmarks, and session tabs, with low-RAM startup restore (only the active tab is spawned live).
-- Wired keyboard shortcuts: `Ctrl/Cmd+T`, `Ctrl/Cmd+W`, `Ctrl/Cmd+K`/`Ctrl/Cmd+L`, `Ctrl/Cmd+Shift+T`, `Alt+H`, and `F12`.
+- Wired keyboard shortcuts: `Ctrl/Cmd+T`, `Ctrl/Cmd+W`, `Ctrl/Cmd+K`/`Ctrl/Cmd+L`, `Ctrl/Cmd+Shift+T`, `Ctrl/Cmd+Z`, `Alt+H`, and `F12`. Browser shortcuts are also forwarded from the CEF child view so they keep working while a page has focus.
+- Added a native rail tab context menu with duplicate, copy URL, reload, close, close others, close tabs below, reopen-closed-tab, and DevTools actions.
+- `F12`, the rail **DevTools** button, the tab context menu, and the command palette all open Chromium DevTools in a separate window.
+- Closed tabs now retain their title and original position, so `Cmd/Ctrl+Z` and `Cmd/Ctrl+Shift+T` restore them where they were.
+- Browser creation is deferred out of window-event callbacks and blank initial frames are retried with escalating delays, so new and restored tabs reliably load their page on all platforms. Fallback favicon downloads wait for a committed URL, and main-frame navigations are never cancelled by the ad blocker.
+- Rail tooltips appear only in collapsed mode, where they serve as labels for icon-only buttons. Expanded rail buttons all render visible text labels, and tooltips clear immediately when the pointer leaves the rail or enters the CEF child view.
+- Fixed the macOS shutdown reentrancy abort: `cef::shutdown()` now runs from a one-shot CFRunLoop observer after the winit event handler returns, while run-loop observers are still alive.
 - Fixed the macOS CEF/winit reentrancy crash: CEF is pumped from a main-thread `CFRunLoop` timer, never from a `window_event` handler, and reentrant `about_to_wait` ticks are ignored.
 - Fixed macOS shutdown ordering: browsers and WAL are flushed in `about_to_wait`, the pump timer is disabled, and `cef::shutdown()` runs while winit's run-loop observers still exist.
 - Fixed `do_close` to return `1` so CEF actually destroys browsers and fires `on_before_close`.
@@ -36,8 +42,8 @@ Current version: **0.2.0**. A version bump is released when a PR is merged into 
 - Added `RELEASE_NOTES.md` as the canonical record of shipped changes.
 - Published the source as a public GitHub repository.
 - Fixed the original chrome UX/navigation feedback items: Back/Forward icon states, omnibox URL synchronization, F12 DevTools, view-source navigation, favicons, and hover tooltips.
-- Added 56 unit tests covering omnibox resolution, rail/palette geometry, tooltip centering, hibernation thresholds, adblock mapping, storage, and CEF switch invariants.
-- Verified with `cargo fmt --all -- --check`, `cargo check --bins`, `cargo test --bin kasumi-browser` (56 tests), `cargo build --release`, and interactive macOS test runs with clean shutdown.
+- Added 74 unit tests covering omnibox resolution, rail/palette/menu geometry, context-menu actions, closed-tab metadata, initial-navigation recovery, tooltip pointer-exit handling, collapsed-only tooltip behavior, web-view shortcut forwarding, light/dark palette contrast, hibernation thresholds, adblock mapping, storage, and CEF switch invariants.
+- Verified with `cargo fmt --all -- --check`, `cargo check --bins`, `cargo test --bin kasumi-browser` (74 tests), and `cargo build --release`. Interactive macOS verification is performed before each release push.
 - Removed the obsolete `BUGFIX_TASKS.md` handoff; its completed items are recorded in `RELEASE_NOTES.md`.
 
 ---
@@ -67,10 +73,14 @@ Current version: **0.2.0**. A version bump is released when a PR is merged into 
 
 Kasumi uses a minimalist vertical layout instead of a Chrome-style top tab strip:
 
-- The workspace rail starts expanded at **180 px** with tabs, New tab, Command, Hibernate, blocked-request count, and RAM usage. The `«` button collapses it to a **44 px favicon-only rail** that keeps tab count, active state, and click-to-switch available without text.
+- The workspace rail starts expanded at **180 px** with tabs, New tab, Command, DevTools, Hibernate, blocked-request count, and RAM usage. The `«` button collapses it to a **44 px favicon-only rail** that keeps tab count, active state, and click-to-switch available without text.
 - A floating **Cmd/Ctrl+K command palette** replaces the traditional visible URL bar. It searches open tabs, resolves domains/searches, and exposes quick actions. It opens in a transparent always-on-top overlay so the page stays visible behind it, focuses its input immediately, and closes when you click outside the palette card.
 - CEF content lives to the right of the rail and fills the full window height. Rail tooltips appear in a transparent, click-through overlay, vertically centered beside the hovered row, so the page stays visible and remains interactive.
-- Rail controls use Material Symbols icons for crisp, consistent glyphs at every DPI. Tooltips work in both rail modes with high-contrast text; each tab shows a hover-only **×** close button (right side when expanded, top-right when collapsed).
+- Right-clicking a rail tab opens a native context menu in the same transparent overlay used by the palette. It stays above the page without dimming it, supports `↑`/`↓`/`Enter`/`Esc`, and closes on a primary click anywhere outside the card.
+- Rail controls use Material Symbols icons for crisp, consistent glyphs at every DPI. Expanded controls have visible labels; tooltips are reserved for the collapsed icon rail. Each tab shows a hover-only **×** close button (right side when expanded, top-right when collapsed).
+- The rail, command palette, context menus, and tooltips follow the OS light/dark appearance automatically. System theme changes apply live without restarting the browser, and web pages receive the same system color preference from Chromium.
+
+`F12` opens Chromium DevTools for the active tab in its own window.
 
 ---
 
@@ -83,9 +93,10 @@ Kasumi uses a minimalist vertical layout instead of a Chrome-style top tab strip
 | `Ctrl / Cmd + K` | Open the floating command palette |
 | `Ctrl / Cmd + L` | Open the command palette seeded with the active URL |
 | `Ctrl / Cmd + Shift + T` | Re-open last closed tab |
+| `Ctrl / Cmd + Z` | Undo the last tab close and restore its position |
 | `Alt + H` | Hibernate all background tabs immediately |
-| `F12` | Open Chromium DevTools for the active tab |
-| `↑` / `↓`, `Enter`, `Esc` (in palette) | Select, run, or close a command |
+| `F12` | Open Chromium DevTools for the active tab in a new window |
+| `↑` / `↓`, `Enter`, `Esc` (in palette or tab menu) | Select, run, or close a command |
 | `Enter` (in palette) | Navigate to URL, domain (auto-prefixes `https://`), or DuckDuckGo search |
 
 ---
@@ -117,7 +128,7 @@ kasumi-browser/
     └── ui/
         ├── mod.rs
         ├── platform_view.rs      # Cross-platform child window show/hide/resize
-        └── chrome.rs             # egui + wgpu vertical rail and command palette
+        └── chrome.rs             # egui + wgpu vertical rail, command palette, and tab menu
 ```
 
 ---
@@ -262,9 +273,8 @@ sha256sum kasumi-browser.tar.gz > kasumi-browser.tar.gz.sha256
 
 ## 🚧 Future Development
 
-- **Theme awareness:** the chrome currently uses a fixed dark style and does not follow the OS light/dark setting.
 - **Windows and Linux testing:** native child-view code exists for `HWND` and `X11`, but full interactive verification is still needed on those platforms.
-- **More integration tests:** unit coverage is in place for omnibox resolution, rail/palette geometry, tooltips, hibernation thresholds, adblock mapping, storage, and CEF switches; automated end-to-end browser tests are still future work.
+- **More integration tests:** unit coverage is in place for omnibox resolution, rail/palette/menu geometry, closed-tab restoration metadata, tooltips, hibernation thresholds, adblock mapping, storage, and CEF switches; automated end-to-end browser tests are still future work.
 - **Packaged-app verification:** macOS, Windows, and Linux release artifacts still need interactive testing after signing/bundling.
 
 ---

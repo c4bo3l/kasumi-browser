@@ -4,6 +4,47 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
+## v0.3.0 — 2026-11-23
+
+### Added
+
+- Native tab context menu on rail rows in both expanded and favicon-only modes. It offers New tab, Duplicate tab, Copy URL, Reload tab, Close tab, Close other tabs, Close tabs below this tab, Reopen closed tab, and DevTools.
+- The context menu renders in the existing transparent, always-on-top overlay above the CEF page. It does not dim the page, supports `↑`/`↓`/`Enter`/`Esc`, and dismisses on a primary click outside the card.
+- `Cmd/Ctrl+Z` now undoes the last tab close, matching `Cmd/Ctrl+Shift+T`. Repeated presses restore earlier closed tabs in reverse-close order.
+- The native rail, command palette, context menus, and tooltips now follow the OS light/dark appearance. Theme changes apply live without a restart, and the startup frame uses the current system theme.
+
+### Changed
+
+- Closed tabs now retain their title and original rail index, so restored tabs return to their previous position instead of always opening at the end.
+- Duplicate tab now inserts the copy immediately to the right of the original tab.
+- The command-palette overlay renderer is shared with the tab menu; opening one now explicitly closes the other.
+- The tab context-menu command is now labeled "Close tabs below this tab" instead of the ambiguous "Close tabs to right".
+- `F12` opens Chromium DevTools in its own window.
+- Bumped the project and macOS bundle version from `0.2.0` to `0.3.0`.
+
+### Fixed
+
+- Context-menu row highlighting now uses the exact clickable row rect. Nested egui child widgets were registering their own hover areas and stealing pointer hover from the row, which made highlights appear only near the top edge.
+- New and restored tabs now load reliably. CEF browser creation is queued from `focus_tab` and drained from `about_to_wait` instead of running inside a winit window-event callback, where macOS CEF's external pump could intermittently drop the initial navigation.
+- If a browser still has an empty or `about:blank` main frame after creation, the tab's target URL is reissued with escalating delays (750 ms, 1.5 s, 3 s). A committed navigation cancels the retries, so healthy pages are not loaded twice.
+- Fallback favicon downloads no longer start in `OnAfterCreated`. They wait until a real URL commits, avoiding a Chromium loader race that could intermittently leave new tabs blank.
+- Rail tooltips now clear when the pointer leaves the rail or enters the CEF child view, so they no longer remain visible after the cursor moves away.
+- Tooltips are limited to the collapsed rail, where they label icon-only buttons. Expanded rail buttons now all render visible text labels, including the collapse control.
+- Fixed repeated `Cmd/Ctrl+T` (and the other shell shortcuts) after a web view gains focus. CEF now forwards `Cmd/Ctrl+T`, `Cmd/Ctrl+W`, `Cmd/Ctrl+K`/`Cmd/Ctrl+L`, `Cmd/Ctrl+Shift+T`, `Cmd/Ctrl+Z`, and `F12` to the native tab manager instead of trapping them in the child view.
+- Fixed a macOS shutdown abort (`tried to handle event while another event is currently being handled`): `cef::shutdown()` now runs from a one-shot CFRunLoop observer after the winit event handler returns, while winit's run-loop observers remain alive.
+- The ad blocker no longer cancels main-frame navigations; only subresources are filtered, preventing filter rules from breaking a page load.
+- Reverted the experimental DevTools docking work; CEF 156/macOS native-parent docking proved unstable, and DevTools now consistently opens in a separate window.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser` — 74 tests, including context-menu geometry/actions/enabled states, closed-tab metadata and restore-index clamping, initial-navigation recovery, tooltip pointer-exit handling, collapsed-only tooltip behavior, web-view shortcut forwarding, main-frame adblock exemption, `Cmd/Ctrl+Z` shortcut modifier rules, light/dark palette contrast, and palette/menu mutual exclusion.
+- `cargo build --release`
+- Manual runtime verification confirmed on macOS: `F12` opens Chromium DevTools in a separate window; dark and light system appearances switch the native chrome live; normal tab switching, resize, and quit behaved as expected.
+
+---
+
 ## v0.2.0 — 2026-11-23
 
 ### Added
@@ -225,7 +266,6 @@ Initial public source release: [github.com/c4bo3l/kasumi-browser](https://github
 ## Future development
 
 - Vertical tabs
-- Theme awareness / OS light-dark following
 - Full Windows and Linux validation
 - More unit tests
 - Settings UI

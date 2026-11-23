@@ -1,4 +1,4 @@
-use crate::events::BrowserEvent;
+use crate::events::{BrowserEvent, BrowserShortcut};
 use cef::*;
 use crossbeam_channel::Sender;
 
@@ -181,15 +181,55 @@ wrap_display_handler! {
     }
 }
 
-/// CEF event flags for Ctrl and Cmd on all platforms.
+/// CEF event flags. Values come from `cef_event_flags_t`.
+const SHIFT_MODIFIER_FLAG: u32 = 2;
 const PRIMARY_MODIFIER_FLAGS: u32 = 4 | 128; // EVENTFLAG_CONTROL_DOWN | EVENTFLAG_COMMAND_DOWN
+const ALT_MODIFIER_FLAG: u32 = 8;
+const REPEAT_EVENT_FLAG: u32 = 8_192;
 
-/// VK_K, using CEF's platform-independent Windows virtual key codes.
+/// Virtual key codes, using CEF's platform-independent Windows key codes.
 const VK_K: i32 = 0x4B;
+const VK_L: i32 = 0x4C;
+const VK_T: i32 = 0x54;
+const VK_W: i32 = 0x57;
+const VK_Z: i32 = 0x5A;
+const VK_F12: i32 = 0x7B;
 
-/// Return true for a Cmd/Ctrl+K key-down forwarded from the web view.
-pub(crate) fn is_command_palette_key(key_down: bool, key_code: i32, modifiers: u32) -> bool {
-    key_down && key_code == VK_K && modifiers & PRIMARY_MODIFIER_FLAGS != 0
+/// Classify a key event forwarded from the CEF web view.
+///
+/// Native child views do not deliver key events to the winit parent, so the
+/// browser has to mirror the shell shortcuts itself. Keeping the mapping in a
+/// pure helper makes the cross-platform behavior unit-testable.
+pub(crate) fn browser_shortcut(
+    key_down: bool,
+    key_code: i32,
+    modifiers: u32,
+) -> Option<BrowserShortcut> {
+    let is_repeat = modifiers & REPEAT_EVENT_FLAG != 0;
+    if !key_down || is_repeat {
+        return None;
+    }
+
+    let primary = modifiers & PRIMARY_MODIFIER_FLAGS != 0;
+    let shift = modifiers & SHIFT_MODIFIER_FLAG != 0;
+    let alt = modifiers & ALT_MODIFIER_FLAG != 0;
+
+    if key_code == VK_F12 {
+        return Some(BrowserShortcut::OpenDevTools);
+    }
+
+    if !primary || alt {
+        return None;
+    }
+
+    match key_code {
+        VK_T if shift => Some(BrowserShortcut::ReopenClosedTab),
+        VK_T => Some(BrowserShortcut::NewTab),
+        VK_W if !shift => Some(BrowserShortcut::CloseTab),
+        VK_L | VK_K if !shift => Some(BrowserShortcut::OpenCommandPalette),
+        VK_Z if !shift => Some(BrowserShortcut::ReopenClosedTab),
+        _ => None,
+    }
 }
 
 wrap_keyboard_handler! {
@@ -209,22 +249,12 @@ wrap_keyboard_handler! {
             if let Some(event) = event {
                 let is_key_down = event.type_ == KeyEventType::KEYDOWN
                     || event.type_ == KeyEventType::RAWKEYDOWN;
-                // CEF uses Windows virtual key codes on every platform.
-                // VK_F12 = 0x7B.
-                if is_key_down && event.windows_key_code == 0x7B {
-                    let _ = self.event_sender.send(BrowserEvent::OpenDevTools {
+                if let Some(shortcut) =
+                    browser_shortcut(is_key_down, event.windows_key_code, event.modifiers)
+                {
+                    let _ = self.event_sender.send(BrowserEvent::BrowserShortcut {
                         tab_id: self.tab_id,
-                    });
-                    return 1;
-                }
-
-                if is_command_palette_key(
-                    is_key_down,
-                    event.windows_key_code,
-                    event.modifiers,
-                ) {
-                    let _ = self.event_sender.send(BrowserEvent::OpenCommandPalette {
-                        tab_id: self.tab_id,
+                        shortcut,
                     });
                     return 1;
                 }
@@ -329,16 +359,53 @@ pub fn create_tab_client(
 
 #[cfg(test)]
 mod tests {
-    use super::is_command_palette_key;
+    use super::browser_shortcut;
+    use crate::events::BrowserShortcut;
 
     #[test]
-    fn command_palette_key_requires_k_with_ctrl_or_cmd() {
-        assert!(is_command_palette_key(true, 0x4B, 4)); // Ctrl+K
-        assert!(is_command_palette_key(true, 0x4B, 128)); // Cmd+K
-        assert!(is_command_palette_key(true, 0x4B, 4 | 8)); // Ctrl+Alt+K
-        assert!(!is_command_palette_key(false, 0x4B, 4));
-        assert!(!is_command_palette_key(true, 0x7B, 4)); // F12
-        assert!(!is_command_palette_key(true, 0x4B, 0));
-        assert!(!is_command_palette_key(true, 0x4B, 2)); // Shift only
+    fn web_view_forwards_all_shell_shortcuts() {
+        assert_eq!(
+            browser_shortcut(true, 0x54, 128),
+            Some(BrowserShortcut::NewTab)
+        );
+        assert_eq!(
+            browser_shortcut(true, 0x54, 4),
+            Some(BrowserShortcut::NewTab)
+        );
+        assert_eq!(
+            browser_shortcut(true, 0x54, 128 | 2),
+            Some(BrowserShortcut::ReopenClosedTab)
+        );
+        assert_eq!(
+            browser_shortcut(true, 0x5A, 128),
+            Some(BrowserShortcut::ReopenClosedTab)
+        );
+        assert_eq!(
+            browser_shortcut(true, 0x57, 128),
+            Some(BrowserShortcut::CloseTab)
+        );
+        assert_eq!(
+            browser_shortcut(true, 0x4B, 128),
+            Some(BrowserShortcut::OpenCommandPalette)
+        );
+        assert_eq!(
+            browser_shortcut(true, 0x4C, 4),
+            Some(BrowserShortcut::OpenCommandPalette)
+        );
+        assert_eq!(
+            browser_shortcut(true, 0x7B, 0),
+            Some(BrowserShortcut::OpenDevTools)
+        );
+    }
+
+    #[test]
+    fn web_view_ignores_repeats_and_unrelated_modifiers() {
+        assert_eq!(browser_shortcut(false, 0x54, 128), None);
+        assert_eq!(browser_shortcut(true, 0x54, 128 | 8_192), None);
+        assert_eq!(browser_shortcut(true, 0x54, 128 | 8), None);
+        assert_eq!(browser_shortcut(true, 0x54, 0), None);
+        assert_eq!(browser_shortcut(true, 0x54, 2), None);
+        assert_eq!(browser_shortcut(true, 0x57, 128 | 2), None);
+        assert_eq!(browser_shortcut(true, 0x58, 128), None);
     }
 }

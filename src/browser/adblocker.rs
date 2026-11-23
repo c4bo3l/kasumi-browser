@@ -82,6 +82,13 @@ pub fn create_adblock_engine() -> Arc<Engine> {
     Arc::new(engine)
 }
 
+/// Main-frame navigations must never be cancelled: a filter rule that matches
+/// a page URL would otherwise leave the new/ restored tab on `about:blank`.
+/// Only subresources are eligible for network-level blocking.
+pub fn adblock_applies_to(resource_type: &str) -> bool {
+    resource_type != "main_frame"
+}
+
 fn map_resource_type(rt: ResourceType) -> &'static str {
     match rt {
         ResourceType::SCRIPT => "script",
@@ -128,6 +135,9 @@ wrap_resource_request_handler! {
                 .unwrap_or_default();
 
             let req_type = map_resource_type(req.resource_type());
+            if !adblock_applies_to(req_type) {
+                return ReturnValue::CONTINUE;
+            }
 
             if let Ok(adblock_req) = Request::new(&url, &first_party_url, req_type, "") {
                 let result = self.engine.check_network_request(&adblock_req);
@@ -182,7 +192,7 @@ pub fn create_tab_request_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{create_adblock_engine, map_resource_type};
+    use super::{adblock_applies_to, create_adblock_engine, map_resource_type};
     use adblock::request::Request;
     use cef::ResourceType;
 
@@ -200,6 +210,26 @@ mod tests {
         assert_eq!(map_resource_type(ResourceType::PING), "ping");
         assert_eq!(map_resource_type(ResourceType::WORKER), "other");
         assert_eq!(map_resource_type(ResourceType::SUB_RESOURCE), "other");
+    }
+
+    #[test]
+    fn main_frame_navigations_are_never_blocked() {
+        assert!(!adblock_applies_to("main_frame"));
+        for resource_type in [
+            "script",
+            "image",
+            "stylesheet",
+            "xmlhttprequest",
+            "sub_frame",
+            "media",
+            "font",
+            "other",
+        ] {
+            assert!(
+                adblock_applies_to(resource_type),
+                "{resource_type} should still be filterable"
+            );
+        }
     }
 
     #[test]
