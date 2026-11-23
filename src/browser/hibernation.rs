@@ -200,6 +200,9 @@ pub struct TabManager {
     // Number of `host.close_browser(1)` calls awaiting an `on_before_close` event.
     pending_browser_closes: u32,
 
+    // Set when CEF forwards Cmd/Ctrl+K; consumed by the winit handler.
+    command_palette_requested: bool,
+
     // Favicon URLs already requested, and URLs seen before the browser exists.
     requested_favicons: HashSet<(u64, String)>,
     pending_favicon_urls: HashMap<u64, Vec<String>>,
@@ -243,6 +246,7 @@ impl TabManager {
             storage,
             recently_closed: Vec::new(),
             pending_browser_closes: 0,
+            command_palette_requested: false,
             requested_favicons: HashSet::new(),
             pending_favicon_urls: HashMap::new(),
             resolved_favicons: HashSet::new(),
@@ -403,9 +407,9 @@ impl TabManager {
                     if let Some(host) = browser.host() {
                         let view_handle = host.window_handle();
                         if !view_handle.is_null() {
-                            #[cfg(target_os = "macos")]
-                            unsafe {
-                                platform_view::hide_view(view_handle.cast());
+                            if let Err(e) = unsafe { platform_view::hide_view(view_handle.cast()) }
+                            {
+                                tracing::warn!("Could not hide old tab view: {e}");
                             }
                         }
                     }
@@ -619,43 +623,48 @@ impl TabManager {
 
     /// Position and show the active tab's native view.
     pub fn show_active_tab_view(&self) {
-        if let Some(id) = self.active_tab_id {
-            if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
-                if let Some(ref browser) = tab.browser {
-                    if let Some(host) = browser.host() {
-                        let view_handle = host.window_handle();
-                        if !view_handle.is_null() && !self.parent_window_view.is_null() {
-                            #[cfg(target_os = "macos")]
-                            unsafe {
-                                platform_view::show_view(
-                                    self.parent_window_view.cast(),
-                                    view_handle.cast(),
-                                    self.content_rect,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+        let Some(id) = self.active_tab_id else {
+            return;
+        };
+        let Some(tab) = self.tabs.iter().find(|t| t.id == id) else {
+            return;
+        };
+        let Some(host) = tab.browser.as_ref().and_then(|browser| browser.host()) else {
+            return;
+        };
+        let view_handle = host.window_handle();
+        if view_handle.is_null() || self.parent_window_view.is_null() {
+            return;
+        }
+        if let Err(e) = unsafe {
+            platform_view::show_view(
+                self.parent_window_view.cast(),
+                view_handle.cast(),
+                self.content_rect,
+            )
+        } {
+            tracing::warn!("Could not show active tab view: {e}");
         }
     }
 
     /// Resize the active tab's native view.
     pub fn resize_active_tab_view(&self) {
-        if let Some(id) = self.active_tab_id {
-            if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
-                if let Some(ref browser) = tab.browser {
-                    if let Some(host) = browser.host() {
-                        let view_handle = host.window_handle();
-                        if !view_handle.is_null() {
-                            #[cfg(target_os = "macos")]
-                            unsafe {
-                                platform_view::resize_view(view_handle.cast(), self.content_rect);
-                            }
-                        }
-                    }
-                }
-            }
+        let Some(id) = self.active_tab_id else {
+            return;
+        };
+        let Some(tab) = self.tabs.iter().find(|t| t.id == id) else {
+            return;
+        };
+        let Some(host) = tab.browser.as_ref().and_then(|browser| browser.host()) else {
+            return;
+        };
+        let view_handle = host.window_handle();
+        if view_handle.is_null() {
+            return;
+        }
+        if let Err(e) = unsafe { platform_view::resize_view(view_handle.cast(), self.content_rect) }
+        {
+            tracing::warn!("Could not resize active tab view: {e}");
         }
     }
 
@@ -664,6 +673,11 @@ impl TabManager {
         while let Ok(event) = self.event_receiver.try_recv() {
             self.handle_browser_event(event);
         }
+    }
+
+    /// Consume a Cmd/Ctrl+K request forwarded from the CEF web view.
+    pub fn consume_command_palette_request(&mut self) -> bool {
+        std::mem::take(&mut self.command_palette_requested)
     }
 
     fn handle_browser_event(&mut self, event: BrowserEvent) {
@@ -766,6 +780,9 @@ impl TabManager {
             }
             BrowserEvent::OpenDevTools { tab_id } => {
                 self.show_dev_tools(tab_id);
+            }
+            BrowserEvent::OpenCommandPalette { .. } => {
+                self.command_palette_requested = true;
             }
             BrowserEvent::ViewSource { url, .. } => {
                 if url.is_empty() {

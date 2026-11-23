@@ -1,6 +1,6 @@
 [package]
 name = "kasumi-browser"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 
 [package.metadata.cef.bundle]
@@ -19,6 +19,8 @@ raw-window-handle = "0.6"
 egui = "0.30"
 egui-wgpu = "0.30"
 egui-winit = "0.30"
+# Material Symbols icon font, pinned to the egui 0.30-compatible release.
+egui_material_icons = "0.2.0"
 wgpu = "23"
 
 # System RAM pressure monitoring for aggressive tab hibernation

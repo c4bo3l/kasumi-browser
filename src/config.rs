@@ -8,14 +8,17 @@ pub const DEFAULT_HOME_URL: &str = "https://duckduckgo.com";
 /// Default omnibox search query prefix
 pub const DEFAULT_SEARCH_URL_PREFIX: &str = "https://duckduckgo.com/?q=";
 
-/// Height of the top tab bar in points/logical pixels
-pub const TAB_BAR_HEIGHT: f32 = 38.0;
+/// Expanded width of the collapsible vertical workspace rail, in logical points.
+pub const RAIL_WIDTH_EXPANDED: f32 = 180.0;
 
-/// Height of the omnibox/navigation toolbar in points/logical pixels
-pub const NAV_BAR_HEIGHT: f32 = 38.0;
+/// Width of the favicon-only strip left visible when the rail is collapsed.
+pub const RAIL_WIDTH_COLLAPSED: f32 = 44.0;
 
-/// Total browser chrome height drawn natively via egui
-pub const CHROME_HEIGHT: f32 = TAB_BAR_HEIGHT + NAV_BAR_HEIGHT; // 76.0 px
+/// Width of the floating Cmd/Ctrl+K command palette.
+pub const COMMAND_PALETTE_WIDTH: f32 = 560.0;
+
+/// Vertical offset of the command palette from the top of the window.
+pub const COMMAND_PALETTE_TOP_OFFSET: f32 = 72.0;
 
 /// Default idle timeout before a background tab is eligible for hibernation
 pub const TAB_IDLE_TIMEOUT_NORMAL: Duration = Duration::from_secs(600); // 10 minutes
@@ -40,15 +43,26 @@ pub const TAB_WATCHDOG_TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// itself, so waiting for it before shutdown would never complete.
 pub const SHUTDOWN_MAX_WAIT_TICKS: u32 = 30;
 
+/// Logical width of the native chrome rail for the current expansion state.
+pub fn rail_width(expanded: bool) -> f32 {
+    if expanded {
+        RAIL_WIDTH_EXPANDED
+    } else {
+        RAIL_WIDTH_COLLAPSED
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn chrome_height_matches_spec() {
-        assert_eq!(TAB_BAR_HEIGHT, 38.0);
-        assert_eq!(NAV_BAR_HEIGHT, 38.0);
-        assert_eq!(CHROME_HEIGHT, 76.0);
+    fn rail_widths_match_spec() {
+        assert_eq!(RAIL_WIDTH_EXPANDED, 180.0);
+        assert_eq!(RAIL_WIDTH_COLLAPSED, 44.0);
+        assert_eq!(rail_width(true), RAIL_WIDTH_EXPANDED);
+        assert_eq!(rail_width(false), RAIL_WIDTH_COLLAPSED);
+        assert!(RAIL_WIDTH_COLLAPSED < RAIL_WIDTH_EXPANDED);
     }
 
     #[test]
@@ -67,5 +81,12 @@ mod tests {
     fn default_search_prefix_matches_home_origin() {
         assert!(DEFAULT_SEARCH_URL_PREFIX.starts_with(DEFAULT_HOME_URL));
         assert!(DEFAULT_SEARCH_URL_PREFIX.ends_with("?q="));
+    }
+
+    #[test]
+    fn command_palette_geometry_is_sane() {
+        assert_eq!(COMMAND_PALETTE_WIDTH, 560.0);
+        assert_eq!(COMMAND_PALETTE_TOP_OFFSET, 72.0);
+        assert!(COMMAND_PALETTE_WIDTH < RAIL_WIDTH_EXPANDED * 4.0);
     }
 }

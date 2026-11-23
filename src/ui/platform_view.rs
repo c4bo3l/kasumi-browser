@@ -7,14 +7,14 @@
 
 #![allow(dead_code)]
 
-use crate::config::CHROME_HEIGHT;
-
 /// A rectangle describing where the CEF content should sit inside the outer
 /// winit window, in logical points / device-independent pixels.
 ///
-/// macOS `NSView` frames and CEF's `WindowInfo.bounds` both use this unit.
-/// Platforms whose APIs take physical pixels (Windows `MoveWindow`, X11) use
-/// `scale_factor` to convert at the call site.
+/// The vertical workspace rail occupies the left edge, so the content starts
+/// at `x = rail_width` and extends to the full window height. macOS `NSView`
+/// frames and CEF's `WindowInfo.bounds` both use this unit. Platforms whose
+/// APIs take physical pixels (Windows `MoveWindow`, X11) use `scale_factor`
+/// to convert at the call site.
 #[derive(Debug, Clone, Copy)]
 pub struct ContentRect {
     pub x: u32,
@@ -25,22 +25,31 @@ pub struct ContentRect {
 }
 
 impl ContentRect {
-    /// Compute the logical content rect from the full window physical size.
-    pub fn from_window(physical_width: u32, physical_height: u32, scale_factor: f64) -> Self {
+    /// Compute the logical content rect from the full window physical size and
+    /// the logical width of the left workspace rail.
+    pub fn from_window(
+        physical_width: u32,
+        physical_height: u32,
+        scale_factor: f64,
+        left_inset: f32,
+    ) -> Self {
         let scale = if scale_factor.is_finite() && scale_factor > 0.0 {
             scale_factor
         } else {
             1.0
         };
-        let chrome_height = CHROME_HEIGHT as u32;
         let logical_width = (physical_width as f64 / scale).round() as u32;
         let logical_height = (physical_height as f64 / scale).round() as u32;
-        let content_height = logical_height.saturating_sub(chrome_height);
+        let x = if left_inset.is_finite() && left_inset > 0.0 {
+            (left_inset.round() as u32).min(logical_width)
+        } else {
+            0
+        };
         Self {
-            x: 0,
-            y: chrome_height,
-            width: logical_width,
-            height: content_height,
+            x,
+            y: 0,
+            width: logical_width.saturating_sub(x),
+            height: logical_height,
             scale_factor: scale,
         }
     }
@@ -65,7 +74,6 @@ mod mac {
     use std::ffi::c_void;
 
     use super::ContentRect;
-    use objc2::runtime::AnyObject;
     use objc2_app_kit::NSView;
     use objc2_foundation::NSRect;
 
@@ -73,47 +81,52 @@ mod mac {
     /// position it in `rect`, and make it visible.
     ///
     /// # Safety
-    /// Both `parent_ns_view` and `cef_ns_view` must be valid, live Objective-C
-    /// object pointers obtained from raw-window-handle / CEF respectively.
+    /// Both `parent` and `child` must be valid, live Objective-C object
+    /// pointers obtained from raw-window-handle / CEF respectively.
     pub unsafe fn show_view(
-        parent_ns_view: *mut AnyObject,
-        cef_ns_view: *mut AnyObject,
+        parent: *mut std::ffi::c_void,
+        child_ptr: *mut std::ffi::c_void,
         rect: ContentRect,
-    ) {
-        if parent_ns_view.is_null() || cef_ns_view.is_null() {
-            tracing::warn!("show_view: null pointer(s), skipping");
-            return;
+    ) -> Result<(), String> {
+        if parent.is_null() || child_ptr.is_null() {
+            return Err("show_view received a null NSView pointer".to_string());
         }
-        let parent = unsafe { &*parent_ns_view.cast::<NSView>() };
-        let child = unsafe { &*cef_ns_view.cast::<NSView>() };
+        let parent_view = unsafe { &*parent.cast::<NSView>() };
+        let child = unsafe { &*child_ptr.cast::<NSView>() };
         // Add first so set_frame() can query the parent's coordinate system.
-        unsafe { parent.addSubview(child) };
+        unsafe { parent_view.addSubview(child) };
         set_frame(child, &rect);
         child.setHidden(false);
+        Ok(())
     }
 
     /// Reposition the CEF `NSView` without changing its parent.
     ///
     /// # Safety
-    /// `cef_ns_view` must be a valid live `NSView *`.
-    pub unsafe fn resize_view(cef_ns_view: *mut AnyObject, rect: ContentRect) {
-        if cef_ns_view.is_null() {
-            return;
+    /// `child` must be a valid live `NSView *`.
+    pub unsafe fn resize_view(
+        child_ptr: *mut std::ffi::c_void,
+        rect: ContentRect,
+    ) -> Result<(), String> {
+        if child_ptr.is_null() {
+            return Ok(());
         }
-        let child = unsafe { &*cef_ns_view.cast::<NSView>() };
+        let child = unsafe { &*child_ptr.cast::<NSView>() };
         set_frame(child, &rect);
+        Ok(())
     }
 
     /// Hide the CEF `NSView` (without destroying it or its browser process).
     ///
     /// # Safety
-    /// `cef_ns_view` must be a valid live `NSView *`.
-    pub unsafe fn hide_view(cef_ns_view: *mut AnyObject) {
-        if cef_ns_view.is_null() {
-            return;
+    /// `child` must be a valid live `NSView *`.
+    pub unsafe fn hide_view(child_ptr: *mut std::ffi::c_void) -> Result<(), String> {
+        if child_ptr.is_null() {
+            return Ok(());
         }
-        let child = unsafe { &*cef_ns_view.cast::<NSView>() };
+        let child = unsafe { &*child_ptr.cast::<NSView>() };
         child.setHidden(true);
+        Ok(())
     }
 
     /// Detach the CEF `NSView` from the winit content view. This completes the
@@ -164,15 +177,22 @@ mod mac {
 // ---------------------------------------------------------------------------
 #[cfg(windows)]
 mod win {
+    use std::ffi::c_void;
+
     use super::ContentRect;
+    use windows_sys::Win32::Foundation::HWND;
 
     /// Reparent and position the CEF child `HWND`.
     pub fn show_view(
-        parent_hwnd: windows_sys::Win32::Foundation::HWND,
-        cef_hwnd: windows_sys::Win32::Foundation::HWND,
+        parent: *mut c_void,
+        child: *mut c_void,
         rect: ContentRect,
-    ) {
+    ) -> Result<(), String> {
         use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        if parent.is_null() || child.is_null() {
+            return Err("show_view received a null HWND".to_string());
+        }
+        let (parent_hwnd, cef_hwnd): (HWND, HWND) = (parent, child);
         let (x, y, width, height) = rect.to_physical();
         unsafe {
             SetParent(cef_hwnd, parent_hwnd);
@@ -186,32 +206,48 @@ mod win {
             );
             ShowWindow(cef_hwnd, SW_SHOW);
         }
+        Ok(())
     }
 
-    pub fn resize_view(cef_hwnd: windows_sys::Win32::Foundation::HWND, rect: ContentRect) {
+    pub fn resize_view(child: *mut c_void, rect: ContentRect) -> Result<(), String> {
         use windows_sys::Win32::UI::WindowsAndMessaging::*;
+        if child.is_null() {
+            return Ok(());
+        }
         let (x, y, width, height) = rect.to_physical();
         unsafe {
-            MoveWindow(cef_hwnd, x as i32, y as i32, width as i32, height as i32, 1);
+            MoveWindow(
+                HWND(child),
+                x as i32,
+                y as i32,
+                width as i32,
+                height as i32,
+                1,
+            );
         }
+        Ok(())
     }
 
-    pub fn hide_view(cef_hwnd: windows_sys::Win32::Foundation::HWND) {
+    pub fn hide_view(child: *mut c_void) -> Result<(), String> {
         use windows_sys::Win32::UI::WindowsAndMessaging::*;
-        unsafe {
-            ShowWindow(cef_hwnd, SW_HIDE);
+        if child.is_null() {
+            return Ok(());
         }
+        unsafe {
+            ShowWindow(HWND(child), SW_HIDE);
+        }
+        Ok(())
     }
 
     /// Destroy the child `HWND` to complete CEF's native browser teardown.
     ///
     /// # Safety
-    /// `cef_hwnd` must be a valid live CEF child window handle.
-    pub unsafe fn detach_view(cef_hwnd: *mut std::ffi::c_void) {
+    /// `child` must be a valid live CEF child window handle.
+    pub unsafe fn detach_view(child: *mut c_void) {
         use windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow;
-        if !cef_hwnd.is_null() {
+        if !child.is_null() {
             unsafe {
-                DestroyWindow(cef_hwnd);
+                DestroyWindow(HWND(child));
             }
         }
     }
@@ -222,18 +258,45 @@ mod win {
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ConfigureWindowAux, Window};
+    use x11rb::rust_connection::RustConnection;
+
     use super::ContentRect;
 
+    /// X11 window IDs are carried as pointer values by the platform-agnostic
+    /// interface. A single connection is reused for every low-frequency
+    /// show/hide/resize operation.
+    fn connection() -> Result<&'static RustConnection, String> {
+        static CONNECTION: OnceLock<RustConnection> = OnceLock::new();
+        CONNECTION.get_or_try_init(|| {
+            let (conn, _screen_number) =
+                x11rb::connect(None).map_err(|e| format!("X11 connect failed: {e}"))?;
+            Ok::<RustConnection, String>(conn)
+        })
+    }
+
+    fn xid(handle: *mut c_void) -> Window {
+        handle as usize as Window
+    }
+
     pub fn show_view(
-        conn: &x11rb::rust_connection::RustConnection,
-        parent_xid: u32,
-        cef_xid: u32,
+        parent: *mut c_void,
+        child: *mut c_void,
         rect: ContentRect,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use x11rb::connection::Connection;
-        use x11rb::protocol::xproto::*;
+    ) -> Result<(), String> {
+        if parent.is_null() || child.is_null() {
+            return Err("show_view received a null X11 window ID".to_string());
+        }
+        let conn = connection()?;
         let (x, y, width, height) = rect.to_physical();
-        conn.reparent_window(cef_xid, parent_xid, x as i16, y as i16)?;
+        let parent_xid = xid(parent);
+        let cef_xid = xid(child);
+        conn.reparent_window(cef_xid, parent_xid, x as i16, y as i16)
+            .map_err(|e| format!("X11 reparent_window failed: {e}"))?;
         conn.configure_window(
             cef_xid,
             &ConfigureWindowAux::new()
@@ -241,46 +304,47 @@ mod linux {
                 .y(y as i32)
                 .width(width)
                 .height(height),
-        )?;
-        conn.map_window(cef_xid)?;
-        conn.flush()?;
+        )
+        .map_err(|e| format!("X11 configure_window failed: {e}"))?;
+        conn.map_window(cef_xid)
+            .map_err(|e| format!("X11 map_window failed: {e}"))?;
+        conn.flush().map_err(|e| format!("X11 flush failed: {e}"))?;
         Ok(())
     }
 
-    pub fn resize_view(
-        conn: &x11rb::rust_connection::RustConnection,
-        cef_xid: u32,
-        rect: ContentRect,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use x11rb::connection::Connection;
-        use x11rb::protocol::xproto::*;
+    pub fn resize_view(child: *mut c_void, rect: ContentRect) -> Result<(), String> {
+        if child.is_null() {
+            return Ok(());
+        }
+        let conn = connection()?;
         let (x, y, width, height) = rect.to_physical();
         conn.configure_window(
-            cef_xid,
+            xid(child),
             &ConfigureWindowAux::new()
                 .x(x as i32)
                 .y(y as i32)
                 .width(width)
                 .height(height),
-        )?;
-        conn.flush()?;
+        )
+        .map_err(|e| format!("X11 configure_window failed: {e}"))?;
+        conn.flush().map_err(|e| format!("X11 flush failed: {e}"))?;
         Ok(())
     }
 
-    pub fn hide_view(
-        conn: &x11rb::rust_connection::RustConnection,
-        cef_xid: u32,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use x11rb::connection::Connection;
-        use x11rb::protocol::xproto::*;
-        conn.unmap_window(cef_xid)?;
-        conn.flush()?;
+    pub fn hide_view(child: *mut c_void) -> Result<(), String> {
+        if child.is_null() {
+            return Ok(());
+        }
+        let conn = connection()?;
+        conn.unmap_window(xid(child))
+            .map_err(|e| format!("X11 unmap_window failed: {e}"))?;
+        conn.flush().map_err(|e| format!("X11 flush failed: {e}"))?;
         Ok(())
     }
 
     /// X11 teardown needs the connection handle, which is owned by the main
     /// loop. Hide/resize are sufficient here; closing the browser still works.
-    pub fn detach_view(_cef_xid: *mut std::ffi::c_void) {
+    pub fn detach_view(_cef_xid: *mut c_void) {
         tracing::debug!("detach_view is a no-op on X11");
     }
 }
@@ -300,45 +364,58 @@ pub use linux::{detach_view, hide_view, resize_view, show_view};
 #[cfg(test)]
 mod tests {
     use super::ContentRect;
-    use crate::config::CHROME_HEIGHT;
+    use crate::config::{rail_width, RAIL_WIDTH_COLLAPSED, RAIL_WIDTH_EXPANDED};
 
     #[test]
-    fn content_rect_is_logical_and_starts_below_chrome() {
-        let rect = ContentRect::from_window(2560, 1600, 2.0);
-        assert_eq!(rect.x, 0);
-        assert_eq!(rect.y, CHROME_HEIGHT as u32);
-        assert_eq!(rect.width, 1280);
-        assert_eq!(rect.height, 724);
+    fn content_rect_is_logical_and_starts_right_of_the_rail() {
+        let rect = ContentRect::from_window(2560, 1600, 2.0, rail_width(true));
+        assert_eq!(rect.x, RAIL_WIDTH_EXPANDED as u32);
+        assert_eq!(rect.y, 0);
+        assert_eq!(rect.width, 1280 - RAIL_WIDTH_EXPANDED as u32);
+        assert_eq!(rect.height, 800);
         assert_eq!(rect.scale_factor, 2.0);
-        assert_eq!(rect.to_physical(), (0, 152, 2560, 1448));
+        assert_eq!(rect.to_physical(), (360, 0, 2200, 1600));
     }
 
     #[test]
-    fn content_rect_saturates_when_window_is_shorter_than_chrome() {
-        let rect = ContentRect::from_window(800, 50, 1.0);
-        assert_eq!(rect.y, CHROME_HEIGHT as u32);
-        assert_eq!(rect.height, 0);
+    fn collapsed_rail_leaves_a_favicon_width_strip() {
+        let rect = ContentRect::from_window(2560, 1600, 2.0, rail_width(false));
+        assert_eq!(rect.x, RAIL_WIDTH_COLLAPSED as u32);
+        assert_eq!(rect.width, 1280 - RAIL_WIDTH_COLLAPSED as u32);
+        assert_eq!(rect.height, 800);
+    }
+
+    #[test]
+    fn content_rect_saturates_when_rail_is_wider_than_window() {
+        let rect = ContentRect::from_window(800, 600, 1.0, 5000.0);
+        assert_eq!(rect.x, 800);
+        assert_eq!(rect.width, 0);
+        assert_eq!(rect.height, 600);
     }
 
     #[test]
     fn content_rect_handles_zero_and_invalid_scale_factors() {
-        let zero = ContentRect::from_window(800, 600, 0.0);
+        let zero = ContentRect::from_window(800, 600, 0.0, 0.0);
         assert_eq!(zero.width, 800);
         assert_eq!(zero.scale_factor, 1.0);
 
-        let invalid = ContentRect::from_window(800, 600, f64::NAN);
+        let invalid = ContentRect::from_window(800, 600, f64::NAN, 0.0);
         assert_eq!(invalid.width, 800);
         assert_eq!(invalid.scale_factor, 1.0);
 
-        let empty = ContentRect::from_window(0, 0, 1.0);
+        let negative_inset = ContentRect::from_window(800, 600, 1.0, -10.0);
+        assert_eq!(negative_inset.x, 0);
+        assert_eq!(negative_inset.width, 800);
+
+        let empty = ContentRect::from_window(0, 0, 1.0, 0.0);
         assert_eq!(empty.width, 0);
         assert_eq!(empty.height, 0);
     }
 
     #[test]
     fn content_rect_rounds_fractional_logical_sizes() {
-        let rect = ContentRect::from_window(1500, 900, 1.5);
-        assert_eq!(rect.width, 1000);
-        assert_eq!(rect.height, 524);
+        let rect = ContentRect::from_window(1500, 900, 1.5, 10.0);
+        assert_eq!(rect.width, 990);
+        assert_eq!(rect.height, 600);
     }
 }

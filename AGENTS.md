@@ -59,7 +59,7 @@ Use these exact crate versions and release profile settings:
 ```toml
 [package]
 name = "kasumi-browser"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -74,6 +74,9 @@ winit = "0.30"
 raw-window-handle = "0.6"
 egui = "0.30"
 egui-wgpu = "0.30"
+egui-winit = "0.30"
+# Material Symbols icon font, pinned to the egui 0.30-compatible release.
+egui_material_icons = "0.2.0"
 wgpu = "23"
 
 # System RAM pressure monitoring for aggressive tab hibernation
@@ -209,14 +212,16 @@ pub struct Tab {
 
 ### 5.4 Native UI Chrome & Child Viewport (`src/ui/`)
 - **Layout Geometry (logical points / DIPs):**
-  - Top Tab Strip: `height = 38.0` px
-  - Navigation & Omnibox Bar: `height = 38.0` px
-  - Total Chrome Height: `CHROME_HEIGHT = 76.0` px
-  - CEF Child Viewport Rect: `x = 0`, `y = 76`, `width = logical_window_width`, `height = logical_window_height - 76`.
-  - macOS `NSView` frames and CEF `WindowInfo.bounds` use these logical values directly. Winit's content view is flipped (`isFlipped == true`), so the child view y-origin is `76`, not `parent_height - 76 - height`. Windows `HWND` and X11 APIs convert the logical rect to physical pixels with `scale_factor`.
+  - Default rail: expanded at `RAIL_WIDTH_EXPANDED = 180.0` px so vertical tabs are visible immediately.
+  - Collapsed rail: `RAIL_WIDTH_COLLAPSED = 44.0` px favicon-only strip with clickable tab icons and active-tab indicator.
+  - Command palette: `COMMAND_PALETTE_WIDTH = 560.0` px, top offset `72.0` px.
+  - CEF Child Viewport Rect: `x = rail_width`, `y = 0`, `width = logical_window_width - rail_width`, `height = logical_window_height`.
+  - macOS `NSView` frames and CEF `WindowInfo.bounds` use these logical values directly. Windows `HWND` and X11 APIs convert the logical rect to physical pixels with `scale_factor`.
+  - While the command palette is open, show it in a transparent, always-on-top native overlay window so the page stays visible behind it; primary clicks outside the palette card dismiss the overlay and the browser keeps running. Rail tooltips use a separate transparent, click-through native overlay so they render above the page beside the hovered row without blocking page input.
+  - Rail icons use the Material Symbols icon font pinned to the egui 0.30-compatible release.
 - **UI Elements in `egui`:**
-  - **Tab Strip:** Horizontal scrollable tabs showing `title` (truncated to 24 chars), loading spinner, `💤` badge if `TabState::Hibernated`, close button (`×`), and `+` new tab button.
-  - **Toolbar:** Back (`←`), Forward (`→`), Reload/Stop (`↻`/`✕`), Omnibox text input (auto-selects all on `Ctrl/Cmd+L`), Shield badge (`🛡 {blocked_count}`), Hibernate All Background Tabs button (`💤`), and live System/App RAM readout (`RAM: 412 MB`).
+  - **Vertical Workspace Rail:** Collapsible left rail with workspace label, Command button, New tab, vertically scrollable tabs (title, loading/hibernated badge, middle-click close, plus a hover-only × button on the row right in expanded mode and top-right in collapsed mode), shield badge, RAM readout, and Hibernate All button. Rail tooltips are visible in both modes, use high-contrast text, and render above the page beside the hovered row via a click-through overlay.
+  - **Floating Command Palette:** `Cmd/Ctrl+K` or `Cmd/Ctrl+L` opens a centered command bar in a transparent overlay window with tab search, address/search resolution, keyboard selection (`↑`/`↓`, `Enter`, `Esc`), quick actions, immediate input focus, and click-outside dismissal.
   - **Omnibox Resolution:**
     - If input parses via `url::Url::parse` -> navigate directly.
     - Else if input has no spaces and contains `.` (e.g., `github.com/rust-lang`) -> prepend `https://` and navigate.

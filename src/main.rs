@@ -15,16 +15,16 @@ use std::sync::Arc;
 use app::KasumiBrowserApp;
 use browser::hibernation::TabManager;
 use cef::CefString;
-use config::SHUTDOWN_MAX_WAIT_TICKS;
+use config::{rail_width, SHUTDOWN_MAX_WAIT_TICKS};
 use events::UiAction;
 use storage::db::{StorageHandle, StorageManager};
-use ui::chrome::{ChromeRenderer, ChromeState};
+use ui::chrome::{ChromeRenderer, ChromeState, PaletteRenderer, TooltipRenderer};
 use ui::platform_view::ContentRect;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Window, WindowId, WindowLevel};
 
 // ---------------------------------------------------------------------------
 // macOS: CEF external message pump via a main-thread CoreFoundation timer.
@@ -231,12 +231,26 @@ struct KasumiBrowserHandler {
     tab_manager: Option<TabManager>,
     storage_handle: Option<StorageHandle>,
 
+    // Transparent always-on-top overlay for the full-window command palette.
+    // The CEF child view stays visible behind it on every platform.
+    overlay_window: Option<Arc<Window>>,
+    overlay_window_id: Option<WindowId>,
+    overlay: Option<PaletteRenderer>,
+    overlay_visible: bool,
+
+    // Transparent, click-through overlay for rail tooltips. A native window is
+    // required so tooltips can appear above the CEF child view.
+    tooltip_window: Option<Arc<Window>>,
+    tooltip_window_id: Option<WindowId>,
+    tooltip: Option<TooltipRenderer>,
+    tooltip_visible: bool,
+    tooltip_size: Option<(u32, u32)>,
+
     // Current UI state (populated from CEF events in Phase 3+)
     chrome_state: ChromeState,
 
     // Keyboard modifier tracking
     modifiers: ModifiersState,
-    ctrl_l_pressed: bool,
 
     // Shutdown state. CEF message-pump work is only ever performed from
     // `about_to_wait` so it can never re-enter winit's window event handler.
@@ -261,14 +275,232 @@ impl KasumiBrowserHandler {
             chrome: None,
             tab_manager: None,
             storage_handle: None,
+            overlay_window: None,
+            overlay_window_id: None,
+            overlay: None,
+            overlay_visible: false,
+            tooltip_window: None,
+            tooltip_window_id: None,
+            tooltip: None,
+            tooltip_visible: false,
+            tooltip_size: None,
             chrome_state: ChromeState::default(),
             modifiers: ModifiersState::default(),
-            ctrl_l_pressed: false,
             shutdown_requested: false,
             shutdown_browsers_closed: false,
             shutdown_ticks: 0,
         }
     }
+
+    fn sync_palette_overlay(&mut self, event_loop: &ActiveEventLoop) {
+        if self.shutdown_requested {
+            self.hide_palette_overlay();
+            return;
+        }
+        if self.chrome_state.command_palette_open {
+            self.ensure_palette_overlay(event_loop);
+        } else {
+            self.hide_palette_overlay();
+        }
+    }
+
+    fn ensure_palette_overlay(&mut self, event_loop: &ActiveEventLoop) {
+        let mut created_window = false;
+        if self.overlay_window.is_none() {
+            created_window = true;
+            let Some(main) = self.window.as_ref() else {
+                return;
+            };
+            let attrs = Window::default_attributes()
+                .with_title("Kasumi Command Palette")
+                .with_inner_size(main.inner_size())
+                .with_transparent(true)
+                .with_decorations(false)
+                .with_resizable(false)
+                .with_window_level(WindowLevel::AlwaysOnTop);
+            let overlay_window = match event_loop.create_window(attrs) {
+                Ok(window) => Arc::new(window),
+                Err(e) => {
+                    tracing::error!("Failed to create command palette overlay: {}", e);
+                    return;
+                }
+            };
+            overlay_window.set_window_level(WindowLevel::AlwaysOnTop);
+            self.overlay_window_id = Some(overlay_window.id());
+            self.overlay_window = Some(overlay_window);
+        }
+
+        if self.overlay.is_none() {
+            let Some(window) = self.overlay_window.as_ref() else {
+                return;
+            };
+            let Some(overlay) = PaletteRenderer::new(
+                Arc::clone(window),
+                &self.wgpu_instance,
+                &self.adapter,
+                Arc::clone(&self.device),
+                Arc::clone(&self.queue),
+            ) else {
+                tracing::error!("Failed to initialize the command palette overlay renderer");
+                return;
+            };
+            self.overlay = Some(overlay);
+        }
+
+        if created_window || !self.overlay_visible {
+            self.position_palette_overlay();
+        }
+        if let Some(window) = self.overlay_window.as_ref() {
+            if !self.overlay_visible {
+                window.set_visible(true);
+                window.focus_window();
+                self.overlay_visible = true;
+            }
+            window.request_redraw();
+        }
+    }
+
+    fn position_palette_overlay(&self) {
+        let (Some(main), Some(overlay)) = (self.window.as_ref(), self.overlay_window.as_ref())
+        else {
+            return;
+        };
+        let _ = overlay.request_inner_size(main.inner_size());
+        // The overlay is undecorated, so its outer origin is its content origin.
+        // Anchor it to the main window's content origin to account for the
+        // macOS title bar; egui coordinates are relative to that content area.
+        let origin = main.inner_position().or_else(|_| main.outer_position());
+        if let Ok(origin) = origin {
+            overlay.set_outer_position(overlay_screen_position(
+                origin,
+                (0.0, 0.0),
+                main.scale_factor(),
+            ));
+        }
+    }
+
+    fn hide_palette_overlay(&mut self) {
+        if self.overlay_visible {
+            if let Some(window) = self.overlay_window.as_ref() {
+                let _ = window.set_visible(false);
+            }
+            self.overlay_visible = false;
+            if let Some(window) = self.window.as_ref() {
+                window.focus_window();
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn sync_tooltip_overlay(&mut self, event_loop: &ActiveEventLoop) {
+        if self.shutdown_requested || self.chrome_state.command_palette_open {
+            self.hide_tooltip_overlay();
+            return;
+        }
+        let Some(tooltip) = self.chrome_state.tooltip.clone() else {
+            self.hide_tooltip_overlay();
+            return;
+        };
+
+        if self.tooltip_window.is_none() {
+            let attrs = Window::default_attributes()
+                .with_title("Kasumi Tooltip")
+                .with_inner_size(winit::dpi::LogicalSize::new(tooltip.width, tooltip.height))
+                .with_transparent(true)
+                .with_decorations(false)
+                .with_resizable(false)
+                .with_window_level(WindowLevel::AlwaysOnTop);
+            let window = match event_loop.create_window(attrs) {
+                Ok(window) => Arc::new(window),
+                Err(e) => {
+                    tracing::error!("Failed to create tooltip overlay: {e}");
+                    return;
+                }
+            };
+            window.set_window_level(WindowLevel::AlwaysOnTop);
+            if let Err(e) = window.set_cursor_hittest(false) {
+                tracing::warn!("Tooltip overlay click-through unavailable: {e}");
+            }
+            self.tooltip_window_id = Some(window.id());
+            self.tooltip_window = Some(window);
+        }
+
+        if self.tooltip.is_none() {
+            let Some(window) = self.tooltip_window.as_ref() else {
+                return;
+            };
+            let Some(renderer) = TooltipRenderer::new(
+                Arc::clone(window),
+                &self.wgpu_instance,
+                &self.adapter,
+                Arc::clone(&self.device),
+                Arc::clone(&self.queue),
+            ) else {
+                tracing::error!("Failed to initialize the tooltip overlay renderer");
+                return;
+            };
+            self.tooltip = Some(renderer);
+        }
+
+        let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor());
+        let size = (
+            (tooltip.width * scale as f32).round().max(1.0) as u32,
+            (tooltip.height * scale as f32).round().max(1.0) as u32,
+        );
+        let (Some(main), Some(overlay)) = (self.window.as_ref(), self.tooltip_window.as_ref())
+        else {
+            return;
+        };
+        if self.tooltip_size != Some(size) {
+            let _ = overlay.request_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1));
+            self.tooltip_size = Some(size);
+        }
+        let origin = main.inner_position().or_else(|_| main.outer_position());
+        if let Ok(origin) = origin {
+            overlay.set_outer_position(overlay_screen_position(
+                origin,
+                (tooltip.anchor.x, tooltip.anchor.y),
+                scale,
+            ));
+        }
+        if !self.tooltip_visible {
+            overlay.set_visible(true);
+            if let Err(e) = overlay.set_cursor_hittest(false) {
+                tracing::warn!("Tooltip overlay click-through unavailable: {e}");
+            }
+            // Keep keyboard focus in the browser chrome, not the helper window.
+            main.focus_window();
+            self.tooltip_visible = true;
+        }
+        overlay.request_redraw();
+    }
+
+    fn hide_tooltip_overlay(&mut self) {
+        if self.tooltip_visible {
+            if let Some(window) = self.tooltip_window.as_ref() {
+                let _ = window.set_visible(false);
+            }
+            self.tooltip_visible = false;
+        }
+        self.tooltip_size = None;
+    }
+}
+
+/// Convert an egui content-space point into physical screen coordinates.
+///
+/// egui coordinates start at the main window's *content* origin, while the
+/// helper overlays are undecorated, so their outer origin equals their content
+/// origin. Callers must pass `inner_position()` (not `outer_position()`),
+/// otherwise macOS title-bar height shifts tooltips away from their tab rows.
+fn overlay_screen_position(
+    content_origin: winit::dpi::PhysicalPosition<i32>,
+    point: (f32, f32),
+    scale_factor: f64,
+) -> winit::dpi::PhysicalPosition<i32> {
+    winit::dpi::PhysicalPosition::new(
+        content_origin.x + (point.0 as f64 * scale_factor).round() as i32,
+        content_origin.y + (point.1 as f64 * scale_factor).round() as i32,
+    )
 }
 
 /// Cmd on macOS, Ctrl elsewhere. Keeping this decision in one place makes the
@@ -296,32 +528,44 @@ impl ApplicationHandler for KasumiBrowserHandler {
             }
         };
 
-        let chrome = ChromeRenderer::new(
+        let Some(chrome) = ChromeRenderer::new(
             Arc::clone(&window),
             &self.wgpu_instance,
             &self.adapter,
             Arc::clone(&self.device),
             Arc::clone(&self.queue),
-        );
+        ) else {
+            tracing::error!("Failed to initialize chrome renderer");
+            event_loop.exit();
+            return;
+        };
 
-        #[cfg(target_os = "macos")]
         let parent_view: *mut std::ffi::c_void = {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            if let Ok(handle) = window.window_handle() {
-                match handle.as_raw() {
+            match window.window_handle() {
+                Ok(handle) => match handle.as_raw() {
+                    #[cfg(target_os = "macos")]
                     RawWindowHandle::AppKit(appkit) => appkit.ns_view.as_ptr(),
+                    #[cfg(windows)]
+                    RawWindowHandle::Win32(win32) => win32.hwnd.get() as *mut std::ffi::c_void,
+                    #[cfg(target_os = "linux")]
+                    RawWindowHandle::Xlib(xlib) => xlib.window as usize as *mut std::ffi::c_void,
+                    #[cfg(target_os = "linux")]
+                    RawWindowHandle::Xcb(xcb) => xcb.window.get() as usize as *mut std::ffi::c_void,
                     _ => std::ptr::null_mut(),
-                }
-            } else {
-                std::ptr::null_mut()
+                },
+                Err(_) => std::ptr::null_mut(),
             }
         };
-        #[cfg(not(target_os = "macos"))]
-        let parent_view: *mut std::ffi::c_void = std::ptr::null_mut();
 
         let size = window.inner_size();
         let scale = window.scale_factor();
-        let rect = ContentRect::from_window(size.width, size.height, scale);
+        let rect = ContentRect::from_window(
+            size.width,
+            size.height,
+            scale,
+            rail_width(self.chrome_state.rail_expanded),
+        );
         tracing::info!("CEF content rect (logical): {:?}", rect);
 
         let db_path = PathBuf::from(concat!(
@@ -347,10 +591,97 @@ impl ApplicationHandler for KasumiBrowserHandler {
 
     fn window_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Overlay events never reach the main chrome or global shortcuts.
+        if Some(window_id) == self.overlay_window_id {
+            let _consumed = if let (Some(window), Some(overlay)) =
+                (self.overlay_window.as_ref(), self.overlay.as_mut())
+            {
+                overlay.on_window_event(window, &event)
+            } else {
+                false
+            };
+
+            match event {
+                WindowEvent::CloseRequested => {
+                    self.chrome_state.close_command_palette();
+                    self.sync_palette_overlay(event_loop);
+                }
+                WindowEvent::Resized(new_size) => {
+                    if let Some(overlay) = self.overlay.as_mut() {
+                        overlay.resize(new_size);
+                    }
+                }
+                WindowEvent::ScaleFactorChanged { .. } => {
+                    if let (Some(window), Some(overlay)) =
+                        (self.overlay_window.as_ref(), self.overlay.as_mut())
+                    {
+                        overlay.resize(window.inner_size());
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    let mut actions = Vec::new();
+                    if let (Some(window), Some(overlay)) =
+                        (self.overlay_window.as_ref(), self.overlay.as_mut())
+                    {
+                        actions = overlay.render(window, &mut self.chrome_state);
+                    }
+                    for action in actions {
+                        if let Some(tm) = self.tab_manager.as_mut() {
+                            tm.handle_ui_action(action);
+                        }
+                    }
+                    self.sync_palette_overlay(event_loop);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Tooltip overlay events never reach the main chrome or shortcuts.
+        if Some(window_id) == self.tooltip_window_id {
+            let _consumed = if let (Some(window), Some(tooltip)) =
+                (self.tooltip_window.as_ref(), self.tooltip.as_mut())
+            {
+                tooltip.on_window_event(window, &event)
+            } else {
+                false
+            };
+
+            match event {
+                WindowEvent::CloseRequested => {
+                    self.chrome_state.tooltip = None;
+                    self.hide_tooltip_overlay();
+                }
+                WindowEvent::Resized(new_size) => {
+                    if let Some(tooltip) = self.tooltip.as_mut() {
+                        tooltip.resize(new_size);
+                    }
+                }
+                WindowEvent::ScaleFactorChanged { .. } => {
+                    if let (Some(window), Some(tooltip)) =
+                        (self.tooltip_window.as_ref(), self.tooltip.as_mut())
+                    {
+                        tooltip.resize(window.inner_size());
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    if let (Some(window), Some(renderer)) =
+                        (self.tooltip_window.as_ref(), self.tooltip.as_mut())
+                    {
+                        if let Some(tooltip) = self.chrome_state.tooltip.clone() {
+                            renderer.render(window, &tooltip);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Let egui consume keyboard/mouse input first
         let _consumed =
             if let (Some(window), Some(chrome)) = (self.window.as_ref(), self.chrome.as_mut()) {
@@ -403,8 +734,8 @@ impl ApplicationHandler for KasumiBrowserHandler {
                             }
                         }
                         Key::Character(c) if ctrl => match c.as_str() {
-                            "l" | "L" => {
-                                self.ctrl_l_pressed = true;
+                            "l" | "L" | "k" | "K" => {
+                                self.chrome_state.open_command_palette();
                             }
                             "t" | "T" => {
                                 if let Some(tm) = self.tab_manager.as_mut() {
@@ -435,14 +766,21 @@ impl ApplicationHandler for KasumiBrowserHandler {
                 if let Some(chrome) = self.chrome.as_mut() {
                     chrome.resize(*new_size);
                 }
+                self.position_palette_overlay();
                 if let (Some(window), Some(tm)) = (self.window.as_ref(), self.tab_manager.as_mut())
                 {
                     let scale = window.scale_factor();
-                    let rect = ContentRect::from_window(new_size.width, new_size.height, scale);
+                    let rect = ContentRect::from_window(
+                        new_size.width,
+                        new_size.height,
+                        scale,
+                        rail_width(self.chrome_state.rail_expanded),
+                    );
                     tm.resize(rect);
                 }
             }
             WindowEvent::RedrawRequested => {
+                let rail_before = self.chrome_state.rail_expanded;
                 if let (Some(window), Some(chrome), Some(tm)) = (
                     self.window.as_ref(),
                     self.chrome.as_mut(),
@@ -452,16 +790,35 @@ impl ApplicationHandler for KasumiBrowserHandler {
                     // iteration in `about_to_wait`, never here. This keeps all
                     // CEF work in one non-window-event callback and prevents
                     // double-processing.
-                    let ctrl_l = std::mem::take(&mut self.ctrl_l_pressed);
-                    let actions = chrome.render(window, &mut self.chrome_state, ctrl_l);
+                    let actions = chrome.render(window, &mut self.chrome_state);
 
                     for action in actions {
                         tm.handle_ui_action(action);
                     }
                 }
+
+                if rail_before != self.chrome_state.rail_expanded {
+                    if let (Some(window), Some(tm)) =
+                        (self.window.as_ref(), self.tab_manager.as_mut())
+                    {
+                        let size = window.inner_size();
+                        let scale = window.scale_factor();
+                        let rect = ContentRect::from_window(
+                            size.width,
+                            size.height,
+                            scale,
+                            rail_width(self.chrome_state.rail_expanded),
+                        );
+                        tracing::info!("Workspace rail toggled; CEF content rect: {:?}", rect);
+                        tm.resize(rect);
+                    }
+                }
             }
             _ => {}
         }
+
+        self.sync_palette_overlay(event_loop);
+        self.sync_tooltip_overlay(event_loop);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -497,11 +854,17 @@ impl ApplicationHandler for KasumiBrowserHandler {
 
         if let Some(tm) = self.tab_manager.as_mut() {
             tm.pump_events();
+            if tm.consume_command_palette_request() {
+                self.chrome_state.open_command_palette();
+            }
             if !self.shutdown_requested {
                 tm.tick();
             }
             tm.update_chrome_state(&mut self.chrome_state);
         }
+
+        self.sync_palette_overlay(event_loop);
+        self.sync_tooltip_overlay(event_loop);
 
         if self.shutdown_requested {
             self.shutdown_ticks += 1;
@@ -757,7 +1120,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::is_primary_shortcut_modifier;
+    use super::{is_primary_shortcut_modifier, overlay_screen_position};
+    use winit::dpi::PhysicalPosition;
     use winit::keyboard::ModifiersState;
 
     #[test]
@@ -773,5 +1137,14 @@ mod tests {
         ));
         assert!(!is_primary_shortcut_modifier(ModifiersState::SHIFT));
         assert!(!is_primary_shortcut_modifier(ModifiersState::ALT));
+    }
+
+    #[test]
+    fn overlay_position_uses_content_origin_and_pixel_scale() {
+        let position = overlay_screen_position(PhysicalPosition::new(100, 40), (188.0, 174.0), 2.0);
+        assert_eq!((position.x, position.y), (476, 388));
+
+        let position = overlay_screen_position(PhysicalPosition::new(100, 40), (52.0, 120.5), 1.0);
+        assert_eq!((position.x, position.y), (152, 161));
     }
 }

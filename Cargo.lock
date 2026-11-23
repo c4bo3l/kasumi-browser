@@ -837,6 +837,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_material_icons"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1456a754392e6007785d625c4f17b0150d57c3e41b14b0ea282dee653d25046"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1450,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "kasumi-browser"
-version = "0.1.9"
+version = "0.2.0"
 dependencies = [
  "adblock",
  "cef",
@@ -1458,6 +1467,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "egui_material_icons",
  "mimalloc",
  "objc2 0.5.3",
  "objc2-app-kit 0.2.2",

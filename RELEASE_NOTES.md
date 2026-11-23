@@ -4,6 +4,43 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
+## v0.2.0 — 2026-11-23
+
+### Added
+
+- Collapsible vertical workspace rail: starts expanded at 180 px with tabs, Command, New tab, Hibernate, shield, and RAM controls; `«` collapses it to a 44 px favicon-only rail with clickable tab switching and an active-tab indicator.
+- Floating `Cmd/Ctrl+K` command palette with tab search, address/search resolution, keyboard selection (`↑`/`↓`, `Enter`, `Esc`), and quick actions. `Cmd/Ctrl+L` now opens the same palette seeded with the active URL.
+- CEF now forwards `Cmd/Ctrl+K` from the web view to the native chrome, so the palette opens even when page content has keyboard focus.
+- Rail controls use the Material Symbols icon font (pinned to the egui 0.30-compatible release), replacing hand-drawn glyphs with crisp, consistent icons.
+- Rail tooltips now appear vertically centered beside the hovered row in both expanded and collapsed modes, use high-contrast text on a dark frame, and render in a transparent click-through overlay above the CEF page instead of inside the rail.
+- Each tab row now reveals a hover-only × close button: right side when expanded, top-right when collapsed. The loading/hibernated marker shifts left so the two never overlap.
+- The command palette now renders in a transparent, always-on-top native overlay window: the page stays visible behind it, input is focused immediately, and any primary click outside the palette card closes it. A focus request raised during the opening frame is carried into the overlay's next frame instead of being discarded.
+- The collapse control is pinned to the outer edge of the expanded rail.
+- Cross-platform parent-view extraction for macOS `NSView`, Windows `HWND`, and X11/XCB windows; show/hide/resize use one platform-agnostic interface.
+
+### Changed
+
+- CEF content now starts at `x = rail_width`, `y = 0` and fills the full window height, replacing the previous fixed 76 px top chrome.
+- The command palette uses a separate transparent winit window instead of covering the native CEF child view, so page content remains visible behind the dimmed overlay on macOS, Windows, and Linux.
+- Command palette labels now render inside their highlight rectangles, and mouse hover no longer overrides the keyboard selection.
+- Bumped the project and macOS bundle version from `0.1.9` to `0.2.0`.
+- Removed the obsolete `BUGFIX_TASKS.md` handoff; its completed items remain documented in the v0.1.9 and v0.2.0 release notes.
+
+### Fixed
+
+- Eliminated the `egui_wgpu::renderer: Detected a linear (sRGBA aware) framebuffer` warning by preferring `Rgba8Unorm`/`Bgra8Unorm` surface formats for the chrome, palette overlay, and tooltip overlay. Surface creation errors are now logged instead of panicking.
+- Tooltip overlays are now anchored to the main window's content origin rather than its frame origin, and the visible card fills its overlay window so it is vertically centered on the hovered tab row on macOS and HiDPI displays. The command palette uses the same content-origin mapping.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser` — 56 tests, including default rail visibility, rail widths, over-page tooltip metrics/anchoring in both modes, overlay content-origin scaling, hover close-button geometry, palette focus-request carry-over, click-outside dismissal, command palette candidates/keyboard selection/row fill, CEF Cmd/Ctrl+K forwarding, rail-relative content rectangles, and non-sRGB surface-format fallback behavior.
+- `cargo build --release`
+- Manual runtime verification completed on macOS: expanded/collapsed rail, command palette overlay and click-outside dismissal, hover close buttons, vertically centered tooltips, and clean shutdown confirmed by the user.
+
+---
+
 ## v0.1.9 — 2026-11-23
 
 ### Fixed
