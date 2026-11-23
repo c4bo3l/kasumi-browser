@@ -8,7 +8,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ### Added
 
-- Added `.github/workflows/pr.yml` for pull requests targeting `main`. It checks formatting and runs `cargo check --bins`.
+- Added `.github/workflows/pr.yml` for pull requests targeting `main`. It checks formatting and runs `cargo check --bins` on the supported `macos-15-intel` runner.
 - Added Cargo and CEF caches to the PR workflow to keep CI runs fast.
 - Unit tests are run locally for now and are not part of PR CI.
 
