@@ -1,13 +1,17 @@
-//! egui + wgpu browser chrome: tab strip (38 px) + toolbar (38 px) = 76 px total.
+//! egui + wgpu browser chrome: a collapsible vertical workspace rail plus a
+//! floating Cmd/Ctrl+K command palette.
 //!
 //! # Architecture
-//! `ChromeRenderer` owns the wgpu surface, device/queue, and egui context.  
+//! `ChromeRenderer` owns the wgpu surface, device/queue, and egui context.
 //! Each frame the caller:
 //! 1. Updates `ChromeState` with the current tab list / active-tab info.
 //! 2. Calls `render()` → draws the chrome and returns any `UiAction`s the user triggered.
 //!
-//! The CEF content renders entirely in a separate native OS child window that sits
-//! *below* the chrome at y-offset 76 px (logical).  This file never touches CEF.
+//! The CEF content renders in a separate native OS child view that starts at
+//! `x = rail_width` and fills the remaining window height. The command palette
+//! and rail tooltips use transparent native overlay windows so they appear
+//! above that child view; the browser keeps running underneath and the page
+//! stays visible. This file never touches CEF directly.
 
 #![allow(dead_code)]
 
@@ -15,13 +19,63 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use egui::{
-    pos2, vec2, Align, Color32, Frame, Layout, Response, RichText, Rounding, Sense, Stroke,
-    TextEdit, TextureOptions, Ui,
+    pos2, vec2, Align, Align2, Color32, FontFamily, FontId, Frame, Layout, Order, Response,
+    RichText, Rounding, Sense, Stroke, TextEdit, TextureOptions, Ui, UiBuilder,
 };
 use egui_wgpu::ScreenDescriptor;
 
-use crate::config::{CHROME_HEIGHT, DEFAULT_SEARCH_URL_PREFIX, TAB_BAR_HEIGHT};
+use crate::config::{
+    rail_width, COMMAND_PALETTE_TOP_OFFSET, COMMAND_PALETTE_WIDTH, DEFAULT_SEARCH_URL_PREFIX,
+};
 use crate::events::UiAction;
+
+/// Rail palette. Keeping these as named constants makes the active state
+/// consistent between the expanded and favicon-only layouts.
+const RAIL_BG: Color32 = Color32::from_rgb(24, 25, 29);
+const RAIL_SURFACE: Color32 = Color32::from_rgb(38, 44, 58);
+const RAIL_ROW_ACTIVE: Color32 = Color32::from_rgb(52, 75, 112);
+const RAIL_ROW_HOVER: Color32 = Color32::from_rgb(42, 46, 54);
+const RAIL_ACCENT: Color32 = Color32::from_rgb(110, 170, 255);
+const RAIL_TEXT: Color32 = Color32::from_rgb(214, 218, 226);
+const RAIL_TEXT_DIM: Color32 = Color32::from_rgb(140, 148, 162);
+const TOOLTIP_WIDTH: f32 = 240.0;
+const TOOLTIP_HEIGHT_EXPANDED: f32 = 52.0;
+const TOOLTIP_HEIGHT_COLLAPSED: f32 = 40.0;
+const PALETTE_ROW_SELECTED: Color32 = Color32::from_rgb(58, 82, 120);
+const PALETTE_ROW_HOVER: Color32 = Color32::from_rgb(44, 48, 56);
+
+/// Prefer egui's recommended non-sRGB surface formats. Some drivers only list
+/// `Bgra8UnormSrgb` first, which makes `egui_wgpu` warn about linear sRGB
+/// framebuffers; choosing the matching `Unorm` format avoids the warning.
+fn preferred_surface_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFormat> {
+    formats
+        .iter()
+        .copied()
+        .find(|format| *format == wgpu::TextureFormat::Rgba8Unorm)
+        .or_else(|| {
+            formats
+                .iter()
+                .copied()
+                .find(|format| *format == wgpu::TextureFormat::Bgra8Unorm)
+        })
+        .or_else(|| formats.iter().copied().find(|format| !format.is_srgb()))
+        .or_else(|| formats.first().copied())
+}
+
+/// Semantic icons mapped to the registered Material Symbols font. Keeping a
+/// small enum prevents glyph constants from leaking into the layout code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RailIcon {
+    Plus,
+    Search,
+    ChevronLeft,
+    ChevronRight,
+    Moon,
+    Shield,
+    Chip,
+    Globe,
+    Close,
+}
 
 // ---------------------------------------------------------------------------
 // Public data types
@@ -57,13 +111,42 @@ pub struct TabInfo {
     pub favicon: Option<Favicon>,
 }
 
+/// An action produced by selecting a command-palette row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandAction {
+    SelectTab(u64),
+    NewTab(Option<String>),
+    Navigate { tab_id: u64, url: String },
+    HibernateAll,
+    ToggleRail,
+}
+
+/// One row in the floating command palette.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPaletteItem {
+    pub icon: &'static str,
+    pub label: String,
+    pub subtitle: String,
+    pub action: CommandAction,
+}
+
+/// A rail tooltip to draw in a transparent overlay above the CEF page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RailTooltip {
+    pub text: String,
+    /// Top-left corner in main-window logical coordinates.
+    pub anchor: egui::Pos2,
+    pub width: f32,
+    pub height: f32,
+}
+
 /// All mutable UI state consumed by `ChromeRenderer::render()` each frame.
 pub struct ChromeState {
     pub tabs: Vec<TabInfo>,
     pub active_tab_id: Option<u64>,
-    /// Text currently shown in the omnibox input field.
+    /// Text mirrored from the active tab; the command palette edits a copy.
     pub omnibox_text: String,
-    /// True while the user is editing the omnibox; prevents event-driven clobbering.
+    /// True while the command palette is editing `omnibox_text`.
     pub omnibox_focused: bool,
     /// Tab whose URL was last copied into the omnibox.
     pub last_synced_tab_id: Option<u64>,
@@ -73,6 +156,18 @@ pub struct ChromeState {
     pub is_loading: bool,
     /// RAM used by this process in megabytes (updated by sysinfo watchdog).
     pub ram_mb: u64,
+    /// Whether the vertical workspace rail is expanded.
+    pub rail_expanded: bool,
+    /// Whether the floating Cmd/Ctrl+K palette is visible.
+    pub command_palette_open: bool,
+    /// Current query in the command palette.
+    pub command_palette_query: String,
+    /// Currently highlighted command palette row.
+    pub command_selection: usize,
+    /// Set when the palette should focus and select its query on next render.
+    pub command_palette_focus_requested: bool,
+    /// Latest rail tooltip; consumed by the overlay window on each frame.
+    pub tooltip: Option<RailTooltip>,
 }
 
 impl Default for ChromeState {
@@ -86,7 +181,39 @@ impl Default for ChromeState {
             last_synced_url: String::new(),
             is_loading: false,
             ram_mb: 0,
+            // Start visible so the vertical layout is immediately discoverable;
+            // the ‹ button collapses it to a favicon-only rail.
+            rail_expanded: true,
+            command_palette_open: false,
+            command_palette_query: String::new(),
+            command_selection: 0,
+            command_palette_focus_requested: false,
+            tooltip: None,
         }
+    }
+}
+
+impl ChromeState {
+    /// Open the command palette seeded with the active tab's current address.
+    pub fn open_command_palette(&mut self) {
+        if !self.command_palette_open {
+            self.command_palette_query = self.omnibox_text.clone();
+            self.command_selection = 0;
+            self.command_palette_focus_requested = true;
+        }
+        self.command_palette_open = true;
+    }
+
+    pub fn close_command_palette(&mut self) {
+        self.command_palette_open = false;
+        self.command_palette_query.clear();
+        self.command_selection = 0;
+        self.command_palette_focus_requested = false;
+        self.tooltip = None;
+    }
+
+    pub fn toggle_rail(&mut self) {
+        self.rail_expanded = !self.rail_expanded;
     }
 }
 
@@ -119,19 +246,26 @@ impl ChromeRenderer {
         adapter: &wgpu::Adapter,
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
-    ) -> Self {
-        let surface = instance
-            .create_surface(Arc::clone(&window))
-            .expect("create_surface failed");
+    ) -> Option<Self> {
+        let surface = match instance.create_surface(Arc::clone(&window)) {
+            Ok(surface) => surface,
+            Err(e) => {
+                tracing::error!("Failed to create chrome surface: {e}");
+                return None;
+            }
+        };
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(adapter);
-        let format = caps
-            .formats
-            .iter()
+        let Some(format) = preferred_surface_format(&caps.formats) else {
+            tracing::error!("Chrome adapter reported no surface formats");
+            return None;
+        };
+        let alpha_mode = caps
+            .alpha_modes
+            .first()
             .copied()
-            .find(|f| f.is_srgb())
-            .unwrap_or(caps.formats[0]);
+            .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
 
         // Clamp surface dimensions to the adapter's max texture size.
         let max_tex = adapter.limits().max_texture_dimension_2d;
@@ -141,7 +275,7 @@ impl ChromeRenderer {
             width: size.width.max(1).min(max_tex),
             height: size.height.max(1).min(max_tex),
             present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -149,6 +283,9 @@ impl ChromeRenderer {
 
         let renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
         let egui_ctx = egui::Context::default();
+        // Register the Material Symbols fallback used by every rail icon. It
+        // is pinned to the egui 0.30-compatible crate release.
+        egui_material_icons::initialize(&egui_ctx);
         // Tooltips must appear immediately; the default delay makes the chrome
         // controls look unlabeled during quick hovers.
         egui_ctx.style_mut(|style| {
@@ -164,7 +301,7 @@ impl ChromeRenderer {
             Some(max_tex as usize),
         );
 
-        Self {
+        Some(Self {
             surface,
             device,
             queue,
@@ -174,7 +311,7 @@ impl ChromeRenderer {
             egui_state,
             favicon_textures: HashMap::new(),
             max_texture_dim: max_tex,
-        }
+        })
     }
 
     /// Forward a winit `WindowEvent` to egui for input processing.
@@ -202,30 +339,15 @@ impl ChromeRenderer {
         &mut self,
         window: &winit::window::Window,
         state: &mut ChromeState,
-        ctrl_l_pressed: bool,
     ) -> Vec<UiAction> {
         let mut actions: Vec<UiAction> = Vec::new();
 
         self.sync_favicon_textures(state);
 
-        let mut raw_input = self.egui_state.take_egui_input(window);
-
-        if ctrl_l_pressed {
-            state.omnibox_focused = true;
-            // Let the focused TextEdit process a synthetic Cmd/Ctrl+A so the
-            // whole current URL is selected, matching browser omnibox behavior.
-            raw_input.events.push(egui::Event::Key {
-                key: egui::Key::A,
-                physical_key: Some(egui::Key::A),
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::COMMAND,
-            });
-        }
-
+        let raw_input = self.egui_state.take_egui_input(window);
         let egui_ctx = self.egui_ctx.clone();
         let full_output = egui_ctx.run(raw_input, |ctx| {
-            self.build_ui(ctx, state, &mut actions, ctrl_l_pressed);
+            self.build_ui(ctx, state, &mut actions);
         });
 
         self.egui_state
@@ -277,9 +399,9 @@ impl ChromeRenderer {
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.17,
-                                g: 0.17,
-                                b: 0.17,
+                                r: 0.10,
+                                g: 0.11,
+                                b: 0.13,
                                 a: 1.0,
                             }),
                             store: wgpu::StoreOp::Store,
@@ -338,361 +460,550 @@ impl ChromeRenderer {
     // UI construction
     // -----------------------------------------------------------------------
 
-    fn build_ui(
-        &self,
-        ctx: &egui::Context,
-        state: &mut ChromeState,
-        actions: &mut Vec<UiAction>,
-        ctrl_l_pressed: bool,
-    ) {
-        let tab_height = TAB_BAR_HEIGHT;
-        let _chrome_height = CHROME_HEIGHT;
+    fn build_ui(&self, ctx: &egui::Context, state: &mut ChromeState, actions: &mut Vec<UiAction>) {
+        self.build_rail(ctx, state, actions);
 
-        // ── Tab Strip ───────────────────────────────────────────────────────
-        egui::TopBottomPanel::top("tab_strip")
-            .exact_height(tab_height)
-            .frame(Frame::none().fill(Color32::from_rgb(30, 31, 35)))
-            .show(ctx, |ui| {
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.add_space(5.0);
-
-                    egui::ScrollArea::horizontal()
-                        .id_salt("tab_scroll")
-                        .show(ui, |ui| {
-                            for tab in &state.tabs {
-                                let is_active = state.active_tab_id == Some(tab.id);
-                                let tab_id = tab.id;
-
-                                let title = if tab.title.is_empty() {
-                                    "New Tab".to_string()
-                                } else {
-                                    truncate_title(&tab.title, 24)
-                                };
-
-                                let label_text = if tab.is_loading {
-                                    format!("⟳ {}", title)
-                                } else if tab.display_state == TabDisplayState::Hibernated {
-                                    format!("💤 {}", title)
-                                } else {
-                                    title.clone()
-                                };
-
-                                let fill = if is_active {
-                                    Color32::from_rgb(64, 66, 72)
-                                } else {
-                                    Color32::from_rgb(44, 45, 50)
-                                };
-                                let stroke = if is_active {
-                                    Stroke::new(1.0_f32, Color32::from_rgb(88, 140, 220))
-                                } else {
-                                    Stroke::new(0.5_f32, Color32::from_rgb(62, 63, 68))
-                                };
-
-                                let frame_resp = Frame::none()
-                                    .fill(fill)
-                                    .rounding(Rounding::same(6.0))
-                                    .stroke(stroke)
-                                    .inner_margin(egui::Margin::symmetric(8.0, 0.0))
-                                    .show(ui, |ui| {
-                                        ui.set_max_height(tab_height - 4.0);
-                                        ui.with_layout(
-                                            Layout::left_to_right(Align::Center),
-                                            |ui| {
-                                                self.paint_favicon(ui, tab);
-
-                                                let tab_btn = ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new(&label_text)
-                                                            .color(Color32::from_rgb(235, 235, 238))
-                                                            .size(13.0),
-                                                    )
-                                                    .sense(Sense::click()),
-                                                );
-                                                if tab_btn.clicked() {
-                                                    actions.push(UiAction::SelectTab { tab_id });
-                                                }
-                                                Self::chrome_tooltip(
-                                                    ui,
-                                                    &tab_btn,
-                                                    format!("{}\n{}", tab.title, tab.url),
-                                                );
-
-                                                ui.add_space(4.0);
-
-                                                let close = ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new("×")
-                                                            .color(Color32::from_rgb(150, 150, 155))
-                                                            .size(15.0),
-                                                    )
-                                                    .sense(Sense::click()),
-                                                );
-                                                if close.hovered() {
-                                                    ui.painter().rect_filled(
-                                                        close.rect,
-                                                        Rounding::same(4.0_f32),
-                                                        Color32::from_rgba_unmultiplied(
-                                                            255, 255, 255, 28,
-                                                        ),
-                                                    );
-                                                }
-                                                if close.clicked() {
-                                                    actions.push(UiAction::CloseTab { tab_id });
-                                                }
-                                                Self::chrome_tooltip(
-                                                    ui,
-                                                    &close,
-                                                    "Close tab (middle-click anywhere on tab)",
-                                                );
-                                            },
-                                        );
-                                    });
-
-                                let tab_hit = ui.interact(
-                                    frame_resp.response.rect,
-                                    egui::Id::new(("tab_middle_click", tab_id)),
-                                    Sense::click(),
-                                );
-                                if tab_hit.middle_clicked() {
-                                    actions.push(UiAction::CloseTab { tab_id });
-                                }
-
-                                if frame_resp.response.hovered() && !is_active {
-                                    ui.painter().rect_filled(
-                                        frame_resp.response.rect,
-                                        Rounding::same(6.0_f32),
-                                        Color32::from_rgba_unmultiplied(255, 255, 255, 12),
-                                    );
-                                }
-
-                                if is_active {
-                                    let rect = frame_resp.response.rect;
-                                    ui.painter().line_segment(
-                                        [
-                                            pos2(rect.left() + 7.0, rect.top() + 1.0),
-                                            pos2(rect.right() - 7.0, rect.top() + 1.0),
-                                        ],
-                                        Stroke::new(2.0_f32, Color32::from_rgb(120, 175, 255)),
-                                    );
-                                }
-
-                                ui.add_space(3.0);
-                            }
-                        });
-
-                    let new_tab = ui.add(
-                        egui::Label::new(RichText::new("+").color(Color32::WHITE).size(17.0))
-                            .sense(Sense::click()),
-                    );
-                    if new_tab.clicked() {
-                        actions.push(UiAction::NewTab { url: None });
-                    }
-                    Self::chrome_tooltip(ui, &new_tab, "New tab (Cmd/Ctrl+T)");
-                });
-            });
-
-        // ── Toolbar (nav + omnibox + badges) ───────────────────────────────
-        egui::TopBottomPanel::top("toolbar")
-            .exact_height(TAB_BAR_HEIGHT)
-            .frame(Frame::none().fill(Color32::from_rgb(34, 35, 39)))
-            .show(ctx, |ui| {
-                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                    ui.add_space(6.0);
-
-                    let active_tab = state
-                        .tabs
-                        .iter()
-                        .find(|t| Some(t.id) == state.active_tab_id);
-                    let can_back = active_tab.map(|t| t.can_go_back).unwrap_or(false);
-                    let can_fwd = active_tab.map(|t| t.can_go_forward).unwrap_or(false);
-
-                    let back = Self::nav_button(ui, can_back, true, "Back (Cmd/Ctrl+←)");
-                    if back.clicked() && can_back {
-                        if let Some(id) = state.active_tab_id {
-                            actions.push(UiAction::GoBack { tab_id: id });
-                        }
-                    }
-
-                    let forward = Self::nav_button(ui, can_fwd, false, "Forward (Cmd/Ctrl+→)");
-                    if forward.clicked() && can_fwd {
-                        if let Some(id) = state.active_tab_id {
-                            actions.push(UiAction::GoForward { tab_id: id });
-                        }
-                    }
-
-                    let (reload_label, is_loading_now, reload_tooltip) = if state.is_loading {
-                        ("✕", true, "Stop loading (Esc)")
-                    } else {
-                        ("↻", false, "Reload (Cmd/Ctrl+R)")
-                    };
-                    let reload_btn = ui.add_sized(
-                        vec2(28.0, 28.0),
-                        egui::Button::new(
-                            RichText::new(reload_label).color(Color32::WHITE).size(16.0),
-                        )
-                        .stroke(Stroke::NONE),
-                    );
-                    if reload_btn.clicked() {
-                        if let Some(id) = state.active_tab_id {
-                            if is_loading_now {
-                                actions.push(UiAction::Stop { tab_id: id });
-                            } else {
-                                actions.push(UiAction::Reload {
-                                    tab_id: id,
-                                    ignore_cache: false,
-                                });
-                            }
-                        }
-                    }
-                    Self::chrome_tooltip(ui, &reload_btn, reload_tooltip);
-
-                    ui.add_space(4.0);
-
-                    let omnibox_width = (ui.available_width() - 160.0).max(160.0);
-                    let omnibox_id = egui::Id::new("kasumi_omnibox");
-                    if ctrl_l_pressed {
-                        // Set focus before the widget processes this frame's
-                        // synthetic select-all event.
-                        ctx.memory_mut(|mem| mem.request_focus(omnibox_id));
-                    }
-                    let omnibox_resp = ui.add(
-                        TextEdit::singleline(&mut state.omnibox_text)
-                            .id(omnibox_id)
-                            .desired_width(omnibox_width)
-                            .hint_text("Search or enter address…")
-                            .text_color(Color32::WHITE)
-                            .frame(true),
-                    );
-
-                    state.omnibox_focused = omnibox_resp.has_focus();
-                    Self::chrome_tooltip(ui, &omnibox_resp, "Search or enter address (Cmd/Ctrl+L)");
-
-                    if omnibox_resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        let url = resolve_omnibox(&state.omnibox_text);
-                        if let Some(id) = state.active_tab_id {
-                            actions.push(UiAction::Navigate { tab_id: id, url });
-                        }
-                        state.omnibox_focused = false;
-                    }
-
-                    ui.add_space(4.0);
-
-                    let blocked: u32 = active_tab.map(|t| t.blocked_requests).unwrap_or(0);
-                    let shield = ui.label(
-                        RichText::new(format!("🛡 {}", blocked))
-                            .color(Color32::from_rgb(80, 200, 120))
-                            .size(12.0),
-                    );
-                    Self::chrome_tooltip(ui, &shield, format!("Blocked requests: {}", blocked));
-
-                    ui.add_space(4.0);
-
-                    let hibernate_btn = ui.add_sized(
-                        vec2(28.0, 28.0),
-                        egui::Button::new(RichText::new("💤").color(Color32::WHITE).size(14.0))
-                            .stroke(Stroke::NONE),
-                    );
-                    if hibernate_btn.clicked() {
-                        actions.push(UiAction::HibernateAllBackground);
-                    }
-                    Self::chrome_tooltip(
-                        ui,
-                        &hibernate_btn,
-                        "Hibernate all background tabs (Alt+H)",
-                    );
-
-                    ui.add_space(4.0);
-
-                    let ram = ui.label(
-                        RichText::new(format!("RAM: {} MB", state.ram_mb))
-                            .color(Color32::GRAY)
-                            .size(11.0),
-                    );
-                    Self::chrome_tooltip(ui, &ram, "Browser-process RAM usage");
-
-                    ui.add_space(4.0);
-                });
-            });
-
-        // Fill the rest of the window with a transparent (zero-height) central panel.
+        // The CEF view occupies everything to the right of the rail. The
+        // central panel is transparent so it never paints over page content.
         egui::CentralPanel::default()
             .frame(Frame::none().fill(Color32::TRANSPARENT))
             .show(ctx, |_ui| {});
     }
 
-    /// Draw a native chevron icon so Back/Forward never depend on font glyphs.
-    fn nav_button(ui: &mut Ui, enabled: bool, point_left: bool, tooltip: &str) -> Response {
-        let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
-        if !ui.is_rect_visible(rect) {
-            Self::chrome_tooltip(ui, &response, tooltip);
-            return response;
-        }
+    /// Draw the collapsible left workspace rail.
+    fn build_rail(
+        &self,
+        ctx: &egui::Context,
+        state: &mut ChromeState,
+        actions: &mut Vec<UiAction>,
+    ) {
+        // Tooltips are rendered in a transparent overlay above the page, so
+        // collect the hovered row for this frame instead of painting in-rail.
+        let mut rail_tooltip: Option<RailTooltip> = None;
+        let width = rail_width(state.rail_expanded);
+        let rail = egui::SidePanel::left("workspace_rail")
+            .exact_width(width)
+            .resizable(false)
+            .frame(Frame::none().fill(RAIL_BG))
+            .show(ctx, |ui| {
+                if !state.rail_expanded {
+                    // Favicon-only mode: show one large, clickable icon per tab,
+                    // plus always-visible expand / new-tab / command controls.
+                    ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                        ui.add_space(5.0);
 
-        let painter = ui.painter();
-        if response.hovered() {
-            painter.rect_filled(rect, Rounding::same(6.0), Color32::from_rgb(68, 69, 75));
-        }
+                        let expand =
+                            Self::rail_icon_button(ui, vec2(34.0, 30.0), RailIcon::ChevronRight);
+                        if expand.clicked() {
+                            state.toggle_rail();
+                        }
+                        Self::chrome_tooltip(
+                            &mut rail_tooltip,
+                            ui,
+                            &expand,
+                            "Expand workspace rail",
+                            state.rail_expanded,
+                        );
 
-        let color = if enabled {
-            Color32::from_rgb(235, 235, 238)
-        } else {
-            Color32::from_rgb(105, 106, 112)
-        };
-        let center = rect.center();
-        let tip_x = if point_left {
-            center.x - 4.0
-        } else {
-            center.x + 4.0
-        };
-        let base_x = if point_left {
-            center.x + 3.0
-        } else {
-            center.x - 3.0
-        };
-        let stroke = Stroke::new(1.8_f32, color);
-        painter.line_segment(
-            [pos2(tip_x, center.y), pos2(base_x, center.y - 5.5)],
-            stroke,
-        );
-        painter.line_segment(
-            [pos2(tip_x, center.y), pos2(base_x, center.y + 5.5)],
-            stroke,
-        );
+                        ui.add_space(3.0);
+                        let new_tab = Self::rail_icon_button(ui, vec2(34.0, 34.0), RailIcon::Plus);
+                        if new_tab.clicked() {
+                            actions.push(UiAction::NewTab { url: None });
+                        }
+                        Self::chrome_tooltip(
+                            &mut rail_tooltip,
+                            ui,
+                            &new_tab,
+                            "New tab (Cmd/Ctrl+T)",
+                            state.rail_expanded,
+                        );
 
-        Self::chrome_tooltip(ui, &response, tooltip);
-        response
+                        ui.add_space(2.0);
+                        let command =
+                            Self::rail_icon_button(ui, vec2(34.0, 30.0), RailIcon::Search);
+                        if command.clicked() {
+                            state.open_command_palette();
+                        }
+                        Self::chrome_tooltip(
+                            &mut rail_tooltip,
+                            ui,
+                            &command,
+                            "Command palette (Cmd/Ctrl+K)",
+                            state.rail_expanded,
+                        );
+
+                        ui.add_space(5.0);
+                        ui.separator();
+                        ui.add_space(5.0);
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("favicon_rail_tabs")
+                            .show(ui, |ui| {
+                                for tab in &state.tabs {
+                                    let tab_id = tab.id;
+                                    let is_active = state.active_tab_id == Some(tab_id);
+                                    let (row_rect, row_resp) = ui.allocate_exact_size(
+                                        vec2(width - 6.0, 44.0),
+                                        Sense::click(),
+                                    );
+
+                                    Self::paint_tab_row(
+                                        ui,
+                                        row_rect,
+                                        is_active,
+                                        row_resp.hovered(),
+                                    );
+                                    let icon_rect = egui::Rect::from_center_size(
+                                        row_rect.center(),
+                                        vec2(24.0, 24.0),
+                                    );
+                                    self.paint_favicon_in_rect(ui, tab, icon_rect);
+                                    let close_resp = Self::paint_tab_close(
+                                        ui,
+                                        row_rect,
+                                        row_resp.hovered(),
+                                        tab_id,
+                                        false,
+                                    );
+                                    Self::paint_tab_status(ui, row_rect, tab, false);
+
+                                    if close_resp.clicked() {
+                                        actions.push(UiAction::CloseTab { tab_id });
+                                    } else if row_resp.clicked() {
+                                        actions.push(UiAction::SelectTab { tab_id });
+                                    }
+                                    if row_resp.middle_clicked() {
+                                        actions.push(UiAction::CloseTab { tab_id });
+                                    }
+                                    let tooltip_text = if state.rail_expanded {
+                                        format!("{}\n{}", tab.title, tab.url)
+                                    } else {
+                                        tab.title.clone()
+                                    };
+                                    Self::chrome_tooltip(
+                                        &mut rail_tooltip,
+                                        ui,
+                                        &row_resp,
+                                        tooltip_text,
+                                        state.rail_expanded,
+                                    );
+                                }
+                            });
+                    });
+                    return;
+                }
+
+                ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
+                    ui.add_space(7.0);
+                    ui.horizontal(|ui| {
+                        // Keep the collapse affordance pinned to the outer
+                        // edge; the workspace label follows it.
+                        ui.add_space(3.0);
+                        let collapse =
+                            Self::rail_icon_button(ui, vec2(26.0, 26.0), RailIcon::ChevronLeft);
+                        if collapse.clicked() {
+                            state.toggle_rail();
+                        }
+                        Self::chrome_tooltip(
+                            &mut rail_tooltip,
+                            ui,
+                            &collapse,
+                            "Collapse workspace rail",
+                            state.rail_expanded,
+                        );
+                        ui.add_space(7.0);
+                        let brand = ui.label(
+                            RichText::new("KASUMI")
+                                .size(12.0)
+                                .strong()
+                                .color(Color32::from_rgb(150, 185, 235)),
+                        );
+                        Self::chrome_tooltip(
+                            &mut rail_tooltip,
+                            ui,
+                            &brand,
+                            "Kasumi Browser workspace",
+                            state.rail_expanded,
+                        );
+                    });
+
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    ui.add_space(2.0);
+                    let command = Self::rail_action_button(
+                        ui,
+                        width - 12.0,
+                        32.0,
+                        RailIcon::Search,
+                        "Command",
+                    );
+                    if command.clicked() {
+                        state.open_command_palette();
+                    }
+                    Self::chrome_tooltip(
+                        &mut rail_tooltip,
+                        ui,
+                        &command,
+                        "Open command palette (Cmd/Ctrl+K)",
+                        state.rail_expanded,
+                    );
+
+                    ui.add_space(3.0);
+                    let new_tab =
+                        Self::rail_action_button(ui, width - 12.0, 32.0, RailIcon::Plus, "New tab");
+                    if new_tab.clicked() {
+                        actions.push(UiAction::NewTab { url: None });
+                    }
+                    Self::chrome_tooltip(
+                        &mut rail_tooltip,
+                        ui,
+                        &new_tab,
+                        "New tab (Cmd/Ctrl+T)",
+                        state.rail_expanded,
+                    );
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("WORKSPACE")
+                                .size(9.0)
+                                .color(Color32::from_rgb(125, 130, 140)),
+                        );
+                    });
+                    ui.add_space(2.0);
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("rail_tabs")
+                        .show(ui, |ui| {
+                            for tab in &state.tabs {
+                                let tab_id = tab.id;
+                                let is_active = state.active_tab_id == Some(tab_id);
+                                let title = if tab.title.is_empty() {
+                                    "New Tab".to_string()
+                                } else {
+                                    truncate_title(&tab.title, 18)
+                                };
+
+                                let (row_rect, row_resp) = ui
+                                    .allocate_exact_size(vec2(width - 12.0, 36.0), Sense::click());
+
+                                // Paint the background and its contents against the
+                                // same rect. Previously the labels were added after
+                                // the row had advanced the cursor, so they appeared
+                                // below the highlight instead of inside it.
+                                Self::paint_tab_row(ui, row_rect, is_active, row_resp.hovered());
+                                let icon_rect = egui::Rect::from_min_size(
+                                    pos2(row_rect.min.x + 8.0, row_rect.center().y - 10.0),
+                                    vec2(20.0, 20.0),
+                                );
+                                self.paint_favicon_in_rect(ui, tab, icon_rect);
+
+                                let text_color = if is_active { Color32::WHITE } else { RAIL_TEXT };
+                                ui.painter().text(
+                                    pos2(row_rect.min.x + 34.0, row_rect.center().y),
+                                    Align2::LEFT_CENTER,
+                                    title,
+                                    FontId::new(12.0, FontFamily::Proportional),
+                                    text_color,
+                                );
+                                let close_resp = Self::paint_tab_close(
+                                    ui,
+                                    row_rect,
+                                    row_resp.hovered(),
+                                    tab_id,
+                                    true,
+                                );
+                                Self::paint_tab_status(
+                                    ui,
+                                    row_rect,
+                                    tab,
+                                    row_resp.hovered() || close_resp.hovered(),
+                                );
+
+                                if close_resp.clicked() {
+                                    actions.push(UiAction::CloseTab { tab_id });
+                                } else if row_resp.clicked() {
+                                    actions.push(UiAction::SelectTab { tab_id });
+                                }
+                                if row_resp.middle_clicked() {
+                                    actions.push(UiAction::CloseTab { tab_id });
+                                }
+                                let tooltip_text = if state.rail_expanded {
+                                    format!("{}\n{}", tab.title, tab.url)
+                                } else {
+                                    tab.title.clone()
+                                };
+                                Self::chrome_tooltip(
+                                    &mut rail_tooltip,
+                                    ui,
+                                    &row_resp,
+                                    tooltip_text,
+                                    state.rail_expanded,
+                                );
+                            }
+                        });
+                });
+
+                // Status block stays at the bottom of the rail.
+                let status_rect = egui::Rect::from_min_max(
+                    pos2(0.0, ui.clip_rect().bottom() - 78.0),
+                    pos2(width, ui.clip_rect().bottom()),
+                );
+                ui.allocate_new_ui(UiBuilder::new().max_rect(status_rect), |ui| {
+                    ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+                        ui.add_space(6.0);
+                        let hibernate = Self::rail_action_button(
+                            ui,
+                            width - 12.0,
+                            30.0,
+                            RailIcon::Moon,
+                            "Hibernate",
+                        );
+                        if hibernate.clicked() {
+                            actions.push(UiAction::HibernateAllBackground);
+                        }
+                        Self::chrome_tooltip(
+                            &mut rail_tooltip,
+                            ui,
+                            &hibernate,
+                            "Hibernate all background tabs (Alt+H)",
+                            state.rail_expanded,
+                        );
+
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            let (icon_rect, _) =
+                                ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
+                            paint_rail_icon(ui, icon_rect, RailIcon::Shield, RAIL_TEXT_DIM);
+                            ui.add_space(3.0);
+                            let blocked = state
+                                .tabs
+                                .iter()
+                                .find(|t| Some(t.id) == state.active_tab_id)
+                                .map(|t| t.blocked_requests)
+                                .unwrap_or(0);
+                            ui.label(
+                                RichText::new(format!("{blocked}"))
+                                    .size(11.0)
+                                    .color(Color32::from_rgb(80, 200, 120)),
+                            );
+                        });
+
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            let (icon_rect, _) =
+                                ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
+                            paint_rail_icon(ui, icon_rect, RailIcon::Chip, RAIL_TEXT_DIM);
+                            ui.add_space(3.0);
+                            ui.label(
+                                RichText::new(format!("RAM {} MB", state.ram_mb))
+                                    .size(11.0)
+                                    .color(RAIL_TEXT_DIM),
+                            );
+                        });
+                    });
+                });
+            });
+        state.tooltip = rail_tooltip;
+
+        // Keep the rail width associated with the panel for tests/debugging.
+        let _ = rail.response.rect;
     }
 
-    /// Draw a tooltip inside the 76 px native chrome region.
-    ///
-    /// CEF's child view sits above the wgpu surface at y >= 76, so egui's
-    /// default pointer-following tooltip is hidden behind the page. Anchoring
-    /// at y = 0 keeps the tooltip visible in the tab strip instead.
-    fn chrome_tooltip(ui: &Ui, response: &Response, text: impl Into<egui::WidgetText>) {
+    /// Draw the floating command palette over a dimmed full-window layer.
+    pub fn build_command_palette(
+        ctx: &egui::Context,
+        state: &mut ChromeState,
+        actions: &mut Vec<UiAction>,
+        focus_command: bool,
+    ) {
+        let items = command_palette_items(
+            &state.command_palette_query,
+            &state.tabs,
+            state.active_tab_id,
+        );
+        state.command_selection = clamp_command_selection(state.command_selection, items.len());
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            state.close_command_palette();
+            return;
+        }
+        let move_up = ctx.input(|i| i.key_pressed(egui::Key::ArrowUp));
+        let move_down = ctx.input(|i| i.key_pressed(egui::Key::ArrowDown));
+        state.command_selection =
+            advance_command_selection(state.command_selection, items.len(), move_up, move_down);
+
+        let execute_enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let mut executed = false;
+
+        let screen = ctx.screen_rect();
+        let palette_width = COMMAND_PALETTE_WIDTH.min((screen.width() - 24.0).max(200.0));
+        let palette_x = (screen.width() - palette_width) / 2.0;
+        let palette_y = COMMAND_PALETTE_TOP_OFFSET.min((screen.height() - 120.0).max(4.0));
+
+        egui::Area::new(egui::Id::new("command_overlay"))
+            .order(Order::Foreground)
+            .fixed_pos(screen.min)
+            .movable(false)
+            .show(ctx, |ui| {
+                // Allocate the full screen so the Area's clip rect includes the
+                // overlay; painting outside an unallocated Area gets clipped.
+                let (overlay_rect, _) = ui.allocate_exact_size(screen.size(), Sense::hover());
+                ui.painter().rect_filled(
+                    overlay_rect,
+                    Rounding::ZERO,
+                    Color32::from_rgba_unmultiplied(0, 0, 0, 150),
+                );
+            });
+
+        let mut palette_rect =
+            egui::Rect::from_min_size(pos2(palette_x, palette_y), vec2(palette_width, 0.0));
+        egui::Area::new(egui::Id::new("command_palette"))
+            .order(Order::Foreground)
+            .fixed_pos(pos2(palette_x, palette_y))
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_width(palette_width);
+                palette_rect = Frame::none()
+                    .fill(Color32::from_rgb(30, 32, 38))
+                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(72, 88, 116)))
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                    .show(ui, |ui| {
+                        let input_id = egui::Id::new("kasumi_command_palette_input");
+                        if focus_command {
+                            ctx.memory_mut(|mem| mem.request_focus(input_id));
+                        }
+                        let input = ui.add(
+                            TextEdit::singleline(&mut state.command_palette_query)
+                                .id(input_id)
+                                .hint_text("Search, open a tab, or enter an address…")
+                                .text_color(Color32::WHITE)
+                                .frame(false)
+                                .desired_width(palette_width - 28.0),
+                        );
+                        if focus_command {
+                            input.request_focus();
+                        }
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+
+                        if items.is_empty() {
+                            ui.label(
+                                RichText::new("No matching commands")
+                                    .color(Color32::GRAY)
+                                    .size(12.0),
+                            );
+                        } else {
+                            for (index, item) in items.iter().enumerate() {
+                                let selected = index == state.command_selection;
+                                let (row_rect, row_resp) = ui.allocate_exact_size(
+                                    vec2(palette_width - 28.0, 34.0),
+                                    Sense::click(),
+                                );
+                                let fill = palette_row_fill(selected, row_resp.hovered());
+                                ui.painter()
+                                    .rect_filled(row_rect, Rounding::same(6.0), fill);
+
+                                // Lay the labels out *inside* the allocated row.
+                                // Adding them after `allocate_exact_size` would
+                                // place them below the highlight rect.
+                                ui.allocate_new_ui(UiBuilder::new().max_rect(row_rect), |ui| {
+                                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                        ui.add_space(8.0);
+                                        ui.label(RichText::new(item.icon).size(14.0));
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            RichText::new(&item.label)
+                                                .size(12.0)
+                                                .color(Color32::WHITE),
+                                        );
+                                        ui.add_space(8.0);
+                                        ui.label(
+                                            RichText::new(truncate_title(&item.subtitle, 38))
+                                                .size(10.0)
+                                                .color(Color32::from_rgb(155, 160, 170)),
+                                        );
+                                    });
+                                });
+
+                                if row_resp.clicked() {
+                                    apply_command_item(&item.action, state, actions);
+                                    executed = true;
+                                }
+                            }
+                        }
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("↑↓ select   ↵ run   esc close")
+                                    .size(10.0)
+                                    .color(Color32::from_rgb(120, 125, 135)),
+                            );
+                        });
+                    })
+                    .response
+                    .rect
+                    .expand(8.0);
+            });
+
+        // A primary click anywhere outside the palette card closes it. The
+        // dim layer is part of the same transparent overlay window, so the
+        // page behind stays visible while this happens.
+        let outside_click = ctx.input(|i| {
+            command_palette_click_outside(
+                palette_rect,
+                i.pointer.latest_pos(),
+                i.pointer.primary_clicked(),
+            )
+        });
+        if outside_click {
+            state.close_command_palette();
+            return;
+        }
+
+        if execute_enter && !executed {
+            if let Some(item) = items.get(state.command_selection) {
+                apply_command_item(&item.action, state, actions);
+            }
+        }
+    }
+
+    /// Record a tooltip for the hovered rail row. It is painted later by a
+    /// transparent overlay window so it appears above the native CEF view.
+    fn chrome_tooltip(
+        tooltip: &mut Option<RailTooltip>,
+        ui: &Ui,
+        response: &Response,
+        text: impl Into<String>,
+        expanded: bool,
+    ) {
         if !response.hovered() {
             return;
         }
 
-        let pointer_x = ui
-            .input(|input| input.pointer.hover_pos().map(|pos| pos.x))
-            .unwrap_or_else(|| response.rect.center().x);
-        let right = ui.ctx().screen_rect().right();
-        let x = tooltip_anchor_x(pointer_x, right, response.rect.center().x);
-
-        egui::containers::show_tooltip_at(
-            ui.ctx(),
-            ui.layer_id(),
-            response.id,
-            pos2(x, 0.0),
-            |tooltip| {
-                tooltip.label(text.into());
-            },
-        );
+        let rail = ui.clip_rect();
+        let screen = ui.ctx().screen_rect();
+        let (width, height) = rail_tooltip_metrics(expanded);
+        let anchor = page_tooltip_anchor(rail, response.rect, screen, width, height);
+        *tooltip = Some(RailTooltip {
+            text: text.into(),
+            anchor,
+            width,
+            height,
+        });
     }
 
-    /// Draw a cached favicon, or a neutral fallback dot if none is available.
-    fn paint_favicon(&self, ui: &mut Ui, tab: &TabInfo) {
-        let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
+    /// Draw a cached favicon into an explicit rect, or a vector globe fallback.
+    fn paint_favicon_in_rect(&self, ui: &mut Ui, tab: &TabInfo, rect: egui::Rect) {
         if !ui.is_rect_visible(rect) {
             return;
         }
@@ -705,26 +1016,676 @@ impl ChromeRenderer {
             }
         }
 
-        ui.painter()
-            .circle_filled(rect.center(), 4.0, Color32::from_rgb(120, 130, 145));
+        paint_rail_icon(ui, rect.shrink(2.0), RailIcon::Globe, RAIL_TEXT_DIM);
     }
+
+    /// A compact square icon button used by the collapsed rail and expanded
+    /// header. The hover state uses the same palette as tab rows.
+    fn rail_icon_button(ui: &mut Ui, size: egui::Vec2, icon: RailIcon) -> Response {
+        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+        let fill = if response.hovered() {
+            RAIL_SURFACE
+        } else {
+            Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, Rounding::same(7.0), fill);
+        paint_rail_icon(
+            ui,
+            rect.shrink(5.0),
+            icon,
+            if response.hovered() {
+                Color32::WHITE
+            } else {
+                RAIL_TEXT
+            },
+        );
+        response
+    }
+
+    /// A horizontal icon + label button for the expanded rail.
+    fn rail_action_button(
+        ui: &mut Ui,
+        width: f32,
+        height: f32,
+        icon: RailIcon,
+        label: &str,
+    ) -> Response {
+        let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+        let fill = if response.hovered() {
+            RAIL_SURFACE
+        } else {
+            Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, Rounding::same(7.0), fill);
+        paint_rail_icon(
+            ui,
+            egui::Rect::from_center_size(
+                pos2(rect.min.x + 17.0, rect.center().y),
+                vec2(18.0, 18.0),
+            ),
+            icon,
+            if response.hovered() {
+                Color32::WHITE
+            } else {
+                RAIL_TEXT
+            },
+        );
+        ui.painter().text(
+            pos2(rect.min.x + 34.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            label,
+            FontId::new(12.0, FontFamily::Proportional),
+            if response.hovered() {
+                Color32::WHITE
+            } else {
+                RAIL_TEXT
+            },
+        );
+        response
+    }
+
+    /// Hover-only close affordance. The close hit area is checked before the
+    /// parent row click so clicking × never also selects the tab.
+    fn paint_tab_close(
+        ui: &Ui,
+        row_rect: egui::Rect,
+        row_hovered: bool,
+        tab_id: u64,
+        expanded: bool,
+    ) -> Response {
+        let size = if expanded { 18.0 } else { 14.0 };
+        let rect =
+            egui::Rect::from_center_size(tab_close_center(row_rect, expanded), vec2(size, size));
+        let response = ui.interact(
+            rect,
+            egui::Id::new(("kasumi_tab_close", tab_id, expanded)),
+            Sense::click(),
+        );
+        if row_hovered || response.hovered() {
+            ui.painter()
+                .rect_filled(rect, Rounding::same(4.0), Color32::from_rgb(64, 70, 84));
+            paint_rail_icon(ui, rect.shrink(2.0), RailIcon::Close, Color32::WHITE);
+        }
+        response
+    }
+
+    /// Shared tab-row background. Drawing this against the same rect as the
+    /// row contents is what keeps the active/hover highlight aligned.
+    fn paint_tab_row(ui: &Ui, rect: egui::Rect, is_active: bool, hovered: bool) {
+        let fill = if is_active {
+            RAIL_ROW_ACTIVE
+        } else if hovered {
+            RAIL_ROW_HOVER
+        } else {
+            Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, Rounding::same(7.0), fill);
+
+        if is_active {
+            ui.painter().rect_stroke(
+                rect.shrink(0.5),
+                Rounding::same(7.0),
+                Stroke::new(1.0_f32, Color32::from_rgb(86, 128, 192)),
+            );
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(rect.min, vec2(3.0, rect.height())),
+                Rounding::same(1.5),
+                RAIL_ACCENT,
+            );
+        }
+    }
+
+    /// Loading/hibernated marker anchored inside the tab row. It shifts left
+    /// while the close button is visible so the two never overlap.
+    fn paint_tab_status(ui: &Ui, row_rect: egui::Rect, tab: &TabInfo, close_visible: bool) {
+        let center = tab_status_center(row_rect, close_visible);
+        if tab.is_loading {
+            ui.painter()
+                .circle_filled(center, 3.5, Color32::from_rgb(115, 190, 255));
+        } else if tab.display_state == TabDisplayState::Hibernated {
+            paint_rail_icon(
+                ui,
+                egui::Rect::from_center_size(center, vec2(12.0, 12.0)),
+                RailIcon::Moon,
+                RAIL_TEXT_DIM,
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Palette overlay renderer
+// ---------------------------------------------------------------------------
+
+/// Owns the transparent top-level window used for the command palette.
+///
+/// The CEF child view is a native view above the main window's wgpu layer, so
+/// an in-window egui overlay would be covered by the page. A separate native
+/// window lets the page stay visible behind a real overlay on every platform.
+pub struct PaletteRenderer {
+    surface: wgpu::Surface<'static>,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    surface_config: wgpu::SurfaceConfiguration,
+    renderer: egui_wgpu::Renderer,
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    max_texture_dim: u32,
+}
+
+impl PaletteRenderer {
+    pub fn new(
+        window: Arc<winit::window::Window>,
+        instance: &wgpu::Instance,
+        adapter: &wgpu::Adapter,
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+    ) -> Option<Self> {
+        let surface = match instance.create_surface(Arc::clone(&window)) {
+            Ok(surface) => surface,
+            Err(e) => {
+                tracing::error!("Failed to create palette overlay surface: {e}");
+                return None;
+            }
+        };
+
+        let size = window.inner_size();
+        let caps = surface.get_capabilities(adapter);
+        let Some(format) = preferred_surface_format(&caps.formats) else {
+            tracing::error!("Palette overlay adapter reported no surface formats");
+            return None;
+        };
+        let alpha_mode = caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|m| {
+                matches!(
+                    m,
+                    wgpu::CompositeAlphaMode::PreMultiplied
+                        | wgpu::CompositeAlphaMode::PostMultiplied
+                )
+            })
+            .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
+
+        let max_tex = adapter.limits().max_texture_dimension_2d;
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1).min(max_tex),
+            height: size.height.max(1).min(max_tex),
+            present_mode: wgpu::PresentMode::AutoVsync,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &surface_config);
+
+        let renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let egui_ctx = egui::Context::default();
+        egui_material_icons::initialize(&egui_ctx);
+
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(window.scale_factor() as f32),
+            None,
+            Some(max_tex as usize),
+        );
+
+        Some(Self {
+            surface,
+            device,
+            queue,
+            surface_config,
+            renderer,
+            egui_ctx,
+            egui_state,
+            max_texture_dim: max_tex,
+        })
+    }
+
+    pub fn on_window_event(
+        &mut self,
+        window: &winit::window::Window,
+        event: &winit::event::WindowEvent,
+    ) -> bool {
+        self.egui_state.on_window_event(window, event).consumed
+    }
+
+    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if new_size.width == 0 || new_size.height == 0 {
+            return;
+        }
+        self.surface_config.width = new_size.width.min(self.max_texture_dim);
+        self.surface_config.height = new_size.height.min(self.max_texture_dim);
+        self.surface.configure(&self.device, &self.surface_config);
+    }
+
+    /// Render the palette into the transparent overlay window.
+    pub fn render(
+        &mut self,
+        window: &winit::window::Window,
+        state: &mut ChromeState,
+    ) -> Vec<UiAction> {
+        let mut actions = Vec::new();
+        let mut raw_input = self.egui_state.take_egui_input(window);
+        let focus_before = state.command_palette_focus_requested;
+
+        if focus_before {
+            raw_input.events.push(egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: Some(egui::Key::A),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            });
+        }
+        let focus_command = focus_before;
+
+        let egui_ctx = self.egui_ctx.clone();
+        let full_output = egui_ctx.run(raw_input, |ctx| {
+            ChromeRenderer::build_command_palette(ctx, state, &mut actions, focus_command);
+        });
+        // The rail button raises this flag during the main window's render,
+        // which happens before this overlay's first frame. Consume it here.
+        state.command_palette_focus_requested =
+            focus_request_after_render(focus_before, state.command_palette_focus_requested);
+
+        self.egui_state
+            .handle_platform_output(window, full_output.platform_output.clone());
+
+        let output_frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(e) => {
+                tracing::warn!("palette surface error: {:?}", e);
+                return actions;
+            }
+        };
+        let view = output_frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [self.surface_config.width, self.surface_config.height],
+            pixels_per_point: window.scale_factor() as f32,
+        };
+        let tris = self
+            .egui_ctx
+            .tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
+
+        for (id, delta) in &full_output.textures_delta.set {
+            self.renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("palette_overlay"),
+            });
+        self.renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &tris,
+            &screen_descriptor,
+        );
+
+        {
+            let mut rpass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("palette_overlay_rpass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                })
+                .forget_lifetime();
+            self.renderer.render(&mut rpass, &tris, &screen_descriptor);
+        }
+
+        for id in &full_output.textures_delta.free {
+            self.renderer.free_texture(id);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output_frame.present();
+
+        actions
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tooltip overlay renderer
+// ---------------------------------------------------------------------------
+
+/// Transparent, click-through window used to paint rail tooltips over the
+/// native CEF page view.
+pub struct TooltipRenderer {
+    surface: wgpu::Surface<'static>,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    surface_config: wgpu::SurfaceConfiguration,
+    renderer: egui_wgpu::Renderer,
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    max_texture_dim: u32,
+}
+
+impl TooltipRenderer {
+    pub fn new(
+        window: Arc<winit::window::Window>,
+        instance: &wgpu::Instance,
+        adapter: &wgpu::Adapter,
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+    ) -> Option<Self> {
+        let surface = match instance.create_surface(Arc::clone(&window)) {
+            Ok(surface) => surface,
+            Err(e) => {
+                tracing::error!("Failed to create tooltip overlay surface: {e}");
+                return None;
+            }
+        };
+
+        let size = window.inner_size();
+        let caps = surface.get_capabilities(adapter);
+        let Some(format) = preferred_surface_format(&caps.formats) else {
+            tracing::error!("Tooltip overlay adapter reported no surface formats");
+            return None;
+        };
+        let alpha_mode = caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|m| {
+                matches!(
+                    m,
+                    wgpu::CompositeAlphaMode::PreMultiplied
+                        | wgpu::CompositeAlphaMode::PostMultiplied
+                )
+            })
+            .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
+
+        let max_tex = adapter.limits().max_texture_dimension_2d;
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1).min(max_tex),
+            height: size.height.max(1).min(max_tex),
+            present_mode: wgpu::PresentMode::AutoVsync,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &surface_config);
+
+        let renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let egui_ctx = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(window.scale_factor() as f32),
+            None,
+            Some(max_tex as usize),
+        );
+
+        Some(Self {
+            surface,
+            device,
+            queue,
+            surface_config,
+            renderer,
+            egui_ctx,
+            egui_state,
+            max_texture_dim: max_tex,
+        })
+    }
+
+    pub fn on_window_event(
+        &mut self,
+        window: &winit::window::Window,
+        event: &winit::event::WindowEvent,
+    ) -> bool {
+        self.egui_state.on_window_event(window, event).consumed
+    }
+
+    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if new_size.width == 0
+            || new_size.height == 0
+            || (new_size.width == self.surface_config.width
+                && new_size.height == self.surface_config.height)
+        {
+            return;
+        }
+        self.surface_config.width = new_size.width.min(self.max_texture_dim);
+        self.surface_config.height = new_size.height.min(self.max_texture_dim);
+        self.surface.configure(&self.device, &self.surface_config);
+    }
+
+    /// Paint the tooltip card into the transparent overlay window.
+    pub fn render(&mut self, window: &winit::window::Window, tooltip: &RailTooltip) {
+        self.resize(window.inner_size());
+        let raw_input = self.egui_state.take_egui_input(window);
+        let card = tooltip.clone();
+        let egui_ctx = self.egui_ctx.clone();
+        let full_output = egui_ctx.run(raw_input, |ctx| {
+            egui::CentralPanel::default()
+                .frame(Frame::none().fill(Color32::TRANSPARENT))
+                .show(ctx, |ui| {
+                    Frame::none()
+                        .fill(Color32::from_rgb(16, 19, 26))
+                        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(110, 130, 160)))
+                        .rounding(Rounding::same(7.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 7.0))
+                        .show(ui, |ui| {
+                            // Fill the whole overlay window so the visible card is
+                            // vertically centered on the hovered tab row. A plain
+                            // label sizes the frame to its text and leaves the card
+                            // pinned near the top of the taller transparent window.
+                            let inner_size = vec2(
+                                (card.width - 16.0).max(80.0),
+                                (card.height - 14.0).max(12.0),
+                            );
+                            let (rect, _) = ui.allocate_exact_size(inner_size, Sense::hover());
+                            let lines: Vec<&str> = card.text.lines().collect();
+                            let line_height = 14.0_f32;
+                            let total_height = lines.len() as f32 * line_height;
+                            let first_line_y =
+                                rect.center().y - total_height * 0.5 + line_height * 0.5;
+                            for (index, line) in lines.iter().enumerate() {
+                                ui.painter().text(
+                                    pos2(
+                                        rect.center().x,
+                                        first_line_y + index as f32 * line_height,
+                                    ),
+                                    Align2::CENTER_CENTER,
+                                    *line,
+                                    FontId::proportional(11.0),
+                                    Color32::from_rgb(250, 251, 255),
+                                );
+                            }
+                        });
+                });
+        });
+
+        self.egui_state
+            .handle_platform_output(window, full_output.platform_output.clone());
+
+        let output_frame = match self.surface.get_current_texture() {
+            Ok(frame) => frame,
+            Err(e) => {
+                tracing::warn!("tooltip surface error: {:?}", e);
+                return;
+            }
+        };
+        let view = output_frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [self.surface_config.width, self.surface_config.height],
+            pixels_per_point: window.scale_factor() as f32,
+        };
+        let tris = self
+            .egui_ctx
+            .tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
+
+        for (id, delta) in &full_output.textures_delta.set {
+            self.renderer
+                .update_texture(&self.device, &self.queue, *id, delta);
+        }
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tooltip_overlay"),
+            });
+        self.renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &tris,
+            &screen_descriptor,
+        );
+
+        {
+            let mut rpass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("tooltip_overlay_rpass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                })
+                .forget_lifetime();
+            self.renderer.render(&mut rpass, &tris, &screen_descriptor);
+        }
+
+        for id in &full_output.textures_delta.free {
+            self.renderer.free_texture(id);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output_frame.present();
+    }
+}
+
+/// Draw one of the rail's icons inside `rect` using the registered Material
+/// Symbols font. Font glyphs stay crisp at any DPI and give the rail a
+/// consistent, familiar icon language.
+fn paint_rail_icon(ui: &Ui, rect: egui::Rect, icon: RailIcon, color: Color32) {
+    use egui_material_icons::icons::{
+        ICON_ADD, ICON_BEDTIME, ICON_CHEVRON_LEFT, ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_MEMORY,
+        ICON_PUBLIC, ICON_SEARCH, ICON_SHIELD,
+    };
+
+    let glyph = match icon {
+        RailIcon::Plus => ICON_ADD,
+        RailIcon::Search => ICON_SEARCH,
+        RailIcon::ChevronLeft => ICON_CHEVRON_LEFT,
+        RailIcon::ChevronRight => ICON_CHEVRON_RIGHT,
+        RailIcon::Moon => ICON_BEDTIME,
+        RailIcon::Shield => ICON_SHIELD,
+        RailIcon::Chip => ICON_MEMORY,
+        RailIcon::Globe => ICON_PUBLIC,
+        RailIcon::Close => ICON_CLOSE,
+    };
+
+    let size = rect.width().min(rect.height()) * 1.08;
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        glyph,
+        FontId::new(size, FontFamily::Proportional),
+        color,
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Pure chrome helpers (unit-tested)
 // ---------------------------------------------------------------------------
 
-/// Clamp a tooltip anchor into the visible screen horizontally.
-///
-/// Tooltips are anchored at `y = 0` to stay above the CEF child view. The
-/// fallback is used when egui has no pointer position (keyboard focus).
-pub fn tooltip_anchor_x(pointer_x: f32, right: f32, fallback_x: f32) -> f32 {
-    let x = if pointer_x.is_finite() {
-        pointer_x
+/// Tooltip width/height for each rail mode. Both modes use a readable card
+/// placed over the page; expanded rows include the URL and need more height.
+pub fn rail_tooltip_metrics(expanded: bool) -> (f32, f32) {
+    if expanded {
+        (TOOLTIP_WIDTH, TOOLTIP_HEIGHT_EXPANDED)
     } else {
-        fallback_x
-    };
-    x.clamp(4.0, (right - 4.0).max(4.0))
+        (TOOLTIP_WIDTH, TOOLTIP_HEIGHT_COLLAPSED)
+    }
+}
+
+/// Center of the hover-only close button for a tab row.
+pub fn tab_close_center(row: egui::Rect, expanded: bool) -> egui::Pos2 {
+    if expanded {
+        pos2(row.right() - 13.0, row.center().y)
+    } else {
+        pos2(row.right() - 9.0, row.top() + 9.0)
+    }
+}
+
+/// Center of the loading/hibernated marker, shifted left when × is shown.
+pub fn tab_status_center(row: egui::Rect, close_visible: bool) -> egui::Pos2 {
+    pos2(
+        row.right() - if close_visible { 30.0 } else { 11.0 },
+        row.center().y,
+    )
+}
+
+/// A focus request raised while rendering a frame must survive to the next
+/// frame; one that was already pending has been applied and can be cleared.
+pub fn focus_request_after_render(was_requested: bool, is_requested: bool) -> bool {
+    !was_requested && is_requested
+}
+
+/// A primary click outside the palette card dismisses the overlay. A missing
+/// pointer position (touch/cursor just left the window) must not dismiss it.
+pub fn command_palette_click_outside(
+    palette_rect: egui::Rect,
+    pointer_pos: Option<egui::Pos2>,
+    primary_clicked: bool,
+) -> bool {
+    primary_clicked && pointer_pos.is_some_and(|p| !palette_rect.contains(p))
+}
+
+/// Place a rail tooltip just to the right of the rail, vertically centered on
+/// the hovered row and clamped inside the visible window. This is the top-left
+/// corner of the overlay tooltip window in main-window logical coordinates.
+pub fn page_tooltip_anchor(
+    rail: egui::Rect,
+    row: egui::Rect,
+    screen: egui::Rect,
+    tooltip_width: f32,
+    tooltip_height: f32,
+) -> egui::Pos2 {
+    let min_x = rail.right() + 8.0;
+    let max_x = (screen.right() - tooltip_width - 6.0).max(min_x);
+    let x = min_x.clamp(min_x, max_x);
+    let max_y = (screen.bottom() - tooltip_height - 6.0).max(screen.top() + 6.0);
+    let y = (row.center().y - tooltip_height * 0.5).clamp(screen.top() + 6.0, max_y);
+    pos2(x, y)
 }
 
 /// Truncate a tab title by Unicode scalar value, not bytes, so non-ASCII
@@ -737,6 +1698,151 @@ pub fn truncate_title(title: &str, max_chars: usize) -> String {
     } else {
         truncated
     }
+}
+
+/// Keep the selected palette row in bounds without wrapping on empty lists.
+pub fn clamp_command_selection(selection: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        selection.min(len - 1)
+    }
+}
+
+/// Advance the palette highlight from arrow keys.
+///
+/// Down clamps at the last row; Up wraps to the last row from the first. This
+/// is kept pure so keyboard navigation is covered without constructing egui
+/// input events. Hovering a row must not call this function: mouse hover only
+/// changes the subtle hover tint and must never steal the keyboard selection.
+pub fn advance_command_selection(selection: usize, len: usize, up: bool, down: bool) -> usize {
+    let current = clamp_command_selection(selection, len);
+    if len == 0 {
+        return 0;
+    }
+    if down && !up {
+        (current + 1).min(len - 1)
+    } else if up && !down {
+        current.checked_sub(1).unwrap_or(len - 1)
+    } else {
+        current
+    }
+}
+
+/// Selected rows win over hover; hover is only a secondary affordance.
+pub fn palette_row_fill(selected: bool, hovered: bool) -> Color32 {
+    if selected {
+        PALETTE_ROW_SELECTED
+    } else if hovered {
+        PALETTE_ROW_HOVER
+    } else {
+        Color32::TRANSPARENT
+    }
+}
+
+/// Build the ordered command palette candidates for the current query.
+pub fn command_palette_items(
+    query: &str,
+    tabs: &[TabInfo],
+    active_tab_id: Option<u64>,
+) -> Vec<CommandPaletteItem> {
+    let trimmed = query.trim();
+    let mut items = Vec::new();
+
+    let tab_item = |tab: &TabInfo| CommandPaletteItem {
+        icon: if tab.display_state == TabDisplayState::Hibernated {
+            "💤"
+        } else {
+            "◧"
+        },
+        label: if tab.title.is_empty() {
+            "New Tab".to_string()
+        } else {
+            tab.title.clone()
+        },
+        subtitle: tab.url.clone(),
+        action: CommandAction::SelectTab(tab.id),
+    };
+
+    if trimmed.is_empty() {
+        items.push(CommandPaletteItem {
+            icon: "＋",
+            label: "New tab".to_string(),
+            subtitle: "Open a fresh tab".to_string(),
+            action: CommandAction::NewTab(None),
+        });
+        items.push(CommandPaletteItem {
+            icon: "💤",
+            label: "Hibernate all background tabs".to_string(),
+            subtitle: "Immediately close background browser views".to_string(),
+            action: CommandAction::HibernateAll,
+        });
+        items.push(CommandPaletteItem {
+            icon: "▤",
+            label: "Toggle workspace rail".to_string(),
+            subtitle: "Expand or collapse the left rail".to_string(),
+            action: CommandAction::ToggleRail,
+        });
+        items.extend(tabs.iter().take(12).map(tab_item));
+        return items;
+    }
+
+    let needle = trimmed.to_lowercase();
+    for tab in tabs {
+        if tab.title.to_lowercase().contains(&needle) || tab.url.to_lowercase().contains(&needle) {
+            items.push(tab_item(tab));
+        }
+    }
+
+    let url = resolve_omnibox(trimmed);
+    let looks_like_address = trimmed.contains('.')
+        || trimmed.contains("://")
+        || trimmed.starts_with("view-source:")
+        || trimmed.starts_with("data:");
+
+    let label = if looks_like_address {
+        format!("Go to {trimmed}")
+    } else {
+        format!("Search the web for “{trimmed}”")
+    };
+
+    if let Some(tab_id) = active_tab_id {
+        items.push(CommandPaletteItem {
+            icon: "↗",
+            label,
+            subtitle: url.clone(),
+            action: CommandAction::Navigate {
+                tab_id,
+                url: url.clone(),
+            },
+        });
+    }
+    items.push(CommandPaletteItem {
+        icon: "＋",
+        label: "Open in a new tab".to_string(),
+        subtitle: url,
+        action: CommandAction::NewTab(Some(resolve_omnibox(trimmed))),
+    });
+
+    items
+}
+
+fn apply_command_item(
+    action: &CommandAction,
+    state: &mut ChromeState,
+    actions: &mut Vec<UiAction>,
+) {
+    match action {
+        CommandAction::SelectTab(tab_id) => actions.push(UiAction::SelectTab { tab_id: *tab_id }),
+        CommandAction::NewTab(url) => actions.push(UiAction::NewTab { url: url.clone() }),
+        CommandAction::Navigate { tab_id, url } => actions.push(UiAction::Navigate {
+            tab_id: *tab_id,
+            url: url.clone(),
+        }),
+        CommandAction::HibernateAll => actions.push(UiAction::HibernateAllBackground),
+        CommandAction::ToggleRail => state.toggle_rail(),
+    }
+    state.close_command_palette();
 }
 
 // ---------------------------------------------------------------------------
@@ -775,8 +1881,60 @@ pub fn resolve_omnibox(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_omnibox, tooltip_anchor_x, truncate_title};
+    use egui::{pos2, vec2, Color32};
+
+    use super::{
+        advance_command_selection, clamp_command_selection, command_palette_click_outside,
+        command_palette_items, focus_request_after_render, page_tooltip_anchor, palette_row_fill,
+        preferred_surface_format, rail_tooltip_metrics, resolve_omnibox, tab_close_center,
+        tab_status_center, truncate_title, ChromeState, CommandAction, TabDisplayState, TabInfo,
+        PALETTE_ROW_HOVER, PALETTE_ROW_SELECTED, TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED,
+        TOOLTIP_WIDTH,
+    };
     use crate::config::{DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX};
+
+    fn tab(id: u64, title: &str, url: &str) -> TabInfo {
+        TabInfo {
+            id,
+            url: url.to_string(),
+            title: title.to_string(),
+            is_loading: false,
+            display_state: TabDisplayState::Background,
+            blocked_requests: 0,
+            can_go_back: false,
+            can_go_forward: false,
+            favicon: None,
+        }
+    }
+
+    #[test]
+    fn surface_format_prefers_egui_compatible_unorm_formats() {
+        use wgpu::TextureFormat as F;
+
+        assert_eq!(
+            preferred_surface_format(&[F::Bgra8UnormSrgb, F::Rgba8Unorm]),
+            Some(F::Rgba8Unorm)
+        );
+        assert_eq!(
+            preferred_surface_format(&[F::Rgba8UnormSrgb, F::Bgra8Unorm]),
+            Some(F::Bgra8Unorm)
+        );
+    }
+
+    #[test]
+    fn surface_format_falls_back_without_panicking() {
+        use wgpu::TextureFormat as F;
+
+        assert_eq!(preferred_surface_format(&[]), None);
+        assert_eq!(
+            preferred_surface_format(&[F::Rgba16Float, F::Bgra8UnormSrgb]),
+            Some(F::Rgba16Float)
+        );
+        assert_eq!(
+            preferred_surface_format(&[F::Bgra8UnormSrgb]),
+            Some(F::Bgra8UnormSrgb)
+        );
+    }
 
     #[test]
     fn resolve_omnibox_passes_through_absolute_urls() {
@@ -852,12 +2010,110 @@ mod tests {
     }
 
     #[test]
-    fn tooltip_anchor_stays_inside_the_screen() {
-        assert_eq!(tooltip_anchor_x(100.0, 1280.0, 50.0), 100.0);
-        assert_eq!(tooltip_anchor_x(-20.0, 1280.0, 50.0), 4.0);
-        assert_eq!(tooltip_anchor_x(2000.0, 1280.0, 50.0), 1276.0);
-        assert_eq!(tooltip_anchor_x(f32::NAN, 1280.0, 50.0), 50.0);
-        assert_eq!(tooltip_anchor_x(20.0, 6.0, 50.0), 4.0);
+    fn collapsed_tooltips_are_readable_and_render_over_the_page() {
+        let (width, height) = rail_tooltip_metrics(false);
+        assert_eq!(width, TOOLTIP_WIDTH);
+        assert_eq!(height, TOOLTIP_HEIGHT_COLLAPSED);
+        assert!(width >= 200.0);
+
+        let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(44.0, 800.0));
+        let row = egui::Rect::from_min_size(pos2(3.0, 120.0), vec2(38.0, 44.0));
+        let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let anchor = page_tooltip_anchor(rail, row, screen, width, height);
+        assert_eq!(anchor.x, 52.0);
+        assert!(anchor.x >= rail.right());
+        assert!(anchor.x + width <= screen.right());
+        assert!(anchor.y + height <= screen.bottom());
+    }
+
+    #[test]
+    fn tab_close_button_positions_match_rail_mode() {
+        let row = egui::Rect::from_min_size(pos2(10.0, 100.0), vec2(160.0, 36.0));
+        assert_eq!(tab_close_center(row, true), pos2(157.0, 118.0));
+        assert_eq!(tab_close_center(row, false), pos2(161.0, 109.0));
+    }
+
+    #[test]
+    fn tab_status_shifts_left_when_close_is_visible() {
+        let row = egui::Rect::from_min_size(pos2(10.0, 100.0), vec2(160.0, 36.0));
+        let normal = tab_status_center(row, false);
+        let shifted = tab_status_center(row, true);
+        assert_eq!(normal, pos2(159.0, 118.0));
+        assert_eq!(shifted, pos2(140.0, 118.0));
+        assert!(shifted.x < normal.x);
+    }
+
+    #[test]
+    fn focus_request_raised_during_render_survives_to_next_frame() {
+        assert!(!focus_request_after_render(false, false));
+        assert!(focus_request_after_render(false, true));
+        assert!(!focus_request_after_render(true, true));
+        assert!(!focus_request_after_render(true, false));
+    }
+
+    #[test]
+    fn palette_click_outside_only_dismisses_on_a_real_click_outside() {
+        let rect = egui::Rect::from_min_size(pos2(100.0, 72.0), vec2(560.0, 300.0));
+        assert!(command_palette_click_outside(
+            rect,
+            Some(pos2(50.0, 200.0)),
+            true
+        ));
+        assert!(!command_palette_click_outside(
+            rect,
+            Some(pos2(200.0, 120.0)),
+            true
+        ));
+        assert!(!command_palette_click_outside(rect, None, true));
+        assert!(!command_palette_click_outside(
+            rect,
+            Some(pos2(50.0, 200.0)),
+            false
+        ));
+    }
+
+    #[test]
+    fn page_tooltip_anchor_follows_row_and_stays_over_the_page() {
+        let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(180.0, 800.0));
+        let row = egui::Rect::from_min_size(pos2(6.0, 200.0), vec2(168.0, 36.0));
+        let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let anchor = page_tooltip_anchor(rail, row, screen, TOOLTIP_WIDTH, TOOLTIP_HEIGHT_EXPANDED);
+        assert_eq!(anchor, pos2(188.0, 192.0));
+        assert_eq!(anchor.y + TOOLTIP_HEIGHT_EXPANDED * 0.5, row.center().y);
+        assert!(anchor.x >= rail.right());
+        assert!(anchor.x + TOOLTIP_WIDTH <= screen.right());
+        assert!(anchor.y + TOOLTIP_HEIGHT_EXPANDED <= screen.bottom());
+    }
+
+    #[test]
+    fn page_tooltip_anchor_clamps_near_screen_bottom() {
+        let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(180.0, 800.0));
+        let row = egui::Rect::from_min_size(pos2(6.0, 790.0), vec2(168.0, 36.0));
+        let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let anchor = page_tooltip_anchor(rail, row, screen, TOOLTIP_WIDTH, TOOLTIP_HEIGHT_EXPANDED);
+        assert_eq!(anchor.y, 742.0);
+        assert!(anchor.y + TOOLTIP_HEIGHT_EXPANDED <= screen.bottom());
+    }
+
+    #[test]
+    fn advance_command_selection_handles_keys_and_edges() {
+        assert_eq!(advance_command_selection(0, 0, false, false), 0);
+        assert_eq!(advance_command_selection(7, 0, true, true), 0);
+        assert_eq!(advance_command_selection(0, 5, false, false), 0);
+        assert_eq!(advance_command_selection(2, 5, false, true), 3);
+        assert_eq!(advance_command_selection(4, 5, false, true), 4);
+        assert_eq!(advance_command_selection(0, 5, true, false), 4);
+        assert_eq!(advance_command_selection(2, 5, true, false), 1);
+        assert_eq!(advance_command_selection(2, 5, true, true), 2);
+        assert_eq!(advance_command_selection(99, 5, false, true), 4);
+    }
+
+    #[test]
+    fn palette_row_fill_prefers_keyboard_selection_over_hover() {
+        assert_eq!(palette_row_fill(true, true), PALETTE_ROW_SELECTED);
+        assert_eq!(palette_row_fill(true, false), PALETTE_ROW_SELECTED);
+        assert_eq!(palette_row_fill(false, true), PALETTE_ROW_HOVER);
+        assert_eq!(palette_row_fill(false, false), Color32::TRANSPARENT);
     }
 
     #[test]
@@ -873,5 +2129,76 @@ mod tests {
         );
         assert_eq!(truncate_title("日本語タイトル", 4), "日本語タ…");
         assert_eq!(truncate_title("abc", 0), "…");
+    }
+
+    #[test]
+    fn clamp_command_selection_handles_empty_and_out_of_range_values() {
+        assert_eq!(clamp_command_selection(10, 0), 0);
+        assert_eq!(clamp_command_selection(0, 0), 0);
+        assert_eq!(clamp_command_selection(3, 5), 3);
+        assert_eq!(clamp_command_selection(9, 5), 4);
+    }
+
+    #[test]
+    fn empty_palette_offers_actions_then_open_tabs() {
+        let items = command_palette_items("", &[tab(1, "Rust", "https://rust-lang.org")], Some(1));
+        assert_eq!(items[0].action, CommandAction::NewTab(None));
+        assert_eq!(items[1].action, CommandAction::HibernateAll);
+        assert_eq!(items[2].action, CommandAction::ToggleRail);
+        assert_eq!(items[3].action, CommandAction::SelectTab(1));
+    }
+
+    #[test]
+    fn palette_filters_tabs_case_insensitively() {
+        let tabs = [
+            tab(1, "Rust Language", "https://rust-lang.org"),
+            tab(2, "Docs", "https://docs.rs"),
+        ];
+        let items = command_palette_items("RUST", &tabs, Some(1));
+        assert!(items
+            .iter()
+            .any(|item| item.action == CommandAction::SelectTab(1)));
+        assert!(!items
+            .iter()
+            .any(|item| item.action == CommandAction::SelectTab(2)));
+    }
+
+    #[test]
+    fn palette_offers_navigation_and_new_tab_for_queries() {
+        let items = command_palette_items("hello world", &[], Some(7));
+        assert_eq!(
+            items[0].action,
+            CommandAction::Navigate {
+                tab_id: 7,
+                url: format!("{DEFAULT_SEARCH_URL_PREFIX}hello+world"),
+            }
+        );
+        assert_eq!(
+            items[1].action,
+            CommandAction::NewTab(Some(format!("{DEFAULT_SEARCH_URL_PREFIX}hello+world")))
+        );
+    }
+
+    #[test]
+    fn default_state_shows_the_workspace_rail() {
+        let state = ChromeState::default();
+        assert!(state.rail_expanded);
+        assert!(!state.command_palette_open);
+        assert_eq!(state.command_selection, 0);
+    }
+
+    #[test]
+    fn state_open_palette_seeds_query_and_close_resets_it() {
+        let mut state = ChromeState::default();
+        state.omnibox_text = "https://example.com".to_string();
+        state.open_command_palette();
+        assert!(state.command_palette_open);
+        assert_eq!(state.command_palette_query, "https://example.com");
+        assert!(state.command_palette_focus_requested);
+
+        state.close_command_palette();
+        assert!(!state.command_palette_open);
+        assert!(state.command_palette_query.is_empty());
+        assert!(!state.command_palette_focus_requested);
     }
 }

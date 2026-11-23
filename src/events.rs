@@ -37,6 +37,10 @@ pub enum BrowserEvent {
     OpenDevTools {
         tab_id: u64,
     },
+    /// Cmd/Ctrl+K was pressed while the CEF web view had focus.
+    OpenCommandPalette {
+        tab_id: u64,
+    },
     /// Context menu "View page source" was selected.
     ViewSource {
         tab_id: u64,
@@ -102,6 +106,10 @@ impl std::fmt::Debug for BrowserEvent {
             Self::NewWindow { url } => f.debug_struct("NewWindow").field("url", url).finish(),
             Self::OpenDevTools { tab_id } => f
                 .debug_struct("OpenDevTools")
+                .field("tab_id", tab_id)
+                .finish(),
+            Self::OpenCommandPalette { tab_id } => f
+                .debug_struct("OpenCommandPalette")
                 .field("tab_id", tab_id)
                 .finish(),
             Self::ViewSource { tab_id, url } => f

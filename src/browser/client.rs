@@ -181,6 +181,17 @@ wrap_display_handler! {
     }
 }
 
+/// CEF event flags for Ctrl and Cmd on all platforms.
+const PRIMARY_MODIFIER_FLAGS: u32 = 4 | 128; // EVENTFLAG_CONTROL_DOWN | EVENTFLAG_COMMAND_DOWN
+
+/// VK_K, using CEF's platform-independent Windows virtual key codes.
+const VK_K: i32 = 0x4B;
+
+/// Return true for a Cmd/Ctrl+K key-down forwarded from the web view.
+pub(crate) fn is_command_palette_key(key_down: bool, key_code: i32, modifiers: u32) -> bool {
+    key_down && key_code == VK_K && modifiers & PRIMARY_MODIFIER_FLAGS != 0
+}
+
 wrap_keyboard_handler! {
     pub struct TabKeyboardHandler {
         tab_id: u64,
@@ -198,9 +209,21 @@ wrap_keyboard_handler! {
             if let Some(event) = event {
                 let is_key_down = event.type_ == KeyEventType::KEYDOWN
                     || event.type_ == KeyEventType::RAWKEYDOWN;
-                // CEF uses Windows virtual key codes on every platform; VK_F12 = 0x7B.
+                // CEF uses Windows virtual key codes on every platform.
+                // VK_F12 = 0x7B.
                 if is_key_down && event.windows_key_code == 0x7B {
                     let _ = self.event_sender.send(BrowserEvent::OpenDevTools {
+                        tab_id: self.tab_id,
+                    });
+                    return 1;
+                }
+
+                if is_command_palette_key(
+                    is_key_down,
+                    event.windows_key_code,
+                    event.modifiers,
+                ) {
+                    let _ = self.event_sender.send(BrowserEvent::OpenCommandPalette {
                         tab_id: self.tab_id,
                     });
                     return 1;
@@ -302,4 +325,20 @@ pub fn create_tab_client(
         keyboard_handler.into(),
         context_menu_handler.into(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_command_palette_key;
+
+    #[test]
+    fn command_palette_key_requires_k_with_ctrl_or_cmd() {
+        assert!(is_command_palette_key(true, 0x4B, 4)); // Ctrl+K
+        assert!(is_command_palette_key(true, 0x4B, 128)); // Cmd+K
+        assert!(is_command_palette_key(true, 0x4B, 4 | 8)); // Ctrl+Alt+K
+        assert!(!is_command_palette_key(false, 0x4B, 4));
+        assert!(!is_command_palette_key(true, 0x7B, 4)); // F12
+        assert!(!is_command_palette_key(true, 0x4B, 0));
+        assert!(!is_command_palette_key(true, 0x4B, 2)); // Shift only
+    }
 }
