@@ -14,7 +14,7 @@ Release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ## ✅ What Has Been Done
 
-Current version: **0.4.1**. A version bump is released when a PR is merged into `main`; PRs include the bump in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, `README.md`, `RELEASE_NOTES.md`, and `Cargo.lock` so CI checks the exact release state, as required by `AGENTS.md`.
+Current version: **0.5.0**. A version bump is released when a PR is merged into `main`; PRs include the bump in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, `README.md`, `RELEASE_NOTES.md`, and `Cargo.lock` so CI checks the exact release state, as required by `AGENTS.md`.
 
 - Renamed the project from LiteBrowser to **Kasumi Browser** everywhere: package, binary, CEF helper, bundle ID, window title, database path, and docs.
 - Implemented the CEF subprocess fork trap and `mimalloc` global allocator.
@@ -26,7 +26,8 @@ Current version: **0.4.1**. A version bump is released when a PR is merged into 
 - Integrated `adblock-rust` request interception with built-in starter rules plus optional EasyList/EasyPrivacy files.
 - Added SQLite WAL persistence for history, bookmarks, and session tabs, with low-RAM startup restore (only the active tab is spawned live).
 - Wired keyboard shortcuts: `Ctrl/Cmd+T`, `Ctrl/Cmd+W`, `Ctrl/Cmd+K`/`Ctrl/Cmd+L`, `Ctrl/Cmd+,`, `Ctrl/Cmd+Shift+T`, `Ctrl/Cmd+Z`, `Alt+H`, and `F12`. Browser shortcuts are also forwarded from the CEF child view so they keep working while a page has focus.
-- Added a native rail tab context menu with duplicate, copy URL, reload, close, close others, close tabs below, reopen-closed-tab, and DevTools actions.
+- Added a native rail tab context menu with duplicate, pin/unpin, copy URL, reload, close, close others, close tabs below, reopen-closed-tab, and DevTools actions.
+- Added persistent pinned tabs: pin from the rail context menu, command palette, or the rail pin badge; pinned tabs occupy a compact section at the top of both rail modes and are restored across restarts.
 - `F12`, the rail **DevTools** button, the tab context menu, and the command palette all open Chromium DevTools in a separate window.
 - Closed tabs now retain their title and original position, so `Cmd/Ctrl+Z` and `Cmd/Ctrl+Shift+T` restore them where they were.
 - Browser creation is deferred out of window-event callbacks and blank initial frames are retried with escalating delays, so new and restored tabs reliably load their page on all platforms. Fallback favicon downloads wait for a committed URL, and main-frame navigations are never cancelled by the ad blocker.
@@ -45,8 +46,8 @@ Current version: **0.4.1**. A version bump is released when a PR is merged into 
 - The selected search provider now also controls the new-tab landing page, and the command palette replaces the seeded active URL when you start typing, so changing to Google/Bing does not leave DuckDuckGo in the search or new-tab path. The palette now offers explicit **Search in this tab** and **Search in a new tab** choices for queries (and **Open in this tab** / **Open in a new tab** for addresses), with those actions listed before tab matches.
 - Loading tabs now show an animated native spinner in the favicon slot instead of a static favicon; the spinner disappears as soon as the page finishes loading.
 - Fixed the original chrome UX/navigation feedback items: Back/Forward icon states, omnibox URL synchronization, F12 DevTools, view-source navigation, favicons, and hover tooltips.
-- Added 91 unit tests covering omnibox resolution, search-provider selection and homepages, rail/palette/menu/settings geometry and state, explicit this-tab/new-tab palette actions, loading-spinner rotation geometry, context-menu actions, closed-tab metadata, initial-navigation recovery, tooltip pointer-exit handling, collapsed-only tooltip behavior, web-view shortcut forwarding (including UTF-16 character fallback), the macOS NSEvent shortcut monitor, secondary-display overlay positioning, deferred palette text selection, light/dark palette contrast and theme override, hibernation thresholds, adblock mapping, preference persistence, storage, and CEF switch invariants.
-- Verified with `cargo fmt --all -- --check`, `cargo check --bins`, `cargo test --bin kasumi-browser` (91 tests), and `cargo build --release`. Interactive macOS verification is performed before each release push.
+- Added 96 unit tests covering omnibox resolution, search-provider selection and homepages, rail/palette/menu/settings geometry and state, explicit this-tab/new-tab palette actions, pinned-tab ordering and menu/palette commands, loading-spinner rotation geometry, context-menu actions, closed-tab metadata, initial-navigation recovery, tooltip pointer-exit handling, collapsed-only tooltip behavior, web-view shortcut forwarding (including UTF-16 character fallback), the macOS NSEvent shortcut monitor, secondary-display overlay positioning, deferred palette text selection, light/dark palette contrast and theme override, hibernation thresholds, adblock mapping, preference persistence, storage (including legacy session migration), and CEF switch invariants.
+- Verified with `cargo fmt --all -- --check`, `cargo check --bins`, `cargo test --bin kasumi-browser` (96 tests), and `cargo build --release`. Interactive macOS verification is performed before each release push.
 - Removed the obsolete `BUGFIX_TASKS.md` handoff; its completed items are recorded in `RELEASE_NOTES.md`.
 
 ---
@@ -278,9 +279,8 @@ sha256sum kasumi-browser.tar.gz > kasumi-browser.tar.gz.sha256
 
 ## 🚧 Future Development
 
-**Next up: pinned tabs.** It is the smallest feature with immediate daily-driver value, and it is the foundation for per-workspace pinned lists, so it should land before full workspace switching.
+**Next up: workspaces.** Pinned tabs are now the foundation, so an Arc-style space or edge workspace strip is the natural next step for grouping tabs by project, task, or context.
 
-- **Pinned tabs:** a compact pinned section in the rail that stays visible across tab switches and browser restarts.
 - **Workspaces:** Arc-style Spaces or an edge workspace strip for grouping tabs by project, task, or context.
 - **Per-workspace pins and bookmarks:** each workspace will own its own pinned-tab list and bookmarks so switching spaces restores the full context without mixing them.
 - **Bookmark manager UI:** a native view for organizing, searching, and editing bookmarks.

@@ -4,6 +4,23 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
+## v0.5.0 — 2026-11-23
+
+### Added
+
+- Persistent pinned tabs: pin or unpin from the rail context menu, command palette, or clickable rail pin badge. Pinned tabs occupy a compact section at the top of both rail modes and are stored in SQLite session snapshots, including a migration for databases created by older releases.
+- Closed-tab undo preserves pin state, and new tabs, duplicates, and restored sessions keep pinned tabs ahead of regular tabs.
+- Bumped the project, macOS bundle, About-menu version, docs, and lockfile from `0.4.1` to `0.5.0`.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser` — 96 tests
+- `cargo build --release`
+
+---
+
 ## v0.4.1 — 2026-11-23
 
 ### Changed

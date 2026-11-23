@@ -172,6 +172,9 @@ pub enum UiAction {
     DuplicateTab {
         tab_id: u64,
     },
+    TogglePinTab {
+        tab_id: u64,
+    },
     SelectTab {
         tab_id: u64,
     },

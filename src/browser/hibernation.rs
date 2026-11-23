@@ -130,11 +130,35 @@ pub struct ClosedTab {
     pub title: String,
     /// Position the tab occupied before it was closed.
     pub index: usize,
+    /// Whether the tab belonged to the compact pinned section.
+    pub pinned: bool,
 }
 
 /// Clamp a restored tab's original position to the current tab count.
 pub fn restore_insert_index(original_index: usize, tab_count: usize) -> usize {
     original_index.min(tab_count)
+}
+
+/// Number of pinned tabs that remain after excluding one tab. This is the
+/// boundary where a pinned tab is inserted (or where an unpinned tab lands
+/// when it leaves the pinned section).
+pub fn pinned_insert_index(tabs: &[Tab], exclude_index: Option<usize>) -> usize {
+    tabs.iter()
+        .enumerate()
+        .filter(|(index, tab)| Some(*index) != exclude_index && tab.pinned)
+        .count()
+}
+
+/// Choose an insertion index that preserves the pinned-before-unpinned
+/// invariant used by both the tab model and the native rail.
+pub fn insertion_index(tabs: &[Tab], requested: Option<usize>, pinned: bool) -> usize {
+    let boundary = pinned_insert_index(tabs, None);
+    let requested = requested.unwrap_or(tabs.len());
+    if pinned {
+        requested.min(boundary)
+    } else {
+        requested.clamp(boundary, tabs.len())
+    }
 }
 
 /// Capture the metadata needed to undo a tab close. Keeping this pure makes
@@ -144,6 +168,7 @@ pub fn closed_tab_from(tab: &Tab, index: usize) -> ClosedTab {
         url: tab.url.clone(),
         title: tab.title.clone(),
         index,
+        pinned: tab.pinned,
     }
 }
 
@@ -206,6 +231,7 @@ pub struct Tab {
     pub can_go_back: bool,
     pub can_go_forward: bool,
     pub blocked_requests: u32,
+    pub pinned: bool,
     pub state: TabState,
     pub browser: Option<cef::Browser>,
     pub favicon: Option<Favicon>,
@@ -221,6 +247,7 @@ impl std::fmt::Debug for Tab {
             .field("can_go_back", &self.can_go_back)
             .field("can_go_forward", &self.can_go_forward)
             .field("blocked_requests", &self.blocked_requests)
+            .field("pinned", &self.pinned)
             .field("state", &self.state)
             .field("has_browser", &self.browser.is_some())
             .field("has_favicon", &self.favicon.is_some())
@@ -361,8 +388,11 @@ impl TabManager {
         }
 
         let mut active_id = None;
+        let mut ordered = restored;
+        // Legacy sessions have no pin data, so always place pinned tabs first.
+        ordered.sort_by_key(|snapshot| !snapshot.is_pinned);
 
-        for snapshot in restored {
+        for snapshot in ordered {
             let id = self.next_tab_id;
             self.next_tab_id += 1;
 
@@ -379,6 +409,7 @@ impl TabManager {
                 can_go_back: false,
                 can_go_forward: false,
                 blocked_requests: 0,
+                pinned: snapshot.is_pinned,
                 state: if is_active {
                     TabState::Active
                 } else {
@@ -412,7 +443,13 @@ impl TabManager {
         };
         let index = restore_insert_index(closed.index, self.tabs.len());
         tracing::info!("Re-opening closed tab at {}: {}", index, closed.url);
-        self.insert_tab(Some(closed.url), Some(closed.title), Some(index), true);
+        self.insert_tab(
+            Some(closed.url),
+            Some(closed.title),
+            Some(index),
+            true,
+            closed.pinned,
+        );
     }
 
     /// Whether there is a closed tab available to restore.
@@ -429,6 +466,7 @@ impl TabManager {
                 title: t.title.clone(),
                 is_active: Some(t.id) == self.active_tab_id,
                 is_hibernated: t.state == TabState::Hibernated,
+                is_pinned: t.pinned,
             })
             .collect()
     }
@@ -465,24 +503,23 @@ impl TabManager {
 
     /// Create a new tab. If `make_active` is true, focuses the new tab immediately.
     pub fn create_tab(&mut self, url: Option<String>, make_active: bool) -> u64 {
-        self.insert_tab(url, None, None, make_active)
+        self.insert_tab(url, None, None, make_active, false)
     }
 
-    /// Insert a tab with an optional restored title and position.
+    /// Insert a tab with an optional restored title, position, and pin state.
     fn insert_tab(
         &mut self,
         url: Option<String>,
         title: Option<String>,
         index: Option<usize>,
         make_active: bool,
+        pinned: bool,
     ) -> u64 {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
 
         let target_url = url.unwrap_or_else(|| self.home_url.clone());
-        let at = index.map_or(self.tabs.len(), |i| {
-            restore_insert_index(i, self.tabs.len())
-        });
+        let at = insertion_index(&self.tabs, index, pinned);
 
         let tab = Tab {
             id,
@@ -492,6 +529,7 @@ impl TabManager {
             can_go_back: false,
             can_go_forward: false,
             blocked_requests: 0,
+            pinned,
             state: if make_active {
                 TabState::Active
             } else {
@@ -510,6 +548,20 @@ impl TabManager {
         }
 
         id
+    }
+
+    /// Toggle a tab between the compact pinned section and the normal tabs.
+    /// Pinning appends to the pinned section; unpinning inserts at its start.
+    pub fn toggle_pin_tab(&mut self, id: u64) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let pinned = !self.tabs[index].pinned;
+        let insert_at = pinned_insert_index(&self.tabs, Some(index));
+        let mut tab = self.tabs.remove(index);
+        tab.pinned = pinned;
+        self.tabs.insert(insert_at, tab);
+        self.sync_session();
     }
 
     /// Focus an existing tab by ID.
@@ -1162,8 +1214,12 @@ impl TabManager {
                 {
                     let url = tab.url.clone();
                     let title = tab.title.clone();
-                    self.insert_tab(Some(url), Some(title), Some(index + 1), true);
+                    let pinned = tab.pinned;
+                    self.insert_tab(Some(url), Some(title), Some(index + 1), true, pinned);
                 }
+            }
+            UiAction::TogglePinTab { tab_id } => {
+                self.toggle_pin_tab(tab_id);
             }
             UiAction::SelectTab { tab_id } => {
                 self.focus_tab(tab_id);
@@ -1316,6 +1372,7 @@ impl TabManager {
                 blocked_requests: t.blocked_requests,
                 can_go_back: t.can_go_back,
                 can_go_forward: t.can_go_forward,
+                is_pinned: t.pinned,
                 favicon: t.favicon.clone(),
             })
             .collect();
@@ -1354,10 +1411,10 @@ impl TabManager {
 #[cfg(test)]
 mod tests {
     use super::{
-        closed_tab_from, fallback_favicon_url, idle_timeout_for_pressure, is_blank_navigation_url,
-        is_critical_pressure, needs_initial_navigation, next_navigation_retry_delay,
-        preferred_favicon_url, ram_pressure, restore_insert_index, should_hibernate_tab,
-        should_sync_omnibox, Tab, TabState,
+        closed_tab_from, fallback_favicon_url, idle_timeout_for_pressure, insertion_index,
+        is_blank_navigation_url, is_critical_pressure, needs_initial_navigation,
+        next_navigation_retry_delay, pinned_insert_index, preferred_favicon_url, ram_pressure,
+        restore_insert_index, should_hibernate_tab, should_sync_omnibox, Tab, TabState,
     };
     use crate::config::{TAB_IDLE_TIMEOUT_NORMAL, TAB_IDLE_TIMEOUT_PRESSURE};
     use std::time::{Duration, Instant};
@@ -1574,6 +1631,7 @@ mod tests {
             can_go_back: true,
             can_go_forward: false,
             blocked_requests: 12,
+            pinned: true,
             state: TabState::Background {
                 since: Instant::now(),
             },
@@ -1585,6 +1643,59 @@ mod tests {
         assert_eq!(closed.url, tab.url);
         assert_eq!(closed.title, tab.title);
         assert_eq!(closed.index, 3);
+        assert!(closed.pinned);
+    }
+
+    #[test]
+    fn pinned_insertion_indexes_preserve_section_order() {
+        let tabs = vec![
+            Tab {
+                id: 1,
+                url: "https://pinned.example".to_string(),
+                title: "Pinned".to_string(),
+                is_loading: false,
+                can_go_back: false,
+                can_go_forward: false,
+                blocked_requests: 0,
+                pinned: true,
+                state: TabState::Active,
+                browser: None,
+                favicon: None,
+            },
+            Tab {
+                id: 2,
+                url: "https://pinned-two.example".to_string(),
+                title: "Pinned Two".to_string(),
+                is_loading: false,
+                can_go_back: false,
+                can_go_forward: false,
+                blocked_requests: 0,
+                pinned: true,
+                state: TabState::Hibernated,
+                browser: None,
+                favicon: None,
+            },
+            Tab {
+                id: 3,
+                url: "https://regular.example".to_string(),
+                title: "Regular".to_string(),
+                is_loading: false,
+                can_go_back: false,
+                can_go_forward: false,
+                blocked_requests: 0,
+                pinned: false,
+                state: TabState::Hibernated,
+                browser: None,
+                favicon: None,
+            },
+        ];
+
+        assert_eq!(pinned_insert_index(&tabs, None), 2);
+        assert_eq!(pinned_insert_index(&tabs, Some(0)), 1);
+        assert_eq!(insertion_index(&tabs, None, true), 2);
+        assert_eq!(insertion_index(&tabs, Some(99), true), 2);
+        assert_eq!(insertion_index(&tabs, None, false), 3);
+        assert_eq!(insertion_index(&tabs, Some(0), false), 2);
     }
 
     #[test]
