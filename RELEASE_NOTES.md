@@ -10,15 +10,16 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 - DevTools can be brought forward again after a window resize: F12 and the DevTools rail action now call `show_dev_tools` even when a DevTools browser already exists, letting CEF focus the existing window instead of returning early.
 - Middle-clicking a link no longer navigates the current tab. CEF's open-from-tab disposition is mapped to a Kasumi tab: middle-click opens a live background tab, while Ctrl/Cmd+click and popup-style dispositions open a foreground tab.
-- Background tabs opened this way hide their native child view until selected and participate in normal hibernation/session persistence.
+- Background tabs opened this way hide their native child view until selected and participate in normal hibernation/session persistence. Browser creation now uses CEF's cross-platform `set_as_child` helper so the same path compiles on macOS, Windows, and Linux; macOS uses CEF's `hidden` flag, Windows clears `WS_VISIBLE`, and Linux unmaps the X11 child on creation. CEF window handles now convert between pointer and XID forms through one shared helper.
 - Bumped the project, macOS bundle, About-menu version, docs, and lockfile from `0.5.0` to `0.5.1`.
 
 ### Verification
 
 - `cargo fmt --all -- --check`
 - `cargo check --bins`
-- `cargo test --bin kasumi-browser` — 101 tests
+- `cargo test --bin kasumi-browser` — 103 tests
 - `cargo build --release`
+- PR CI checks formatting, binaries, and unit tests on macOS 15 Intel, Windows, and Linux.
 
 ---
 

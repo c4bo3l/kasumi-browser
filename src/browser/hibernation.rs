@@ -611,9 +611,9 @@ impl TabManager {
                 if let Some(ref browser) = old_tab.browser {
                     if let Some(host) = browser.host() {
                         let view_handle = host.window_handle();
-                        if !view_handle.is_null() {
-                            if let Err(e) = unsafe { platform_view::hide_view(view_handle.cast()) }
-                            {
+                        if !platform_view::cef_handle_is_null(view_handle) {
+                            let view_ptr = platform_view::cef_handle_as_ptr(view_handle);
+                            if let Err(e) = unsafe { platform_view::hide_view(view_ptr) } {
                                 tracing::warn!("Could not hide old tab view: {e}");
                             }
                         }
@@ -849,22 +849,36 @@ impl TabManager {
             self.adblock_engine.clone(),
             Arc::clone(&self.adblock_enabled),
         );
-        let mut window_info = cef::WindowInfo::default();
-
-        window_info.windowless_rendering_enabled = 0;
-        window_info.parent_view = self.parent_window_view;
-        window_info.bounds = cef::Rect {
+        let bounds = cef::Rect {
             x: self.content_rect.x as i32,
             y: self.content_rect.y as i32,
             width: self.content_rect.width as i32,
             height: self.content_rect.height as i32,
         };
+        // CEF exposes different parent fields and handle types per platform.
+        // `set_as_child` writes `parent_window` on Windows/Linux and
+        // `parent_view` on macOS; Linux uses an XID instead of a pointer.
+        let parent_handle = platform_view::ptr_as_cef_handle(self.parent_window_view);
+        let mut window_info = cef::WindowInfo::default().set_as_child(parent_handle, &bounds);
+        window_info.windowless_rendering_enabled = 0;
+
         #[cfg(target_os = "macos")]
         {
             window_info.hidden = if hidden { 1 } else { 0 };
         }
-        #[cfg(not(target_os = "macos"))]
-        let _ = hidden;
+        #[cfg(target_os = "windows")]
+        {
+            if hidden {
+                use windows_sys::Win32::UI::WindowsAndMessaging::WS_VISIBLE;
+                window_info.style &= !WS_VISIBLE;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // CEF's Linux WindowInfo has no hidden flag. The BrowserCreated
+            // handler unmaps the X11 child before it can become visible.
+            let _ = hidden;
+        }
 
         let cef_url = cef::CefString::from(url);
         let browser_settings = cef::BrowserSettings::default();
@@ -957,15 +971,12 @@ impl TabManager {
             return;
         };
         let view_handle = host.window_handle();
-        if view_handle.is_null() || self.parent_window_view.is_null() {
+        if platform_view::cef_handle_is_null(view_handle) || self.parent_window_view.is_null() {
             return;
         }
+        let view_ptr = platform_view::cef_handle_as_ptr(view_handle);
         if let Err(e) = unsafe {
-            platform_view::show_view(
-                self.parent_window_view.cast(),
-                view_handle.cast(),
-                self.content_rect,
-            )
+            platform_view::show_view(self.parent_window_view.cast(), view_ptr, self.content_rect)
         } {
             tracing::warn!("Could not show active tab view: {e}");
         }
@@ -983,11 +994,11 @@ impl TabManager {
             return;
         };
         let view_handle = host.window_handle();
-        if view_handle.is_null() {
+        if platform_view::cef_handle_is_null(view_handle) {
             return;
         }
-        if let Err(e) = unsafe { platform_view::resize_view(view_handle.cast(), self.content_rect) }
-        {
+        let view_ptr = platform_view::cef_handle_as_ptr(view_handle);
+        if let Err(e) = unsafe { platform_view::resize_view(view_ptr, self.content_rect) } {
             tracing::warn!("Could not resize active tab view: {e}");
         }
     }
@@ -1026,11 +1037,13 @@ impl TabManager {
                         .find(|t| t.id == tab_id)
                         .and_then(|tab| tab.browser.as_ref())
                         .and_then(|browser| browser.host())
-                        .map(|host| host.window_handle())
-                        .unwrap_or(std::ptr::null_mut());
-                    if !view_handle.is_null() {
-                        if let Err(e) = unsafe { platform_view::hide_view(view_handle.cast()) } {
-                            tracing::warn!("Could not hide background tab view: {e}");
+                        .map(|host| host.window_handle());
+                    if let Some(view_handle) = view_handle {
+                        if !platform_view::cef_handle_is_null(view_handle) {
+                            let view_ptr = platform_view::cef_handle_as_ptr(view_handle);
+                            if let Err(e) = unsafe { platform_view::hide_view(view_ptr) } {
+                                tracing::warn!("Could not hide background tab view: {e}");
+                            }
                         }
                     }
                 }

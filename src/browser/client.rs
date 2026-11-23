@@ -31,9 +31,11 @@ wrap_life_span_handler! {
                     // finish closing, otherwise the browser stays alive and
                     // page media keeps playing.
                     let view_handle = host.window_handle();
-                    if !view_handle.is_null() {
+                    if !crate::ui::platform_view::cef_handle_is_null(view_handle) {
                         unsafe {
-                            crate::ui::platform_view::detach_view(view_handle.cast());
+                            crate::ui::platform_view::detach_view(
+                                crate::ui::platform_view::cef_handle_as_ptr(view_handle),
+                            );
                         }
                     }
                     host.try_close_browser()

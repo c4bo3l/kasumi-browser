@@ -66,6 +66,35 @@ impl ContentRect {
     }
 }
 
+use cef::sys::cef_window_handle_t;
+
+/// CEF's native window handle is a pointer on macOS/Windows but an XID
+/// integer on Linux. Every function in this module takes `*mut c_void`, so
+/// these helpers keep that conversion in one audited place.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn cef_handle_as_ptr(handle: cef_window_handle_t) -> *mut std::ffi::c_void {
+    handle
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn cef_handle_as_ptr(handle: cef_window_handle_t) -> *mut std::ffi::c_void {
+    handle as usize as *mut std::ffi::c_void
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) fn ptr_as_cef_handle(ptr: *mut std::ffi::c_void) -> cef_window_handle_t {
+    ptr
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn ptr_as_cef_handle(ptr: *mut std::ffi::c_void) -> cef_window_handle_t {
+    ptr as usize as cef_window_handle_t
+}
+
+pub(crate) fn cef_handle_is_null(handle: cef_window_handle_t) -> bool {
+    cef_handle_as_ptr(handle).is_null()
+}
+
 // ---------------------------------------------------------------------------
 // macOS (NSView)
 // ---------------------------------------------------------------------------
@@ -363,8 +392,19 @@ pub use linux::{detach_view, hide_view, resize_view, show_view};
 
 #[cfg(test)]
 mod tests {
-    use super::ContentRect;
+    use super::{cef_handle_as_ptr, cef_handle_is_null, ptr_as_cef_handle, ContentRect};
     use crate::config::{rail_width, RAIL_WIDTH_COLLAPSED, RAIL_WIDTH_EXPANDED};
+
+    #[test]
+    fn null_native_handles_are_detected_across_platforms() {
+        assert!(cef_handle_is_null(ptr_as_cef_handle(std::ptr::null_mut())));
+    }
+
+    #[test]
+    fn native_handle_round_trip_preserves_xid_and_pointer_values() {
+        let ptr = 0x1234_usize as *mut std::ffi::c_void;
+        assert_eq!(cef_handle_as_ptr(ptr_as_cef_handle(ptr)), ptr);
+    }
 
     #[test]
     fn content_rect_is_logical_and_starts_right_of_the_rail() {
