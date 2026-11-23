@@ -4,6 +4,34 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
+## v0.1.7 — 2026-11-23
+
+### Fixed
+
+- The omnibox now follows the active tab's committed URL after link clicks, Back/Forward, and tab switches. It stops overwriting text while focused, and Cmd/Ctrl+L focuses and selects the whole URL.
+- Back and Forward controls are drawn as native arrow shapes instead of relying on font glyphs, with dimmed-but-visible disabled states.
+- Tooltips now cover tabs, close buttons, new tab, Back, Forward, Reload/Stop, the shield badge, Hibernate All, RAM readout, and the omnibox.
+- F12 now opens DevTools when the web view has focus via a CEF `KeyboardHandler`; the winit shortcut remains as a fallback, and repeated presses no longer spawn duplicate windows.
+- Right-click → View Page Source now opens a visible `view-source:` tab and reuses an existing source tab if present.
+
+### Added
+
+- End-to-end favicon pipeline: CEF favicon URL callbacks now trigger main-thread image downloads, decode to RGBA, and render in the tab strip with a neutral fallback.
+- Modernized the tab strip with rounded surfaces, active accent line, hover states, and favicon slots while keeping the 38 px tab-strip / 76 px chrome geometry.
+- Added an omnibox unit test for `view-source:` URLs.
+
+### Changed
+
+- Bumped the project and macOS bundle version from `0.1.6` to `0.1.7`.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser`
+
+---
+
 ## v0.1.6 — 2026-11-23
 
 ### Added

@@ -1,8 +1,8 @@
 # Kasumi Browser — UI / Navigation Bugfix Handoff
 
-**Version:** v0.1.6  
+**Version:** v0.1.7  
 **Date:** 2026-11-23  
-**Status:** Documentation-only batch. No runtime fixes are implemented yet; this file is the handoff for the next agent.
+**Status:** Runtime fixes implemented in v0.1.7. The manual verification checklist near the end still needs a hands-on pass.
 
 This document captures the reported bugs, the code inspection already done, likely root causes, concrete implementation leads, and acceptance criteria. Work through the items in the order listed: the low-risk UI/navigation fixes first, then the CEF callback work.
 
@@ -413,7 +413,7 @@ open target/bundle/KasumiBrowser.app
 
 ## Versioning for the next batch
 
-The next agent should start by bumping to **v0.1.7** (this handoff batch is v0.1.6):
+The next agent should start by bumping to **v0.1.8** (this handoff batch is v0.1.7):
 
 - `Cargo.toml`
 - `src/bin/bundle.rs`
@@ -425,14 +425,14 @@ The next agent should start by bumping to **v0.1.7** (this handoff batch is v0.1
 Suggested PR title / merge commit:
 
 ```text
-v0.1.7: fix chrome UX and navigation feedback
+v0.1.8: fix chrome UX and navigation feedback
 ```
 
 Publish with a pull request:
 
 ```bash
 git push -u origin <branch>
-gh pr create --title "v0.1.7: fix chrome UX and navigation feedback" --fill
+gh pr create --title "v0.1.8: fix chrome UX and navigation feedback" --fill
 gh pr checks --watch
 gh pr merge --squash
 ```

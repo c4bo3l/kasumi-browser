@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,6 +16,7 @@ use cef::{ImplBrowser, ImplBrowserHost, ImplFrame};
 use crossbeam_channel::{Receiver, Sender};
 use sysinfo::{ProcessesToUpdate, System};
 
+use crate::browser::favicon::create_favicon_download_callback;
 use crate::browser::{adblocker, client};
 use crate::config::{
     DEFAULT_HOME_URL, RAM_CHECK_INTERVAL, RAM_CRITICAL_PRESSURE_THRESHOLD,
@@ -23,7 +25,7 @@ use crate::config::{
 };
 use crate::events::{BrowserEvent, UiAction};
 use crate::storage::db::{SessionTabSnapshot, StorageHandle};
-use crate::ui::chrome::{ChromeState, TabDisplayState, TabInfo};
+use crate::ui::chrome::{ChromeState, Favicon, TabDisplayState, TabInfo};
 use crate::ui::platform_view::{self, ContentRect};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +45,7 @@ pub struct Tab {
     pub blocked_requests: u32,
     pub state: TabState,
     pub browser: Option<cef::Browser>,
+    pub favicon: Option<Favicon>,
 }
 
 impl std::fmt::Debug for Tab {
@@ -57,6 +60,7 @@ impl std::fmt::Debug for Tab {
             .field("blocked_requests", &self.blocked_requests)
             .field("state", &self.state)
             .field("has_browser", &self.browser.is_some())
+            .field("has_favicon", &self.favicon.is_some())
             .finish()
     }
 }
@@ -91,6 +95,10 @@ pub struct TabManager {
 
     // Number of `host.close_browser(1)` calls awaiting an `on_before_close` event.
     pending_browser_closes: u32,
+
+    // Favicon URLs already requested, and URLs seen before the browser exists.
+    requested_favicons: HashSet<(u64, String)>,
+    pending_favicon_urls: HashMap<u64, Vec<String>>,
 }
 
 impl TabManager {
@@ -125,6 +133,8 @@ impl TabManager {
             storage,
             recently_closed: Vec::new(),
             pending_browser_closes: 0,
+            requested_favicons: HashSet::new(),
+            pending_favicon_urls: HashMap::new(),
         }
     }
 
@@ -160,6 +170,7 @@ impl TabManager {
                     TabState::Hibernated
                 },
                 browser: None,
+                favicon: None,
             };
 
             self.tabs.push(tab);
@@ -250,6 +261,7 @@ impl TabManager {
                 TabState::Hibernated
             },
             browser: None,
+            favicon: None,
         };
 
         self.tabs.push(tab);
@@ -325,6 +337,8 @@ impl TabManager {
 
         let mut tab = self.tabs.remove(index);
         self.recently_closed.push(tab.url.clone());
+        self.requested_favicons.retain(|(tab_id, _)| *tab_id != id);
+        self.pending_favicon_urls.remove(&id);
 
         if let Some(browser) = tab.browser.take() {
             if let Some(host) = browser.host() {
@@ -433,6 +447,60 @@ impl TabManager {
         }
     }
 
+    /// Ask CEF to download favicon bitmaps. Called on the main UI thread only;
+    /// the callback sends the decoded pixels back over the existing channel.
+    fn request_favicon_downloads(&mut self, tab_id: u64, urls: Vec<String>) {
+        let host = self
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.browser.as_ref())
+            .and_then(|browser| browser.host());
+
+        let Some(host) = host else {
+            self.pending_favicon_urls
+                .entry(tab_id)
+                .or_default()
+                .extend(urls);
+            return;
+        };
+
+        for url in urls {
+            if url.is_empty() || !self.requested_favicons.insert((tab_id, url.clone())) {
+                continue;
+            }
+
+            let cef_url = cef::CefString::from(url.as_str());
+            let mut callback = create_favicon_download_callback(tab_id, self.event_sender.clone());
+            host.download_image(Some(&cef_url), 1, 64, 0, Some(&mut callback));
+        }
+    }
+
+    /// Show DevTools once per browser. Repeated F12 presses focus the existing
+    /// window instead of creating a new one.
+    fn show_dev_tools(&self, tab_id: u64) {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) else {
+            return;
+        };
+        let Some(host) = tab.browser.as_ref().and_then(|browser| browser.host()) else {
+            return;
+        };
+
+        if host.has_dev_tools() != 0 {
+            return;
+        }
+
+        let mut window_info = cef::WindowInfo::default();
+        window_info.windowless_rendering_enabled = 0;
+        window_info.bounds = cef::Rect {
+            x: 100,
+            y: 100,
+            width: 960,
+            height: 720,
+        };
+        host.show_dev_tools(Some(&window_info), None, None, None);
+    }
+
     /// Position and show the active tab's native view.
     pub fn show_active_tab_view(&self) {
         if let Some(id) = self.active_tab_id {
@@ -487,8 +555,13 @@ impl TabManager {
             BrowserEvent::BrowserCreated { tab_id, browser } => {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.browser = Some(browser);
-                    if self.active_tab_id == Some(tab_id) {
-                        self.show_active_tab_view();
+                }
+                if self.active_tab_id == Some(tab_id) {
+                    self.show_active_tab_view();
+                }
+                if let Some(urls) = self.pending_favicon_urls.remove(&tab_id) {
+                    if !urls.is_empty() {
+                        self.request_favicon_downloads(tab_id, urls);
                     }
                 }
             }
@@ -503,6 +576,13 @@ impl TabManager {
             }
             BrowserEvent::AddressChange { tab_id, url } => {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    if tab.url != url {
+                        // A new site needs a fresh favicon; stale pixels must not
+                        // linger in the tab strip.
+                        tab.favicon = None;
+                        self.requested_favicons.retain(|(id, _)| *id != tab_id);
+                        self.pending_favicon_urls.remove(&tab_id);
+                    }
                     tab.url = url.clone();
                     if let Some(ref storage) = self.storage {
                         storage.record_visit(url, tab.title.clone());
@@ -542,6 +622,47 @@ impl TabManager {
                 self.pending_browser_closes = self.pending_browser_closes.saturating_sub(1);
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.browser = None;
+                }
+            }
+            BrowserEvent::OpenDevTools { tab_id } => {
+                self.show_dev_tools(tab_id);
+            }
+            BrowserEvent::ViewSource { url, .. } => {
+                if url.is_empty() {
+                    return;
+                }
+                let source_url = if url.starts_with("view-source:") {
+                    url
+                } else {
+                    format!("view-source:{}", url)
+                };
+                let existing = self.tabs.iter().find(|t| t.url == source_url).map(|t| t.id);
+                if let Some(id) = existing {
+                    self.focus_tab(id);
+                } else {
+                    self.create_tab(Some(source_url), true);
+                }
+            }
+            BrowserEvent::FaviconUrlChanged { tab_id, urls } => {
+                self.request_favicon_downloads(tab_id, urls);
+            }
+            BrowserEvent::FaviconLoaded {
+                tab_id,
+                url,
+                rgba,
+                width,
+                height,
+            } => {
+                if !self.requested_favicons.contains(&(tab_id, url.clone())) {
+                    return;
+                }
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    tab.favicon = Some(Favicon {
+                        url,
+                        rgba,
+                        width,
+                        height,
+                    });
                 }
             }
             BrowserEvent::NewWindow { url } => {
@@ -615,13 +736,7 @@ impl TabManager {
                 self.hibernate_all_background();
             }
             UiAction::OpenDevTools { tab_id } => {
-                if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
-                    if let Some(ref browser) = tab.browser {
-                        if let Some(host) = browser.host() {
-                            host.show_dev_tools(None, None, None, None);
-                        }
-                    }
-                }
+                self.show_dev_tools(tab_id);
             }
         }
     }
@@ -710,6 +825,7 @@ impl TabManager {
             .iter()
             .map(|t| TabInfo {
                 id: t.id,
+                url: t.url.clone(),
                 title: t.title.clone(),
                 is_loading: t.is_loading,
                 display_state: match t.state {
@@ -720,6 +836,7 @@ impl TabManager {
                 blocked_requests: t.blocked_requests,
                 can_go_back: t.can_go_back,
                 can_go_forward: t.can_go_forward,
+                favicon: t.favicon.clone(),
             })
             .collect();
 
@@ -729,11 +846,21 @@ impl TabManager {
         if let Some(id) = self.active_tab_id {
             if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
                 state.is_loading = tab.is_loading;
-                // If omnibox text was never set or tab changed, keep it synced
-                if state.omnibox_text.is_empty() {
+                // Never clobber text while the user is editing. As soon as the
+                // omnibox loses focus, settle back to the active tab's real URL.
+                let identity_changed =
+                    state.last_synced_tab_id != Some(id) || state.last_synced_url != tab.url;
+                if !state.omnibox_focused && (identity_changed || state.omnibox_text != tab.url) {
                     state.omnibox_text = tab.url.clone();
                 }
+                state.last_synced_tab_id = Some(id);
+                state.last_synced_url = tab.url.clone();
             }
+        } else {
+            state.is_loading = false;
+            state.omnibox_text.clear();
+            state.last_synced_tab_id = None;
+            state.last_synced_url.clear();
         }
     }
 }

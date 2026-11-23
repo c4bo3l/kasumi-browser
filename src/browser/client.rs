@@ -46,11 +46,23 @@ wrap_life_span_handler! {
         ) -> i32 {
             if let Some(url) = target_url {
                 let url_str = url.to_string();
-                if !url_str.is_empty() {
-                    let _ = self.event_sender.send(BrowserEvent::NewWindow { url: url_str });
+                if url_str.is_empty() {
+                    return 1;
                 }
+
+                // DevTools and view-source windows are part of the browser
+                // itself; routing them through the normal new-tab popup path
+                // makes them invisible or useless in this shell.
+                let is_internal_view = url_str.starts_with("devtools://")
+                    || url_str.starts_with("chrome-devtools://")
+                    || url_str.starts_with("view-source:");
+                if is_internal_view {
+                    return 0;
+                }
+
+                let _ = self.event_sender.send(BrowserEvent::NewWindow { url: url_str });
             }
-            1 // Cancel default popup window
+            1 // Cancel ordinary popup windows; open them as Kasumi tabs instead.
         }
     }
 }
@@ -115,6 +127,22 @@ wrap_display_handler! {
             }
         }
 
+        fn on_favicon_urlchange(
+            &self,
+            _browser: Option<&mut Browser>,
+            icon_urls: Option<&mut CefStringList>,
+        ) {
+            if let Some(icon_urls) = icon_urls {
+                let urls: Vec<String> = icon_urls.clone().into_iter().collect();
+                if !urls.is_empty() {
+                    let _ = self.event_sender.send(BrowserEvent::FaviconUrlChanged {
+                        tab_id: self.tab_id,
+                        urls,
+                    });
+                }
+            }
+        }
+
         fn on_loading_progress_change(
             &self,
             _browser: Option<&mut Browser>,
@@ -128,12 +156,82 @@ wrap_display_handler! {
     }
 }
 
+wrap_keyboard_handler! {
+    pub struct TabKeyboardHandler {
+        tab_id: u64,
+        event_sender: Sender<BrowserEvent>,
+    }
+
+    impl KeyboardHandler {
+        fn on_pre_key_event(
+            &self,
+            _browser: Option<&mut Browser>,
+            event: Option<&KeyEvent>,
+            _os_event: *mut u8,
+            _is_keyboard_shortcut: Option<&mut ::std::os::raw::c_int>,
+        ) -> i32 {
+            if let Some(event) = event {
+                let is_key_down = event.type_ == KeyEventType::KEYDOWN
+                    || event.type_ == KeyEventType::RAWKEYDOWN;
+                // CEF uses Windows virtual key codes on every platform; VK_F12 = 0x7B.
+                if is_key_down && event.windows_key_code == 0x7B {
+                    let _ = self.event_sender.send(BrowserEvent::OpenDevTools {
+                        tab_id: self.tab_id,
+                    });
+                    return 1;
+                }
+            }
+            0
+        }
+    }
+}
+
+wrap_context_menu_handler! {
+    pub struct TabContextMenuHandler {
+        tab_id: u64,
+        event_sender: Sender<BrowserEvent>,
+    }
+
+    impl ContextMenuHandler {
+        fn on_context_menu_command(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            params: Option<&mut ContextMenuParams>,
+            command_id: ::std::os::raw::c_int,
+            _event_flags: EventFlags,
+        ) -> i32 {
+            let view_source_id = cef::sys::cef_menu_id_t::MENU_ID_VIEW_SOURCE as i32;
+            if command_id != view_source_id {
+                return 0;
+            }
+
+            let Some(params) = params else {
+                return 0;
+            };
+            let page_url_userfree = params.page_url();
+            let page_url = CefStringUtf16::from(&page_url_userfree).to_string();
+            if page_url.is_empty() {
+                return 0;
+            }
+
+            let _ = self.event_sender.send(BrowserEvent::ViewSource {
+                tab_id: self.tab_id,
+                url: page_url,
+            });
+            1
+        }
+    }
+}
+
 wrap_client! {
     pub struct TabClient {
         life_span_handler: LifeSpanHandler,
         load_handler: LoadHandler,
         display_handler: DisplayHandler,
         request_handler: RequestHandler,
+        keyboard_handler: KeyboardHandler,
+        context_menu_handler: ContextMenuHandler,
     }
 
     impl Client {
@@ -149,6 +247,12 @@ wrap_client! {
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(self.request_handler.clone())
         }
+        fn keyboard_handler(&self) -> Option<KeyboardHandler> {
+            Some(self.keyboard_handler.clone())
+        }
+        fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
+            Some(self.context_menu_handler.clone())
+        }
     }
 }
 
@@ -160,6 +264,8 @@ pub fn create_tab_client(
     let life_span_handler = TabLifeSpanHandler::new(tab_id, event_sender.clone());
     let load_handler = TabLoadHandler::new(tab_id, event_sender.clone());
     let display_handler = TabDisplayHandler::new(tab_id, event_sender.clone());
+    let keyboard_handler = TabKeyboardHandler::new(tab_id, event_sender.clone());
+    let context_menu_handler = TabContextMenuHandler::new(tab_id, event_sender.clone());
     let request_handler =
         super::adblocker::create_tab_request_handler(tab_id, event_sender, adblock_engine);
 
@@ -168,5 +274,7 @@ pub fn create_tab_client(
         load_handler.into(),
         display_handler.into(),
         request_handler.into(),
+        keyboard_handler.into(),
+        context_menu_handler.into(),
     )
 }
