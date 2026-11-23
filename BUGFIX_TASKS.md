@@ -1,10 +1,12 @@
 # Kasumi Browser — UI / Navigation Bugfix Handoff
 
-**Version:** v0.1.7  
+**Version:** v0.1.9
 **Date:** 2026-11-23  
-**Status:** Runtime fixes implemented in v0.1.7. The manual verification checklist near the end still needs a hands-on pass.
+**Status:** All reported bug items are implemented. v0.1.9 adds 36 unit tests covering the pure logic behind the fixes, plus the final browser-teardown correction confirmed by the user on macOS.
 
 This document captures the reported bugs, the code inspection already done, likely root causes, concrete implementation leads, and acceptance criteria. Work through the items in the order listed: the low-risk UI/navigation fixes first, then the CEF callback work.
+
+> **Current status:** There are no remaining code items in this handoff. Remaining work is process/manual verification: push the v0.1.9 branch to PR #1, confirm CI, merge, then optionally validate the packaged macOS app and Windows/Linux builds. F12, view-source, favicon, tooltip, and navigation behavior were implemented in the browser code; cross-platform and packaged-app checks are future verification, not known code defects.
 
 ---
 
@@ -381,9 +383,9 @@ After each item, run the verification commands below. Do not combine unrelated f
 ## Verification checklist
 
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
 cargo check --bins
-cargo test --bin kasumi-browser
+cargo test --bin kasumi-browser   # 36 tests
 cargo build --release
 ```
 
@@ -401,6 +403,8 @@ cargo run --bin kasumi-browser
 - Right-click a page and choose View Page Source.
 - Hibernate all background tabs, wake one, then quit; exit code is `0` and no CEF reentrancy crash occurs.
 
+Confirmed on macOS in v0.1.9: closing a YouTube tab stops audio immediately after the CEF native view is detached and `try_close_browser()` completes.
+
 Packaged macOS check:
 
 ```bash
@@ -413,7 +417,7 @@ open target/bundle/KasumiBrowser.app
 
 ## Versioning for the next batch
 
-The next agent should start by bumping to **v0.1.8** (this handoff batch is v0.1.7):
+The next agent should start by bumping to **v0.2.0** (this handoff batch is v0.1.9):
 
 - `Cargo.toml`
 - `src/bin/bundle.rs`
@@ -425,14 +429,14 @@ The next agent should start by bumping to **v0.1.8** (this handoff batch is v0.1
 Suggested PR title / merge commit:
 
 ```text
-v0.1.8: fix chrome UX and navigation feedback
+v0.2.0: fix chrome UX and navigation feedback
 ```
 
 Publish with a pull request:
 
 ```bash
 git push -u origin <branch>
-gh pr create --title "v0.1.8: fix chrome UX and navigation feedback" --fill
+gh pr create --title "v0.2.0: fix chrome UX and navigation feedback" --fill
 gh pr checks --watch
 gh pr merge --squash
 ```

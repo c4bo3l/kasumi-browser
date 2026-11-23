@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cef::{ImplBrowser, ImplBrowserHost, ImplFrame};
 use crossbeam_channel::{Receiver, Sender};
@@ -28,11 +28,115 @@ use crate::storage::db::{SessionTabSnapshot, StorageHandle};
 use crate::ui::chrome::{ChromeState, Favicon, TabDisplayState, TabInfo};
 use crate::ui::platform_view::{self, ContentRect};
 
+/// Derive the conventional favicon URL from a page URL. This is the fallback
+/// when CEF does not report icon links (some sites only provide them after
+/// async hydration, and restored tabs may never fire the callback).
+fn fallback_favicon_url(page_url: &str) -> Option<String> {
+    let page = page_url.strip_prefix("view-source:").unwrap_or(page_url);
+    let parsed = url::Url::parse(page).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let origin = parsed.origin().ascii_serialization();
+    if origin == "null" || origin.is_empty() {
+        return None;
+    }
+    Some(format!("{origin}/favicon.ico"))
+}
+
+/// Prefer a real favicon over Apple touch and oversized decorative icons, all
+/// of which CEF may report in the same `on_favicon_urlchange` batch.
+fn preferred_favicon_url(urls: &[String]) -> Option<String> {
+    let mut best: Option<(i32, usize, String)> = None;
+    for (index, url) in urls.iter().enumerate() {
+        let lower = url.to_ascii_lowercase();
+        let score = if lower.contains("/favicon.ico") || lower.ends_with("/favicon.ico") {
+            1000
+        } else if lower.contains("favicon") {
+            900
+        } else if lower.contains(".ico") {
+            800
+        } else if lower.contains("apple-touch-icon") {
+            200
+        } else {
+            100
+        };
+
+        let better = best
+            .as_ref()
+            .map(|(best_score, best_index, _)| {
+                score > *best_score || (score == *best_score && index < *best_index)
+            })
+            .unwrap_or(true);
+        if better {
+            best = Some((score, index, url.clone()));
+        }
+    }
+    best.map(|(_, _, url)| url)
+}
+
+/// Shared-memory pressure ratio. Zero total memory is treated as no pressure.
+pub fn ram_pressure(used_bytes: u64, total_bytes: u64) -> f32 {
+    if total_bytes == 0 {
+        0.0
+    } else {
+        used_bytes as f32 / total_bytes as f32
+    }
+}
+
+pub fn is_critical_pressure(ratio: f32) -> bool {
+    ratio >= RAM_CRITICAL_PRESSURE_THRESHOLD
+}
+
+pub fn idle_timeout_for_pressure(ratio: f32) -> Duration {
+    if ratio >= RAM_HIGH_PRESSURE_THRESHOLD {
+        TAB_IDLE_TIMEOUT_PRESSURE
+    } else {
+        TAB_IDLE_TIMEOUT_NORMAL
+    }
+}
+
+/// Decide whether the omnibox should be replaced with the active tab URL.
+/// Never clobber text while the user is editing.
+pub fn should_sync_omnibox(
+    omnibox_focused: bool,
+    last_synced_tab_id: Option<u64>,
+    last_synced_url: &str,
+    current_tab_id: Option<u64>,
+    current_url: &str,
+    current_text: &str,
+) -> bool {
+    if omnibox_focused {
+        return false;
+    }
+    current_tab_id.is_none()
+        || last_synced_tab_id != current_tab_id
+        || last_synced_url != current_url
+        || current_text != current_url
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TabState {
     Active,
     Background { since: Instant },
     Hibernated,
+}
+
+/// Pure hibernation decision used by the watchdog. The active tab is never
+/// eligible, and only idle background tabs past the timeout are hibernated.
+pub fn should_hibernate_tab(
+    state: &TabState,
+    is_active: bool,
+    now: Instant,
+    idle_timeout: Duration,
+) -> bool {
+    if is_active {
+        return false;
+    }
+    match state {
+        TabState::Background { since } => now.saturating_duration_since(*since) >= idle_timeout,
+        _ => false,
+    }
 }
 
 pub struct Tab {
@@ -99,6 +203,12 @@ pub struct TabManager {
     // Favicon URLs already requested, and URLs seen before the browser exists.
     requested_favicons: HashSet<(u64, String)>,
     pending_favicon_urls: HashMap<u64, Vec<String>>,
+    // Only the first successful favicon per navigation wins. Sites often list
+    // several icons (apple-touch-icon, large PNGs) and all of them must not
+    // overwrite the tab's actual site icon.
+    resolved_favicons: HashSet<u64>,
+    last_favicon_urls: HashMap<u64, Vec<String>>,
+    favicon_preferences: HashMap<u64, String>,
 }
 
 impl TabManager {
@@ -135,6 +245,9 @@ impl TabManager {
             pending_browser_closes: 0,
             requested_favicons: HashSet::new(),
             pending_favicon_urls: HashMap::new(),
+            resolved_favicons: HashSet::new(),
+            last_favicon_urls: HashMap::new(),
+            favicon_preferences: HashMap::new(),
         }
     }
 
@@ -339,6 +452,9 @@ impl TabManager {
         self.recently_closed.push(tab.url.clone());
         self.requested_favicons.retain(|(tab_id, _)| *tab_id != id);
         self.pending_favicon_urls.remove(&id);
+        self.resolved_favicons.remove(&id);
+        self.last_favicon_urls.remove(&id);
+        self.favicon_preferences.remove(&id);
 
         if let Some(browser) = tab.browser.take() {
             if let Some(host) = browser.host() {
@@ -562,6 +678,21 @@ impl TabManager {
                 if let Some(urls) = self.pending_favicon_urls.remove(&tab_id) {
                     if !urls.is_empty() {
                         self.request_favicon_downloads(tab_id, urls);
+                        return;
+                    }
+                }
+
+                // CEF does not always emit on_favicon_urlchange for restored or
+                // cached navigations. Try the conventional site icon immediately.
+                if !self.last_favicon_urls.contains_key(&tab_id) {
+                    let fallback = self
+                        .tabs
+                        .iter()
+                        .find(|t| t.id == tab_id)
+                        .and_then(|t| fallback_favicon_url(&t.url));
+                    if let Some(fallback) = fallback {
+                        self.favicon_preferences.entry(tab_id).or_default();
+                        self.request_favicon_downloads(tab_id, vec![fallback]);
                     }
                 }
             }
@@ -575,6 +706,7 @@ impl TabManager {
                 self.sync_session();
             }
             BrowserEvent::AddressChange { tab_id, url } => {
+                let mut fallback = None;
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     if tab.url != url {
                         // A new site needs a fresh favicon; stale pixels must not
@@ -582,13 +714,21 @@ impl TabManager {
                         tab.favicon = None;
                         self.requested_favicons.retain(|(id, _)| *id != tab_id);
                         self.pending_favicon_urls.remove(&tab_id);
+                        self.resolved_favicons.remove(&tab_id);
+                        self.last_favicon_urls.remove(&tab_id);
+                        self.favicon_preferences.remove(&tab_id);
                     }
+                    fallback = fallback_favicon_url(&url);
                     tab.url = url.clone();
                     if let Some(ref storage) = self.storage {
                         storage.record_visit(url, tab.title.clone());
                     }
                 }
                 self.sync_session();
+                if let Some(fallback) = fallback {
+                    self.favicon_preferences.entry(tab_id).or_default();
+                    self.request_favicon_downloads(tab_id, vec![fallback]);
+                }
             }
             BrowserEvent::LoadingStateChange {
                 tab_id,
@@ -644,7 +784,24 @@ impl TabManager {
                 }
             }
             BrowserEvent::FaviconUrlChanged { tab_id, urls } => {
-                self.request_favicon_downloads(tab_id, urls);
+                if self.last_favicon_urls.get(&tab_id) == Some(&urls) {
+                    return;
+                }
+                let preferred = preferred_favicon_url(&urls);
+                let mut candidates: Vec<String> = preferred.clone().into_iter().collect();
+                if let Some(tab) = self.tabs.iter().find(|t| t.id == tab_id) {
+                    if let Some(fallback) = fallback_favicon_url(&tab.url) {
+                        if !candidates.contains(&fallback) {
+                            candidates.push(fallback);
+                        }
+                    }
+                }
+                self.favicon_preferences
+                    .insert(tab_id, preferred.unwrap_or_default());
+                self.last_favicon_urls.insert(tab_id, urls);
+                self.requested_favicons.retain(|(id, _)| *id != tab_id);
+                self.resolved_favicons.remove(&tab_id);
+                self.request_favicon_downloads(tab_id, candidates);
             }
             BrowserEvent::FaviconLoaded {
                 tab_id,
@@ -656,6 +813,40 @@ impl TabManager {
                 if !self.requested_favicons.contains(&(tab_id, url.clone())) {
                     return;
                 }
+
+                let preferred = self
+                    .favicon_preferences
+                    .get(&tab_id)
+                    .cloned()
+                    .unwrap_or_default();
+                if !preferred.is_empty() {
+                    let current_is_preferred = self
+                        .tabs
+                        .iter()
+                        .find(|t| t.id == tab_id)
+                        .and_then(|t| t.favicon.as_ref())
+                        .map(|favicon| favicon.url == preferred)
+                        .unwrap_or(false);
+                    if current_is_preferred && url != preferred {
+                        return;
+                    }
+                    if url != preferred && !self.resolved_favicons.insert(tab_id) {
+                        return;
+                    }
+                    if url == preferred {
+                        self.resolved_favicons.insert(tab_id);
+                    }
+                } else if !self.resolved_favicons.insert(tab_id) {
+                    return;
+                }
+
+                tracing::info!(
+                    "Using favicon for tab {} from {} ({}x{})",
+                    tab_id,
+                    url,
+                    width,
+                    height
+                );
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.favicon = Some(Favicon {
                         url,
@@ -768,14 +959,10 @@ impl TabManager {
         }
         self.last_tick = now;
 
-        let ram_ratio = if self.ram_total_bytes > 0 {
-            self.ram_used_bytes as f32 / self.ram_total_bytes as f32
-        } else {
-            0.0
-        };
+        let ram_ratio = ram_pressure(self.ram_used_bytes, self.ram_total_bytes);
 
         // Critical memory pressure: hibernate ALL background tabs immediately
-        if ram_ratio >= RAM_CRITICAL_PRESSURE_THRESHOLD {
+        if is_critical_pressure(ram_ratio) {
             tracing::warn!(
                 "Critical RAM pressure ({:.1}%). Hibernating all background tabs.",
                 ram_ratio * 100.0
@@ -785,25 +972,17 @@ impl TabManager {
         }
 
         // High memory pressure: shrink timeout to 30s
-        let idle_timeout = if ram_ratio >= RAM_HIGH_PRESSURE_THRESHOLD {
-            TAB_IDLE_TIMEOUT_PRESSURE
-        } else {
-            TAB_IDLE_TIMEOUT_NORMAL
-        };
+        let idle_timeout = idle_timeout_for_pressure(ram_ratio);
 
         let active = self.active_tab_id;
         let expired_ids: Vec<u64> = self
             .tabs
             .iter()
             .filter_map(|t| {
-                if Some(t.id) == active {
-                    return None;
-                }
-                match t.state {
-                    TabState::Background { since } if now.duration_since(since) >= idle_timeout => {
-                        Some(t.id)
-                    }
-                    _ => None,
+                if should_hibernate_tab(&t.state, Some(t.id) == active, now, idle_timeout) {
+                    Some(t.id)
+                } else {
+                    None
                 }
             })
             .collect();
@@ -848,9 +1027,14 @@ impl TabManager {
                 state.is_loading = tab.is_loading;
                 // Never clobber text while the user is editing. As soon as the
                 // omnibox loses focus, settle back to the active tab's real URL.
-                let identity_changed =
-                    state.last_synced_tab_id != Some(id) || state.last_synced_url != tab.url;
-                if !state.omnibox_focused && (identity_changed || state.omnibox_text != tab.url) {
+                if should_sync_omnibox(
+                    state.omnibox_focused,
+                    state.last_synced_tab_id,
+                    &state.last_synced_url,
+                    Some(id),
+                    &tab.url,
+                    &state.omnibox_text,
+                ) {
                     state.omnibox_text = tab.url.clone();
                 }
                 state.last_synced_tab_id = Some(id);
@@ -862,5 +1046,192 @@ impl TabManager {
             state.last_synced_tab_id = None;
             state.last_synced_url.clear();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        fallback_favicon_url, idle_timeout_for_pressure, is_critical_pressure,
+        preferred_favicon_url, ram_pressure, should_hibernate_tab, should_sync_omnibox, TabState,
+    };
+    use crate::config::{TAB_IDLE_TIMEOUT_NORMAL, TAB_IDLE_TIMEOUT_PRESSURE};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn ram_pressure_handles_normal_and_zero_total_memory() {
+        assert_eq!(ram_pressure(50, 100), 0.5);
+        assert_eq!(ram_pressure(0, 100), 0.0);
+        assert_eq!(ram_pressure(10, 0), 0.0);
+        assert_eq!(ram_pressure(120, 100), 1.2);
+    }
+
+    #[test]
+    fn memory_pressure_thresholds_use_exact_boundaries() {
+        assert!(!is_critical_pressure(0.899_999));
+        assert!(is_critical_pressure(0.9));
+        assert!(is_critical_pressure(1.0));
+
+        assert_eq!(idle_timeout_for_pressure(0.0), TAB_IDLE_TIMEOUT_NORMAL);
+        assert_eq!(
+            idle_timeout_for_pressure(0.799_999),
+            TAB_IDLE_TIMEOUT_NORMAL
+        );
+        assert_eq!(idle_timeout_for_pressure(0.8), TAB_IDLE_TIMEOUT_PRESSURE);
+        assert_eq!(idle_timeout_for_pressure(0.95), TAB_IDLE_TIMEOUT_PRESSURE);
+        assert_ne!(TAB_IDLE_TIMEOUT_NORMAL, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn omnibox_sync_respects_focus_and_identity_changes() {
+        assert!(!should_sync_omnibox(
+            true,
+            Some(1),
+            "https://old.example",
+            Some(1),
+            "https://new.example",
+            "typing"
+        ));
+        assert!(!should_sync_omnibox(
+            false,
+            Some(1),
+            "https://example.com",
+            Some(1),
+            "https://example.com",
+            "https://example.com"
+        ));
+        assert!(should_sync_omnibox(
+            false,
+            Some(1),
+            "https://old.example",
+            Some(2),
+            "https://new.example",
+            "https://old.example"
+        ));
+        assert!(should_sync_omnibox(
+            false,
+            Some(1),
+            "https://old.example",
+            Some(1),
+            "https://new.example",
+            "https://old.example"
+        ));
+        assert!(should_sync_omnibox(
+            false,
+            Some(1),
+            "https://example.com",
+            Some(1),
+            "https://example.com",
+            "https://typed.example"
+        ));
+        assert!(should_sync_omnibox(
+            false,
+            Some(1),
+            "https://example.com",
+            None,
+            "",
+            ""
+        ));
+    }
+
+    #[test]
+    fn hibernation_decision_respects_active_state_and_idle_boundary() {
+        let now = Instant::now();
+        let timeout = Duration::from_secs(30);
+
+        assert!(!should_hibernate_tab(
+            &TabState::Active,
+            false,
+            now,
+            timeout
+        ));
+        assert!(!should_hibernate_tab(
+            &TabState::Hibernated,
+            false,
+            now,
+            timeout
+        ));
+
+        let fresh = TabState::Background {
+            since: now - Duration::from_secs(10),
+        };
+        assert!(!should_hibernate_tab(&fresh, false, now, timeout));
+
+        let expired = TabState::Background {
+            since: now - Duration::from_secs(30),
+        };
+        assert!(should_hibernate_tab(&expired, false, now, timeout));
+        assert!(!should_hibernate_tab(&expired, true, now, timeout));
+
+        let long_idle = TabState::Background {
+            since: now - TAB_IDLE_TIMEOUT_NORMAL,
+        };
+        assert!(!should_hibernate_tab(
+            &long_idle,
+            false,
+            now,
+            TAB_IDLE_TIMEOUT_NORMAL + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn fallback_favicon_url_only_uses_http_origins() {
+        assert_eq!(
+            fallback_favicon_url("https://www.youtube.com/watch?v=x"),
+            Some("https://www.youtube.com/favicon.ico".to_string())
+        );
+        assert_eq!(
+            fallback_favicon_url("http://example.com:8080/path?q=1"),
+            Some("http://example.com:8080/favicon.ico".to_string())
+        );
+        assert_eq!(
+            fallback_favicon_url("view-source:https://example.com/"),
+            Some("https://example.com/favicon.ico".to_string())
+        );
+        assert_eq!(fallback_favicon_url("ftp://example.com"), None);
+        assert_eq!(fallback_favicon_url("file:///tmp/page.html"), None);
+        assert_eq!(fallback_favicon_url("not a url"), None);
+    }
+
+    #[test]
+    fn preferred_favicon_url_prefers_site_icon_candidates() {
+        assert_eq!(preferred_favicon_url(&[]), None);
+
+        let urls = vec![
+            "https://example.com/apple-touch-icon.png".to_string(),
+            "https://example.com/icon-512.png".to_string(),
+            "https://example.com/favicon.ico".to_string(),
+        ];
+        assert_eq!(
+            preferred_favicon_url(&urls),
+            Some("https://example.com/favicon.ico".to_string())
+        );
+
+        let urls = vec![
+            "https://example.com/apple-touch-icon.png".to_string(),
+            "https://example.com/theme-icon.png".to_string(),
+        ];
+        assert_eq!(
+            preferred_favicon_url(&urls),
+            Some("https://example.com/apple-touch-icon.png".to_string())
+        );
+
+        let urls = vec![
+            "https://example.com/favicon-32x32.png".to_string(),
+            "https://example.com/legacy.ico".to_string(),
+        ];
+        assert_eq!(
+            preferred_favicon_url(&urls),
+            Some("https://example.com/favicon-32x32.png".to_string())
+        );
+
+        let urls = vec![
+            "https://cdn.example.com/a.png".to_string(),
+            "https://cdn.example.com/b.png".to_string(),
+        ];
+        assert_eq!(
+            preferred_favicon_url(&urls),
+            Some("https://cdn.example.com/a.png".to_string())
+        );
     }
 }

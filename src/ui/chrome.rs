@@ -149,6 +149,11 @@ impl ChromeRenderer {
 
         let renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
         let egui_ctx = egui::Context::default();
+        // Tooltips must appear immediately; the default delay makes the chrome
+        // controls look unlabeled during quick hovers.
+        egui_ctx.style_mut(|style| {
+            style.interaction.tooltip_delay = 0.0;
+        });
 
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -360,11 +365,8 @@ impl ChromeRenderer {
 
                                 let title = if tab.title.is_empty() {
                                     "New Tab".to_string()
-                                } else if tab.title.chars().count() > 24 {
-                                    let truncated: String = tab.title.chars().take(24).collect();
-                                    format!("{}…", truncated)
                                 } else {
-                                    tab.title.clone()
+                                    truncate_title(&tab.title, 24)
                                 };
 
                                 let label_text = if tab.is_loading {
@@ -409,10 +411,11 @@ impl ChromeRenderer {
                                                 if tab_btn.clicked() {
                                                     actions.push(UiAction::SelectTab { tab_id });
                                                 }
-                                                tab_btn.on_hover_text(format!(
-                                                    "{}\n{}",
-                                                    tab.title, tab.url
-                                                ));
+                                                Self::chrome_tooltip(
+                                                    ui,
+                                                    &tab_btn,
+                                                    format!("{}\n{}", tab.title, tab.url),
+                                                );
 
                                                 ui.add_space(4.0);
 
@@ -436,10 +439,23 @@ impl ChromeRenderer {
                                                 if close.clicked() {
                                                     actions.push(UiAction::CloseTab { tab_id });
                                                 }
-                                                close.on_hover_text("Close tab");
+                                                Self::chrome_tooltip(
+                                                    ui,
+                                                    &close,
+                                                    "Close tab (middle-click anywhere on tab)",
+                                                );
                                             },
                                         );
                                     });
+
+                                let tab_hit = ui.interact(
+                                    frame_resp.response.rect,
+                                    egui::Id::new(("tab_middle_click", tab_id)),
+                                    Sense::click(),
+                                );
+                                if tab_hit.middle_clicked() {
+                                    actions.push(UiAction::CloseTab { tab_id });
+                                }
 
                                 if frame_resp.response.hovered() && !is_active {
                                     ui.painter().rect_filled(
@@ -471,7 +487,7 @@ impl ChromeRenderer {
                     if new_tab.clicked() {
                         actions.push(UiAction::NewTab { url: None });
                     }
-                    new_tab.on_hover_text("New tab (Cmd/Ctrl+T)");
+                    Self::chrome_tooltip(ui, &new_tab, "New tab (Cmd/Ctrl+T)");
                 });
             });
 
@@ -528,7 +544,7 @@ impl ChromeRenderer {
                             }
                         }
                     }
-                    reload_btn.on_hover_text(reload_tooltip);
+                    Self::chrome_tooltip(ui, &reload_btn, reload_tooltip);
 
                     ui.add_space(4.0);
 
@@ -549,8 +565,7 @@ impl ChromeRenderer {
                     );
 
                     state.omnibox_focused = omnibox_resp.has_focus();
-                    let omnibox_resp =
-                        omnibox_resp.on_hover_text("Search or enter address (Cmd/Ctrl+L)");
+                    Self::chrome_tooltip(ui, &omnibox_resp, "Search or enter address (Cmd/Ctrl+L)");
 
                     if omnibox_resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
                         let url = resolve_omnibox(&state.omnibox_text);
@@ -563,12 +578,12 @@ impl ChromeRenderer {
                     ui.add_space(4.0);
 
                     let blocked: u32 = active_tab.map(|t| t.blocked_requests).unwrap_or(0);
-                    ui.label(
+                    let shield = ui.label(
                         RichText::new(format!("🛡 {}", blocked))
                             .color(Color32::from_rgb(80, 200, 120))
                             .size(12.0),
-                    )
-                    .on_hover_text(format!("Blocked requests: {}", blocked));
+                    );
+                    Self::chrome_tooltip(ui, &shield, format!("Blocked requests: {}", blocked));
 
                     ui.add_space(4.0);
 
@@ -580,16 +595,20 @@ impl ChromeRenderer {
                     if hibernate_btn.clicked() {
                         actions.push(UiAction::HibernateAllBackground);
                     }
-                    hibernate_btn.on_hover_text("Hibernate all background tabs (Alt+H)");
+                    Self::chrome_tooltip(
+                        ui,
+                        &hibernate_btn,
+                        "Hibernate all background tabs (Alt+H)",
+                    );
 
                     ui.add_space(4.0);
 
-                    ui.label(
+                    let ram = ui.label(
                         RichText::new(format!("RAM: {} MB", state.ram_mb))
                             .color(Color32::GRAY)
                             .size(11.0),
-                    )
-                    .on_hover_text("Browser-process RAM usage");
+                    );
+                    Self::chrome_tooltip(ui, &ram, "Browser-process RAM usage");
 
                     ui.add_space(4.0);
                 });
@@ -605,7 +624,8 @@ impl ChromeRenderer {
     fn nav_button(ui: &mut Ui, enabled: bool, point_left: bool, tooltip: &str) -> Response {
         let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
         if !ui.is_rect_visible(rect) {
-            return response.on_hover_text(tooltip);
+            Self::chrome_tooltip(ui, &response, tooltip);
+            return response;
         }
 
         let painter = ui.painter();
@@ -639,7 +659,35 @@ impl ChromeRenderer {
             stroke,
         );
 
-        response.on_hover_text(tooltip)
+        Self::chrome_tooltip(ui, &response, tooltip);
+        response
+    }
+
+    /// Draw a tooltip inside the 76 px native chrome region.
+    ///
+    /// CEF's child view sits above the wgpu surface at y >= 76, so egui's
+    /// default pointer-following tooltip is hidden behind the page. Anchoring
+    /// at y = 0 keeps the tooltip visible in the tab strip instead.
+    fn chrome_tooltip(ui: &Ui, response: &Response, text: impl Into<egui::WidgetText>) {
+        if !response.hovered() {
+            return;
+        }
+
+        let pointer_x = ui
+            .input(|input| input.pointer.hover_pos().map(|pos| pos.x))
+            .unwrap_or_else(|| response.rect.center().x);
+        let right = ui.ctx().screen_rect().right();
+        let x = tooltip_anchor_x(pointer_x, right, response.rect.center().x);
+
+        egui::containers::show_tooltip_at(
+            ui.ctx(),
+            ui.layer_id(),
+            response.id,
+            pos2(x, 0.0),
+            |tooltip| {
+                tooltip.label(text.into());
+            },
+        );
     }
 
     /// Draw a cached favicon, or a neutral fallback dot if none is available.
@@ -663,6 +711,35 @@ impl ChromeRenderer {
 }
 
 // ---------------------------------------------------------------------------
+// Pure chrome helpers (unit-tested)
+// ---------------------------------------------------------------------------
+
+/// Clamp a tooltip anchor into the visible screen horizontally.
+///
+/// Tooltips are anchored at `y = 0` to stay above the CEF child view. The
+/// fallback is used when egui has no pointer position (keyboard focus).
+pub fn tooltip_anchor_x(pointer_x: f32, right: f32, fallback_x: f32) -> f32 {
+    let x = if pointer_x.is_finite() {
+        pointer_x
+    } else {
+        fallback_x
+    };
+    x.clamp(4.0, (right - 4.0).max(4.0))
+}
+
+/// Truncate a tab title by Unicode scalar value, not bytes, so non-ASCII
+/// titles never panic or split a multi-byte character.
+pub fn truncate_title(title: &str, max_chars: usize) -> String {
+    let mut chars = title.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Omnibox resolution logic
 // ---------------------------------------------------------------------------
 
@@ -674,8 +751,13 @@ pub fn resolve_omnibox(input: &str) -> String {
     }
 
     // CEF's view-source: pseudo-scheme is not a normal URL for `url::Url`,
-    // but it must survive omnibox input unchanged.
-    if trimmed.starts_with("view-source:") {
+    // but it must survive omnibox input unchanged. URL schemes are
+    // case-insensitive.
+    if trimmed
+        .get(..12)
+        .map(|prefix| prefix.eq_ignore_ascii_case("view-source:"))
+        .unwrap_or(false)
+    {
         return trimmed.to_string();
     }
 
@@ -693,20 +775,103 @@ pub fn resolve_omnibox(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_omnibox;
+    use super::{resolve_omnibox, tooltip_anchor_x, truncate_title};
+    use crate::config::{DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX};
 
     #[test]
-    fn test_resolve_omnibox() {
+    fn resolve_omnibox_passes_through_absolute_urls() {
         assert_eq!(resolve_omnibox("https://github.com"), "https://github.com");
+        assert_eq!(resolve_omnibox("http://example.com"), "http://example.com");
+        assert_eq!(resolve_omnibox("ftp://example.com"), "ftp://example.com");
+        assert_eq!(resolve_omnibox("file:///tmp/a"), "file:///tmp/a");
+        assert_eq!(
+            resolve_omnibox("data:text/plain,hello"),
+            "data:text/plain,hello"
+        );
+    }
+
+    #[test]
+    fn resolve_omnibox_prepends_https_to_bare_domains() {
         assert_eq!(
             resolve_omnibox("github.com/rust-lang"),
             "https://github.com/rust-lang"
         );
-        assert!(resolve_omnibox("hello world").contains("duckduckgo.com"));
-        assert!(resolve_omnibox("rust async").contains("duckduckgo.com"));
+        assert_eq!(resolve_omnibox("example.com"), "https://example.com");
+        assert_eq!(
+            resolve_omnibox("1.2.3.4:8080/path"),
+            "https://1.2.3.4:8080/path"
+        );
+    }
+
+    #[test]
+    fn resolve_omnibox_searches_non_url_text() {
+        assert_eq!(
+            resolve_omnibox("hello world"),
+            format!("{DEFAULT_SEARCH_URL_PREFIX}hello+world")
+        );
+        assert_eq!(
+            resolve_omnibox("rust async"),
+            format!("{DEFAULT_SEARCH_URL_PREFIX}rust+async")
+        );
+        // `Url::parse` accepts `localhost:3000` as a custom scheme, so the
+        // documented parse-first rule passes it through unchanged.
+        assert_eq!(resolve_omnibox("localhost:3000"), "localhost:3000");
+        assert!(resolve_omnibox("example.com path").contains("duckduckgo.com"));
+    }
+
+    #[test]
+    fn resolve_omnibox_encodes_search_query_characters() {
+        let resolved = resolve_omnibox("rust & webgpu");
+        assert_eq!(
+            resolved,
+            format!("{DEFAULT_SEARCH_URL_PREFIX}rust+%26+webgpu")
+        );
+
+        let unicode = resolve_omnibox("café");
+        assert!(unicode.starts_with(DEFAULT_SEARCH_URL_PREFIX));
+        assert!(unicode.contains("%C3%A9"));
+    }
+
+    #[test]
+    fn resolve_omnibox_handles_empty_and_whitespace_input() {
+        assert_eq!(resolve_omnibox(""), DEFAULT_HOME_URL);
+        assert_eq!(resolve_omnibox("   \t\n"), DEFAULT_HOME_URL);
+    }
+
+    #[test]
+    fn resolve_omnibox_preserves_view_source_scheme_case_insensitively() {
         assert_eq!(
             resolve_omnibox("view-source:https://example.com"),
             "view-source:https://example.com"
         );
+        assert_eq!(
+            resolve_omnibox("  VIEW-SOURCE:https://example.com  "),
+            "VIEW-SOURCE:https://example.com"
+        );
+        assert_eq!(resolve_omnibox("view-source:"), "view-source:");
+    }
+
+    #[test]
+    fn tooltip_anchor_stays_inside_the_screen() {
+        assert_eq!(tooltip_anchor_x(100.0, 1280.0, 50.0), 100.0);
+        assert_eq!(tooltip_anchor_x(-20.0, 1280.0, 50.0), 4.0);
+        assert_eq!(tooltip_anchor_x(2000.0, 1280.0, 50.0), 1276.0);
+        assert_eq!(tooltip_anchor_x(f32::NAN, 1280.0, 50.0), 50.0);
+        assert_eq!(tooltip_anchor_x(20.0, 6.0, 50.0), 4.0);
+    }
+
+    #[test]
+    fn truncate_title_counts_unicode_scalar_values() {
+        assert_eq!(truncate_title("short", 24), "short");
+        assert_eq!(
+            truncate_title("123456789012345678901234", 24),
+            "123456789012345678901234"
+        );
+        assert_eq!(
+            truncate_title("1234567890123456789012345", 24),
+            "123456789012345678901234…"
+        );
+        assert_eq!(truncate_title("日本語タイトル", 4), "日本語タ…");
+        assert_eq!(truncate_title("abc", 0), "…");
     }
 }

@@ -4,6 +4,50 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
+## v0.1.9 — 2026-11-23
+
+### Fixed
+
+- Tooltips are now anchored inside the native chrome region so they are no longer hidden behind the CEF page view.
+- Middle-clicking anywhere on a tab now closes it.
+- Closing a tab now completes the CEF browser teardown, so media such as YouTube audio stops immediately instead of continuing in the background.
+- Favicons now prefer conventional `favicon.ico` URLs, fall back to `<origin>/favicon.ico` when CEF reports no icon links, and reject later decorative icon candidates that do not match the site tab icon.
+
+### Changed
+
+- Bumped the project and macOS bundle version from `0.1.8` to `0.1.9`.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser` — 36 tests, including omnibox edge cases, tooltip anchoring, CEF/switch invariants, adblock request mapping and blocking, favicon validation, hibernation thresholds, shortcut modifiers, and SQLite session/history/bookmark behavior.
+- `cargo build --release`
+- Manual macOS run confirmed that closing a YouTube tab stops audio immediately.
+
+---
+
+## v0.1.8 — 2026-11-23
+
+### Fixed
+
+- Tooltips now appear immediately by removing egui's default hover delay.
+- `Cmd/Ctrl+L` now works even when the omnibox already has keyboard focus, and selects the full URL.
+- Favicon selection now accepts only the first successful icon per navigation, preventing later `apple-touch-icon`/large PNG candidates from overwriting the site's real tab icon.
+
+### Changed
+
+- Bumped the project and macOS bundle version from `0.1.7` to `0.1.8`.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser`
+- Manual macOS run pending after this verification batch.
+
+---
+
 ## v0.1.7 — 2026-11-23
 
 ### Fixed

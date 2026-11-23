@@ -59,7 +59,7 @@ Use these exact crate versions and release profile settings:
 ```toml
 [package]
 name = "kasumi-browser"
-version = "0.1.7"
+version = "0.1.9"
 edition = "2021"
 
 [dependencies]

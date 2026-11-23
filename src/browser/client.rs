@@ -18,8 +18,32 @@ wrap_life_span_handler! {
             }
         }
 
-        fn do_close(&self, _browser: Option<&mut Browser>) -> i32 {
-            tracing::info!("CEF do_close for tab {}", self.tab_id);
+        fn do_close(&self, browser: Option<&mut Browser>) -> i32 {
+            // Returning true tells CEF that the host window needs a custom close
+            // notification. We must then complete the browser close ourselves;
+            // otherwise the browser object lingers and page media keeps playing.
+            let completed = browser
+                .as_ref()
+                .and_then(|browser| browser.host())
+                .map(|host| {
+                    // Returning true means the embedder owns native view
+                    // teardown. Remove the child view before asking CEF to
+                    // finish closing, otherwise the browser stays alive and
+                    // page media keeps playing.
+                    let view_handle = host.window_handle();
+                    if !view_handle.is_null() {
+                        unsafe {
+                            crate::ui::platform_view::detach_view(view_handle.cast());
+                        }
+                    }
+                    host.try_close_browser()
+                })
+                .unwrap_or(0);
+            tracing::info!(
+                "CEF do_close for tab {} (detached view, try_close_browser={})",
+                self.tab_id,
+                completed
+            );
             1
         }
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
@@ -134,6 +158,7 @@ wrap_display_handler! {
         ) {
             if let Some(icon_urls) = icon_urls {
                 let urls: Vec<String> = icon_urls.clone().into_iter().collect();
+                tracing::info!("Favicon URLs for tab {}: {:?}", self.tab_id, urls);
                 if !urls.is_empty() {
                     let _ = self.event_sender.send(BrowserEvent::FaviconUrlChanged {
                         tab_id: self.tab_id,

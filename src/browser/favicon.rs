@@ -12,6 +12,15 @@ use crossbeam_channel::Sender;
 
 use crate::events::BrowserEvent;
 
+/// CEF uses 0 for non-network images such as `data:` URLs.
+fn image_status_is_ok(http_status_code: i32) -> bool {
+    http_status_code == 0 || (200..300).contains(&http_status_code)
+}
+
+fn bitmap_dimensions_are_valid(width: i32, height: i32) -> bool {
+    width > 0 && height > 0
+}
+
 wrap_download_image_callback! {
     pub struct FaviconDownloadCallback {
         tab_id: u64,
@@ -25,8 +34,13 @@ wrap_download_image_callback! {
             http_status_code: ::std::os::raw::c_int,
             image: Option<&mut Image>,
         ) {
-            // CEF uses 0 for non-network images such as data: URLs.
-            let ok_status = http_status_code == 0 || (200..300).contains(&http_status_code);
+            let ok_status = image_status_is_ok(http_status_code);
+            tracing::debug!(
+                "Favicon download callback for tab {}: status={}, image={}",
+                self.tab_id,
+                http_status_code,
+                image.is_some()
+            );
             if !ok_status {
                 return;
             }
@@ -47,7 +61,7 @@ wrap_download_image_callback! {
                 return;
             };
 
-            if width <= 0 || height <= 0 {
+            if !bitmap_dimensions_are_valid(width, height) {
                 return;
             }
 
@@ -83,4 +97,32 @@ pub fn create_favicon_download_callback(
     event_sender: Sender<BrowserEvent>,
 ) -> DownloadImageCallback {
     FaviconDownloadCallback::new(tab_id, event_sender).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{bitmap_dimensions_are_valid, image_status_is_ok};
+
+    #[test]
+    fn favicon_http_status_accepts_success_and_data_urls() {
+        assert!(image_status_is_ok(0));
+        assert!(image_status_is_ok(200));
+        assert!(image_status_is_ok(204));
+        assert!(image_status_is_ok(299));
+        assert!(!image_status_is_ok(-1));
+        assert!(!image_status_is_ok(199));
+        assert!(!image_status_is_ok(300));
+        assert!(!image_status_is_ok(404));
+        assert!(!image_status_is_ok(500));
+    }
+
+    #[test]
+    fn favicon_bitmap_must_have_positive_dimensions() {
+        assert!(bitmap_dimensions_are_valid(1, 1));
+        assert!(bitmap_dimensions_are_valid(16, 32));
+        assert!(!bitmap_dimensions_are_valid(0, 16));
+        assert!(!bitmap_dimensions_are_valid(16, 0));
+        assert!(!bitmap_dimensions_are_valid(-1, 16));
+        assert!(!bitmap_dimensions_are_valid(16, -1));
+    }
 }

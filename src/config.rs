@@ -39,3 +39,33 @@ pub const TAB_WATCHDOG_TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// shutdown. On macOS `on_before_close` is delivered by `cef::shutdown()`
 /// itself, so waiting for it before shutdown would never complete.
 pub const SHUTDOWN_MAX_WAIT_TICKS: u32 = 30;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chrome_height_matches_spec() {
+        assert_eq!(TAB_BAR_HEIGHT, 38.0);
+        assert_eq!(NAV_BAR_HEIGHT, 38.0);
+        assert_eq!(CHROME_HEIGHT, 76.0);
+    }
+
+    #[test]
+    fn hibernation_timeouts_and_thresholds_are_ordered() {
+        assert_eq!(TAB_IDLE_TIMEOUT_NORMAL, Duration::from_secs(600));
+        assert_eq!(TAB_IDLE_TIMEOUT_PRESSURE, Duration::from_secs(30));
+        assert!(TAB_IDLE_TIMEOUT_PRESSURE < TAB_IDLE_TIMEOUT_NORMAL);
+        assert_eq!(RAM_HIGH_PRESSURE_THRESHOLD, 0.80);
+        assert_eq!(RAM_CRITICAL_PRESSURE_THRESHOLD, 0.90);
+        assert!(RAM_HIGH_PRESSURE_THRESHOLD < RAM_CRITICAL_PRESSURE_THRESHOLD);
+        assert_eq!(RAM_CHECK_INTERVAL, Duration::from_secs(5));
+        assert_eq!(TAB_WATCHDOG_TICK_INTERVAL, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn default_search_prefix_matches_home_origin() {
+        assert!(DEFAULT_SEARCH_URL_PREFIX.starts_with(DEFAULT_HOME_URL));
+        assert!(DEFAULT_SEARCH_URL_PREFIX.ends_with("?q="));
+    }
+}
