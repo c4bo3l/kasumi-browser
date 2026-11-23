@@ -31,14 +31,18 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId, WindowLevel};
 
-/// Custom winit event used to exit the loop after macOS CEF shutdown has run
-/// outside winit's single-entry event handler.
+/// Custom winit events used only by the macOS run-loop bridge. Other
+/// platforms keep the empty event type so the winit handler shape is shared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KasumiEvent {
+    /// Sent after macOS CEF shutdown has run outside winit's single-entry
+    /// event handler so the loop can exit safely.
+    #[cfg(target_os = "macos")]
     ShutdownComplete,
     /// A shell shortcut captured by a macOS local NSEvent monitor before the
     /// key reaches the CEF child view. Re-dispatched through the winit event
     /// loop so all UI mutations stay on the main thread.
+    #[cfg(target_os = "macos")]
     NativeShortcut(BrowserShortcut),
 }
 
@@ -954,6 +958,7 @@ fn is_reopen_tab_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
 
 impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: KasumiEvent) {
+        #[cfg(target_os = "macos")]
         match event {
             KasumiEvent::ShutdownComplete => {
                 tracing::info!("CEF shutdown complete — exiting event loop");
@@ -965,6 +970,9 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                 self.sync_tooltip_overlay(event_loop);
             }
         }
+
+        #[cfg(not(target_os = "macos"))]
+        let _ = (event_loop, event);
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
