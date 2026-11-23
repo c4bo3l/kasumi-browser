@@ -16,6 +16,7 @@ use adblock::Engine;
 use cef::*;
 use crossbeam_channel::Sender;
 
+use crate::browser::client::{is_internal_view_url, new_tab_disposition};
 use crate::events::BrowserEvent;
 
 /// Built-in fallback starter rules covering prominent ad networks and telemetry
@@ -169,9 +170,39 @@ wrap_resource_request_handler! {
 wrap_request_handler! {
     pub struct TabRequestHandler {
         resource_request_handler: ResourceRequestHandler,
+        event_sender: Sender<BrowserEvent>,
     }
 
     impl RequestHandler {
+        fn on_open_urlfrom_tab(
+            &self,
+            _browser: Option<&mut cef::Browser>,
+            _frame: Option<&mut Frame>,
+            target_url: Option<&CefString>,
+            target_disposition: WindowOpenDisposition,
+            _user_gesture: i32,
+        ) -> i32 {
+            let Some(url) = target_url else {
+                return 0;
+            };
+            let url = url.to_string();
+            if url.is_empty() || is_internal_view_url(&url) {
+                return 0;
+            }
+            let Some(background) = new_tab_disposition(target_disposition) else {
+                return 0;
+            };
+
+            // Cancel the source-tab navigation. The main UI thread opens a
+            // real Kasumi tab instead, preserving middle-click's background
+            // behavior and Ctrl+click's foreground behavior.
+            let _ = self.event_sender.send(BrowserEvent::OpenUrlFromTab {
+                url,
+                background,
+            });
+            1
+        }
+
         fn resource_request_handler(
             &self,
             _browser: Option<&mut cef::Browser>,
@@ -193,8 +224,8 @@ pub fn create_tab_request_handler(
     engine: Arc<Engine>,
     enabled: Arc<AtomicBool>,
 ) -> RequestHandler {
-    let res_handler = TabResourceRequestHandler::new(tab_id, event_sender, engine, enabled);
-    TabRequestHandler::new(res_handler.into())
+    let res_handler = TabResourceRequestHandler::new(tab_id, event_sender.clone(), engine, enabled);
+    TabRequestHandler::new(res_handler.into(), event_sender)
 }
 
 #[cfg(test)]

@@ -480,7 +480,7 @@ fn install_macos_main_menu() {
     let app_menu = NSMenu::new(mtm);
     let app_version = NSMenuItem::new(mtm);
     unsafe {
-        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.5.0"));
+        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.5.1"));
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
