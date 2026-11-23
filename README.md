@@ -291,6 +291,7 @@ sha256sum kasumi-browser.tar.gz > kasumi-browser.tar.gz.sha256
 - **More integration tests:** unit coverage is in place for omnibox resolution, rail/palette/menu/settings state, closed-tab restoration metadata, tooltips, hibernation thresholds, adblock mapping, preference persistence, storage, and CEF switches; automated end-to-end browser tests are still future work.
 - **Packaged-app verification:** macOS, Windows, and Linux release artifacts still need interactive testing after signing/bundling.
 - **Release CI and signed artifact publishing:** extend the existing PR checks to signed release builds and published artifacts.
+- **Auto-update via GitHub Releases:** check the latest published release, download and verify the signed platform artifact, and install it from a native update prompt with a fallback to the releases page.
 
 ---
 
