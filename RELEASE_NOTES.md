@@ -23,6 +23,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 - Closing the active tab keeps the user in the same workspace when other tabs remain, and opens a fresh tab there instead of jumping to another workspace when it was the workspace's last tab.
 - Bookmark folder renames are scoped by workspace id, so archived folders from deleted workspaces are never accidentally renamed with an unrelated active workspace.
 - Bumped the project, macOS bundle, About-menu version, docs, and lockfile from `0.5.2` to `0.6.0`.
+- Expanded **Future Development** with out-of-the-box picture-in-picture research: prefer Chromium's native PiP in CEF, avoid an OSR/second-renderer fallback, and route native overlay lifecycle through the existing UI action and platform-view paths.
 
 ### Fixed
 

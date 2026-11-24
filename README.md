@@ -297,6 +297,14 @@ sha256sum kasumi-browser.tar.gz > kasumi-browser.tar.gz.sha256
 - **Google Meet / WebRTC calls:** bridge CEF permission callbacks into the native egui chrome, add screen-share source selection, and handle macOS camera/microphone entitlements.
 - **Tiny local AI:** explore a sub-0.4B on-device model for omnibox intent routing, tab grouping, and short structured extraction without sending page data to the cloud.
 - **Automated CEF/Chromium engine updates:** add a scheduled check that opens a review PR when a newer `cef` crate is published, instead of silently swapping the engine at runtime.
+- **Picture-in-picture (PiP) out of the box:** make `<video>` PiP work without user setup on all three platforms. Prefer CEF/Chromium's built-in PiP for native child views; if a CEF milestone does not surface a PiP window, add a native always-on-top video overlay without introducing an OSR CEF view or a second renderer process.
+
+### Picture-in-picture (PiP) — research notes
+
+- **Start with the browser engine:** verify whether CEF 156's native-window mode already honours `HTMLVideoElement.requestPictureInPicture()` and creates a Chromium PiP window. Keep `PictureInPicture` out of `--disable-features`, and avoid switches that strip media playback or overlay support.
+- **Do not use OSR as a fallback:** the sub-20 MB shell target and zero-copy compositing depend on native child views. If engine PiP is unavailable, the fallback should be a small `winit` overlay window that reuses the existing GPU device and presents the video frame without creating another CEF browser.
+- **Native integration points:** expose PiP from the rail context menu and command palette, track enabled state per tab, and route Enter/Close through the existing `UiAction` → `TabManager` message path. Reuse `platform_view.rs` for parent/owner and resize handling on `NSView`, `HWND`, and X11.
+- **Lifecycle and memory:** PiP must survive tab switches and workspace changes, keep audio/video state in the original CEF browser, and be released when the tab closes or hibernates. Add interactive checks for drag/resize, always-on-top stacking, focus/click-through, and macOS/Windows/Linux window ordering.
 
 ### Google Meet / WebRTC calls — research notes
 
