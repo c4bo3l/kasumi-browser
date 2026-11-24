@@ -1489,6 +1489,90 @@ impl ChromeRenderer {
         }
     }
 
+    /// Draw the framed URL field in the expanded rail.
+    ///
+    /// `TextEdit` allocates hidden space for long single-line text, so it is
+    /// wrapped in a width-clamped scroll area. Explicit spacing and a zero text
+    /// margin keep the surrounding frame inside the rail with even side gaps.
+    fn build_rail_address_field(
+        ui: &mut Ui,
+        ctx: &egui::Context,
+        state: &mut ChromeState,
+        actions: &mut Vec<UiAction>,
+        palette: &ChromePalette,
+    ) -> Response {
+        Frame::none()
+            .fill(palette.rail_surface)
+            .stroke(Stroke::new(1.0_f32, palette.palette_border))
+            .rounding(Rounding::same(9.0))
+            .outer_margin(egui::Margin::symmetric(6.0, 0.0))
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Explicit spaces below define the gaps; egui's implicit
+                    // item spacing would otherwise add 8 px between each glyph.
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let (icon_rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                    paint_rail_icon(ui, icon_rect, RailIcon::Globe, palette.rail_accent);
+                    ui.add_space(4.0);
+
+                    // The 22 px copy slot includes its 4 px leading gap. The
+                    // scroll area keeps TextEdit's hidden-text allocation from
+                    // expanding the frame, even for very long URLs.
+                    let copy_slot_width = 22.0;
+                    let input_width = (ui.available_width() - copy_slot_width).max(24.0);
+                    let url_input = egui::ScrollArea::horizontal()
+                        .id_salt("kasumi_rail_url_scroll")
+                        .max_width(input_width)
+                        .scroll_bar_visibility(
+                            egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                        )
+                        .show(ui, |ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut state.omnibox_text)
+                                    .id(egui::Id::new("kasumi_rail_url"))
+                                    .hint_text("Address or search")
+                                    .text_color(palette.text_strong)
+                                    .font(egui::TextStyle::Body)
+                                    .desired_width(input_width)
+                                    .clip_text(true)
+                                    .margin(egui::Margin::ZERO)
+                                    .frame(false),
+                            )
+                        })
+                        .inner;
+                    if url_input.has_focus() {
+                        state.omnibox_focused = true;
+                    } else if state.omnibox_focused && !state.command_palette_open {
+                        state.omnibox_focused = false;
+                    }
+                    if url_input.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if let Some(tab_id) = state.active_tab_id {
+                            let url = resolve_omnibox_with_search(
+                                &state.omnibox_text,
+                                state.preferences.search_url_prefix(),
+                            );
+                            actions.push(UiAction::Navigate { tab_id, url });
+                        }
+                    }
+
+                    let (copy_rect, copy_response) =
+                        ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+                    paint_rail_icon(
+                        ui,
+                        egui::Rect::from_center_size(copy_rect.center(), vec2(12.0, 12.0)),
+                        RailIcon::Copy,
+                        palette.text,
+                    );
+                    if copy_response.clicked() {
+                        ctx.copy_text(state.omnibox_text.clone());
+                    }
+                    copy_response.on_hover_text("Copy URL");
+                });
+            })
+            .response
+    }
+
     /// Draw the collapsible left workspace rail.
     fn build_rail(
         &self,
@@ -1853,75 +1937,10 @@ impl ChromeRenderer {
                     ui.separator();
                     ui.add_space(8.0);
 
-                    // Framed omnibox: the outer margin keeps the frame inside
-                    // the rail, and the input is sized from the space actually
-                    // left after the fixed glyphs so it can never overflow.
-                    Frame::none()
-                        .fill(palette.rail_surface)
-                        .stroke(Stroke::new(1.0_f32, palette.palette_border))
-                        .rounding(Rounding::same(9.0))
-                        .outer_margin(egui::Margin::symmetric(6.0, 0.0))
-                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let (icon_rect, _) =
-                                    ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
-                                paint_rail_icon(
-                                    ui,
-                                    icon_rect,
-                                    RailIcon::Globe,
-                                    palette.rail_accent,
-                                );
-                                ui.add_space(4.0);
-
-                                // Reserve the copy glyph and its spacing before
-                                // giving the remainder to the text field.
-                                let copy_width = 22.0;
-                                let input_width = (ui.available_width() - copy_width).max(24.0);
-                                let url_input = ui.add(
-                                    TextEdit::singleline(&mut state.omnibox_text)
-                                        .id(egui::Id::new("kasumi_rail_url"))
-                                        .hint_text("Address or search")
-                                        .text_color(palette.text_strong)
-                                        .font(egui::TextStyle::Body)
-                                        .desired_width(input_width)
-                                        .frame(false),
-                                );
-                                if url_input.has_focus() {
-                                    state.omnibox_focused = true;
-                                } else if state.omnibox_focused && !state.command_palette_open {
-                                    state.omnibox_focused = false;
-                                }
-                                if url_input.lost_focus()
-                                    && ctx.input(|i| i.key_pressed(egui::Key::Enter))
-                                {
-                                    if let Some(tab_id) = state.active_tab_id {
-                                        let url = resolve_omnibox_with_search(
-                                            &state.omnibox_text,
-                                            state.preferences.search_url_prefix(),
-                                        );
-                                        actions.push(UiAction::Navigate { tab_id, url });
-                                    }
-                                }
-
-                                ui.add_space(4.0);
-                                let (copy_rect, copy_response) =
-                                    ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
-                                paint_rail_icon(
-                                    ui,
-                                    egui::Rect::from_center_size(
-                                        copy_rect.center(),
-                                        vec2(12.0, 12.0),
-                                    ),
-                                    RailIcon::Copy,
-                                    palette.text,
-                                );
-                                if copy_response.clicked() {
-                                    ctx.copy_text(state.omnibox_text.clone());
-                                }
-                                copy_response.on_hover_text("Copy URL");
-                            });
-                        });
+                    // Framed omnibox: the helper reserves the fixed glyph slots
+                    // and uses a zero-margin TextEdit so the frame stays inside
+                    // the rail with even side margins.
+                    Self::build_rail_address_field(ui, ctx, state, actions, &palette);
                     ui.add_space(6.0);
                     ui.separator();
                     ui.add_space(6.0);
@@ -5199,7 +5218,7 @@ mod tests {
     };
     use crate::config::{
         BrowserPreferences, SearchEngine, ThemePreference, WorkspaceColor, WorkspaceIcon,
-        DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX, RAIL_WIDTH_COLLAPSED,
+        DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX, RAIL_WIDTH_COLLAPSED, RAIL_WIDTH_EXPANDED,
     };
     use crate::events::{DownloadEngine, DownloadInfo, DownloadState, UiAction};
 
@@ -5366,6 +5385,56 @@ mod tests {
         assert_eq!(normal, pos2(159.0, 118.0));
         assert_eq!(shifted, pos2(140.0, 118.0));
         assert!(shifted.x < normal.x);
+    }
+
+    #[test]
+    fn rail_address_field_stays_inside_expanded_rail() {
+        let ctx = egui::Context::default();
+        let palette = ChromePalette::DARK;
+        let mut state = ChromeState::default();
+        state.omnibox_text =
+            "https://example.com/a/very/long/path/that/must/not/push/the/frame/outside".to_string();
+        let mut actions = Vec::new();
+        let mut field_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(0.0, 0.0));
+        let mut rail_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(0.0, 0.0));
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    vec2(1280.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::SidePanel::left("rail_address_field_test")
+                    .exact_width(RAIL_WIDTH_EXPANDED)
+                    .resizable(false)
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        let response = ChromeRenderer::build_rail_address_field(
+                            ui,
+                            ctx,
+                            &mut state,
+                            &mut actions,
+                            &palette,
+                        );
+                        field_rect = response.rect;
+                        rail_rect = ui.clip_rect();
+                    });
+            },
+        );
+
+        assert!(
+            field_rect.max.x <= rail_rect.max.x + 0.5,
+            "URL frame overflows the rail: {field_rect:?} vs {rail_rect:?}"
+        );
+        assert!(
+            field_rect.width() <= RAIL_WIDTH_EXPANDED + 0.5,
+            "URL frame is wider than the rail: {:?}",
+            field_rect.width()
+        );
+        assert!(actions.is_empty());
     }
 
     #[test]
