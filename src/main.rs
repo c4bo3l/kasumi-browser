@@ -555,16 +555,18 @@ fn install_macos_main_menu() {
 /// CEF's framework carries its own `CFBundleName` ("Chromium Embedded
 /// Framework"). When the framework is loaded from an unbundled executable,
 /// AppKit can inherit that name for the process and the app menu. Setting both
-/// the user-defaults bundle keys and `NSProcessInfo.processName` keeps the menu
-/// showing "Kasumi Browser" regardless of which source AppKit consults.
+/// the user-defaults bundle keys and the process name keeps the menu showing
+/// "Kasumi Browser" regardless of which source AppKit consults.
 #[cfg(target_os = "macos")]
 unsafe fn set_macos_bundle_name(name: &str) {
     use std::ffi::{c_void, CString};
 
     let value = objc2_foundation::NSString::from_str(name);
 
-    // NSProcessInfo.processName is what AppKit uses for the visible app-menu
-    // title. `setName:` is private but stable across macOS versions.
+    // AppKit uses `NSProcessInfo.processName` for the visible app-menu title.
+    // The private setter was renamed from `setName:` to `setProcessName:` in
+    // recent macOS releases; probe both so an unbundled binary never crashes
+    // on an unknown selector.
     if let (Ok(class_name), Ok(selector_name)) =
         (CString::new("NSProcessInfo"), CString::new("processInfo"))
     {
@@ -576,18 +578,40 @@ unsafe fn set_macos_bundle_name(name: &str) {
             let process_info =
                 process_info_msg(cls as *mut c_void, process_info_sel as *const c_void);
             if !process_info.is_null() {
-                if let Ok(set_name) = CString::new("setName:") {
-                    let set_name_sel = objc2::ffi::sel_registerName(set_name.as_ptr());
-                    let set_name_msg: unsafe extern "C" fn(
-                        *mut c_void,
-                        *const c_void,
-                        *mut c_void,
-                    ) = std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
-                    set_name_msg(
-                        process_info,
-                        set_name_sel as *const c_void,
-                        &*value as *const objc2_foundation::NSString as *mut c_void,
-                    );
+                // `respondsToSelector:` returns a BOOL (u8 on Apple platforms).
+                let responds_msg: unsafe extern "C" fn(
+                    *mut c_void,
+                    *const c_void,
+                    *const c_void,
+                ) -> u8 = std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
+                let responds_sel = objc2::ffi::sel_registerName(
+                    CString::new("respondsToSelector:")
+                        .unwrap_or_default()
+                        .as_ptr(),
+                );
+                for setter in ["setProcessName:", "setName:"] {
+                    if let Ok(setter_name) = CString::new(setter) {
+                        let set_sel = objc2::ffi::sel_registerName(setter_name.as_ptr());
+                        if responds_msg(
+                            process_info,
+                            responds_sel as *const c_void,
+                            set_sel as *const c_void,
+                        ) == 0
+                        {
+                            continue;
+                        }
+                        let set_name_msg: unsafe extern "C" fn(
+                            *mut c_void,
+                            *const c_void,
+                            *mut c_void,
+                        ) = std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
+                        set_name_msg(
+                            process_info,
+                            set_sel as *const c_void,
+                            &*value as *const objc2_foundation::NSString as *mut c_void,
+                        );
+                        break;
+                    }
                 }
             }
         }
