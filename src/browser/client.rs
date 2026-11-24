@@ -1,7 +1,49 @@
 use crate::events::{BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadState};
 use cef::*;
 use crossbeam_channel::Sender;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Shared snapshot of download preferences exposed to the CEF download
+/// handler. `ask_where_to_save` is an atomic flag (like `adblock_enabled`), and
+/// the directory is guarded by a short-lived read lock: the callback only
+/// clones a small string, and writes happen exclusively on the UI thread when
+/// the user applies Settings, so there is no cross-thread contention.
+#[derive(Clone, Default)]
+pub struct SharedDownloadPreferences {
+    pub ask_where_to_save: Arc<AtomicBool>,
+    pub download_directory: Arc<RwLock<String>>,
+}
+
+impl SharedDownloadPreferences {
+    pub fn from_preferences(prefs: &crate::config::BrowserPreferences) -> Self {
+        Self {
+            ask_where_to_save: Arc::new(AtomicBool::new(prefs.ask_where_to_save)),
+            download_directory: Arc::new(RwLock::new(prefs.download_directory.clone())),
+        }
+    }
+
+    pub fn apply(&self, prefs: &crate::config::BrowserPreferences) {
+        self.ask_where_to_save
+            .store(prefs.ask_where_to_save, Ordering::Release);
+        match self.download_directory.write() {
+            Ok(mut directory) => *directory = prefs.download_directory.clone(),
+            Err(poisoned) => *poisoned.into_inner() = prefs.download_directory.clone(),
+        }
+    }
+
+    pub fn ask_where_to_save(&self) -> bool {
+        self.ask_where_to_save.load(Ordering::Acquire)
+    }
+
+    pub fn download_directory(&self) -> String {
+        match self.download_directory.read() {
+            Ok(directory) => directory.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
 
 wrap_life_span_handler! {
     pub struct TabLifeSpanHandler {
@@ -410,6 +452,7 @@ wrap_download_handler! {
     pub struct TabDownloadHandler {
         tab_id: u64,
         event_sender: Sender<BrowserEvent>,
+        download_preferences: SharedDownloadPreferences,
     }
 
     impl DownloadHandler {
@@ -437,9 +480,21 @@ wrap_download_handler! {
             };
             let info = snapshot_download(self.tab_id, item, suggested_name);
             let _ = self.event_sender.send(BrowserEvent::DownloadStarted(info));
-            // No OS save dialog and no second browser view: the native
-            // downloads bubble is the single place where progress is shown.
-            callback.cont(None, 0);
+
+            // "Ask where to save" delegates the destination to CEF's native
+            // save dialog. Otherwise seed CEF with the configured Downloads
+            // folder so non-segmentable downloads (blob:, data:, file:) also
+            // land there instead of CEF's temp directory.
+            let ask = self.download_preferences.ask_where_to_save();
+            let configured = self.download_preferences.download_directory();
+            let directory = if configured.trim().is_empty() {
+                crate::config::default_download_directory()
+            } else {
+                std::path::PathBuf::from(&configured)
+            };
+            let path = directory.to_string_lossy().to_string();
+            let cef_path = CefString::from(path.as_str());
+            callback.cont(Some(&cef_path), if ask { 1 } else { 0 });
             1
         }
 
@@ -583,13 +638,15 @@ pub fn create_tab_client(
     event_sender: Sender<BrowserEvent>,
     adblock_engine: std::sync::Arc<adblock::Engine>,
     adblock_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    download_preferences: SharedDownloadPreferences,
 ) -> Client {
     let life_span_handler = TabLifeSpanHandler::new(tab_id, event_sender.clone());
     let load_handler = TabLoadHandler::new(tab_id, event_sender.clone());
     let display_handler = TabDisplayHandler::new(tab_id, event_sender.clone());
     let keyboard_handler = TabKeyboardHandler::new(tab_id, event_sender.clone());
     let context_menu_handler = TabContextMenuHandler::new(tab_id, event_sender.clone());
-    let download_handler = TabDownloadHandler::new(tab_id, event_sender.clone());
+    let download_handler =
+        TabDownloadHandler::new(tab_id, event_sender.clone(), download_preferences);
     let request_handler = super::adblocker::create_tab_request_handler(
         tab_id,
         event_sender,

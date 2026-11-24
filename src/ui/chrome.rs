@@ -2657,8 +2657,9 @@ impl ChromeRenderer {
                                                 format_download_bytes(download.received_bytes),
                                                 format_download_bytes(download.total_bytes)
                                             ))
-                                            .size(10.0)
-                                            .color(palette.palette_hint),
+                                            .size(11.0)
+                                            .strong()
+                                            .color(palette.text_strong),
                                         );
                                         if download.current_speed > 0 {
                                             ui.label(
@@ -2666,8 +2667,8 @@ impl ChromeRenderer {
                                                     "{} /s",
                                                     format_download_bytes(download.current_speed)
                                                 ))
-                                                .size(10.0)
-                                                .color(palette.palette_hint),
+                                                .size(11.0)
+                                                .color(palette.text),
                                             );
                                         }
                                         ui.label(
@@ -2675,8 +2676,8 @@ impl ChromeRenderer {
                                                 download.engine,
                                                 download.segments,
                                             ))
-                                            .size(10.0)
-                                            .color(palette.palette_hint),
+                                            .size(11.0)
+                                            .color(palette.text),
                                         );
                                         // "Remove info" only forgets the SQLite
                                         // row and UI state; the file on disk is
@@ -2703,8 +2704,8 @@ impl ChromeRenderer {
                                     if !download.full_path.is_empty() {
                                         ui.label(
                                             RichText::new(truncate_title(&download.full_path, 48))
-                                                .size(9.0)
-                                                .color(palette.palette_hint),
+                                                .size(10.0)
+                                                .color(palette.text),
                                         );
                                     }
                                 }
@@ -2944,6 +2945,35 @@ impl ChromeRenderer {
                                     &mut draft.rail_expanded,
                                     "Expand the workspace rail on startup",
                                 );
+
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("DOWNLOADS")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(palette.section_label),
+                                );
+                                ui.add_space(3.0);
+                                ui.checkbox(
+                                    &mut draft.ask_where_to_save,
+                                    "Ask where to save each file",
+                                );
+                                ui.add_space(3.0);
+                                ui.label("Download folder (leave empty for the default Downloads folder):");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut draft.download_directory)
+                                        .desired_width(320.0)
+                                        .hint_text("~/Downloads"),
+                                );
+                                if !draft.ask_where_to_save {
+                                    ui.label(
+                                        RichText::new("Files are saved automatically to the folder above.")
+                                            .size(10.0)
+                                            .color(palette.palette_hint),
+                                    );
+                                }
                                 }
                                 SettingsTab::Workspaces => {
                                     if workspace_create_mode {

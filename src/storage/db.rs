@@ -1040,6 +1040,8 @@ mod tests {
             adblock_enabled: false,
             idle_timeout_minutes: 15,
             search_engine: crate::config::SearchEngine::Google,
+            download_directory: "/tmp/downloads".to_string(),
+            ask_where_to_save: true,
         };
         apply_command(
             &mut conn,

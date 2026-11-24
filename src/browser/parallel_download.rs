@@ -342,19 +342,32 @@ struct OpenDownload {
 pub struct DownloadWriter {
     sender: Sender<WriterCommand>,
     done: Receiver<()>,
+    finalized: Receiver<(u32, bool)>,
 }
 
 impl DownloadWriter {
     pub fn new() -> Self {
         let (sender, receiver) = unbounded::<WriterCommand>();
         let (done_sender, done) = unbounded::<()>();
+        let (finalized_sender, finalized) = unbounded::<(u32, bool)>();
         if let Err(error) = thread::Builder::new()
             .name("kasumi-download-writer".to_string())
-            .spawn(move || run_writer(receiver, done_sender))
+            .spawn(move || run_writer(receiver, done_sender, finalized_sender))
         {
             tracing::warn!("Could not start download writer thread: {error}");
         }
-        Self { sender, done }
+        Self {
+            sender,
+            done,
+            finalized,
+        }
+    }
+
+    /// Drain finalize outcomes produced since the last UI tick. A failed
+    /// rename must demote the row from "Completed" so the user never tries to
+    /// open a file that was never written.
+    pub fn take_finalized(&self) -> Vec<(u32, bool)> {
+        self.finalized.try_iter().collect()
     }
 
     pub fn start(
@@ -411,7 +424,7 @@ impl Default for DownloadWriter {
     }
 }
 
-fn run_writer(receiver: Receiver<WriterCommand>, done: Sender<()>) {
+fn run_writer(receiver: Receiver<WriterCommand>, done: Sender<()>, finalized: Sender<(u32, bool)>) {
     let mut downloads: HashMap<u32, OpenDownload> = HashMap::new();
 
     while let Ok(command) = receiver.recv() {
@@ -486,17 +499,23 @@ fn run_writer(receiver: Receiver<WriterCommand>, done: Sender<()>) {
             WriterCommand::Finish { download_id } => {
                 if let Some(mut download) = downloads.remove(&download_id) {
                     drop(download.file.take());
-                    if std::fs::rename(&download.part_path, &download.final_path).is_err() {
+                    let mut finalized_ok =
+                        std::fs::rename(&download.part_path, &download.final_path).is_ok();
+                    if !finalized_ok {
                         // Windows cannot rename over an existing destination.
                         if download.final_path.exists() {
                             let _ = std::fs::remove_file(&download.final_path);
                         }
-                        if let Err(error) =
-                            std::fs::rename(&download.part_path, &download.final_path)
-                        {
-                            tracing::warn!("Could not finalize {:?}: {error}", download.final_path);
+                        match std::fs::rename(&download.part_path, &download.final_path) {
+                            Ok(()) => finalized_ok = true,
+                            Err(error) => tracing::warn!(
+                                "Could not finalize {:?} from {:?}: {error}",
+                                download.final_path,
+                                download.part_path
+                            ),
                         }
                     }
+                    let _ = finalized.send((download_id, finalized_ok));
                 }
             }
             WriterCommand::Cancel { download_id } => {

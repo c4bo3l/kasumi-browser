@@ -550,11 +550,48 @@ fn install_macos_main_menu() {
     }
 }
 
-/// Seed `CFBundleName` for an unbundled development binary so the macOS app
-/// menu shows the product name instead of the executable name.
+/// Seed the macOS application identity for an unbundled development binary.
+///
+/// CEF's framework carries its own `CFBundleName` ("Chromium Embedded
+/// Framework"). When the framework is loaded from an unbundled executable,
+/// AppKit can inherit that name for the process and the app menu. Setting both
+/// the user-defaults bundle keys and `NSProcessInfo.processName` keeps the menu
+/// showing "Kasumi Browser" regardless of which source AppKit consults.
 #[cfg(target_os = "macos")]
 unsafe fn set_macos_bundle_name(name: &str) {
     use std::ffi::{c_void, CString};
+
+    let value = objc2_foundation::NSString::from_str(name);
+
+    // NSProcessInfo.processName is what AppKit uses for the visible app-menu
+    // title. `setName:` is private but stable across macOS versions.
+    if let (Ok(class_name), Ok(selector_name)) =
+        (CString::new("NSProcessInfo"), CString::new("processInfo"))
+    {
+        let cls = objc2::ffi::objc_getClass(class_name.as_ptr());
+        if !cls.is_null() {
+            let process_info_sel = objc2::ffi::sel_registerName(selector_name.as_ptr());
+            let process_info_msg: unsafe extern "C" fn(*mut c_void, *const c_void) -> *mut c_void =
+                std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
+            let process_info =
+                process_info_msg(cls as *mut c_void, process_info_sel as *const c_void);
+            if !process_info.is_null() {
+                if let Ok(set_name) = CString::new("setName:") {
+                    let set_name_sel = objc2::ffi::sel_registerName(set_name.as_ptr());
+                    let set_name_msg: unsafe extern "C" fn(
+                        *mut c_void,
+                        *const c_void,
+                        *mut c_void,
+                    ) = std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
+                    set_name_msg(
+                        process_info,
+                        set_name_sel as *const c_void,
+                        &*value as *const objc2_foundation::NSString as *mut c_void,
+                    );
+                }
+            }
+        }
+    }
 
     let Ok(class_name) = CString::new("NSUserDefaults") else {
         return;
@@ -581,14 +618,17 @@ unsafe fn set_macos_bundle_name(name: &str) {
     let setter_sel = objc2::ffi::sel_registerName(setter_name.as_ptr());
     let setter: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void, *mut c_void) =
         std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
-    let value = objc2_foundation::NSString::from_str(name);
-    let key = objc2_foundation::NSString::from_str("CFBundleName");
-    setter(
-        defaults,
-        setter_sel as *const c_void,
-        &*value as *const objc2_foundation::NSString as *mut c_void,
-        &*key as *const objc2_foundation::NSString as *mut c_void,
-    );
+    // CEF reads these keys when deriving the process/app name. Seed every
+    // common variant so none can reintroduce "Chromium Embedded Framework".
+    for key_name in ["CFBundleName", "CFBundleDisplayName"] {
+        let key = objc2_foundation::NSString::from_str(key_name);
+        setter(
+            defaults,
+            setter_sel as *const c_void,
+            &*value as *const objc2_foundation::NSString as *mut c_void,
+            &*key as *const objc2_foundation::NSString as *mut c_void,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -705,7 +745,7 @@ impl KasumiBrowserHandler {
                 .with_transparent(true)
                 .with_decorations(false)
                 .with_resizable(false)
-                .with_window_level(WindowLevel::AlwaysOnTop);
+                .with_window_level(WindowLevel::Normal);
             let overlay_window = match event_loop.create_window(attrs) {
                 Ok(window) => Arc::new(window),
                 Err(e) => {
@@ -713,7 +753,7 @@ impl KasumiBrowserHandler {
                     return;
                 }
             };
-            overlay_window.set_window_level(WindowLevel::AlwaysOnTop);
+            overlay_window.set_window_level(WindowLevel::Normal);
             self.overlay_window_id = Some(overlay_window.id());
             self.overlay_window = Some(overlay_window);
         }
@@ -816,7 +856,7 @@ impl KasumiBrowserHandler {
                 .with_transparent(true)
                 .with_decorations(false)
                 .with_resizable(false)
-                .with_window_level(WindowLevel::AlwaysOnTop);
+                .with_window_level(WindowLevel::Normal);
             let window = match event_loop.create_window(attrs) {
                 Ok(window) => Arc::new(window),
                 Err(e) => {
@@ -824,7 +864,7 @@ impl KasumiBrowserHandler {
                     return;
                 }
             };
-            window.set_window_level(WindowLevel::AlwaysOnTop);
+            window.set_window_level(WindowLevel::Normal);
             if let Err(e) = window.set_cursor_hittest(false) {
                 tracing::warn!("Tooltip overlay click-through unavailable: {e}");
             }
@@ -1082,6 +1122,12 @@ fn open_download_path(path: &str, reveal: bool) {
     use std::process::Command;
 
     if path.is_empty() {
+        return;
+    }
+    // Avoid a raw OS "file does not exist" dialog when a transfer failed to
+    // finalize. The downloads row is demoted to Interrupted in that case.
+    if !std::path::Path::new(path).exists() {
+        tracing::warn!("Download file no longer exists: {path}");
         return;
     }
 
@@ -1710,7 +1756,13 @@ fn main() {
 
     // ── 4. macOS: configure NSApplication CrAppControlProtocol ──────────────
     #[cfg(target_os = "macos")]
-    setup_mac_application();
+    {
+        setup_mac_application();
+        // CEF's framework carries a "Chromium Embedded Framework" bundle name.
+        // Claim the process identity before loading it so AppKit cannot adopt
+        // that name for the app menu.
+        unsafe { set_macos_bundle_name("Kasumi Browser") };
+    }
 
     // ── 5. Initialize CEF ────────────────────────────────────────────────────
     let mut settings = cef::Settings::default();

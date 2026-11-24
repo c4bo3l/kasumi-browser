@@ -381,6 +381,10 @@ pub struct TabManager {
     adblock_engine: Arc<adblock::Engine>,
     adblock_enabled: Arc<AtomicBool>,
 
+    // Download preferences shared with CEF handlers. The "ask where to save"
+    // flag is an atomic; the directory is only cloned from a short-lived lock.
+    download_preferences: client::SharedDownloadPreferences,
+
     // User-configurable idle timeout for the normal-pressure watchdog.
     idle_timeout: Duration,
 
@@ -440,6 +444,7 @@ impl TabManager {
         let used = sys.used_memory();
         let adblock_engine = adblocker::create_adblock_engine();
         let adblock_enabled = Arc::new(AtomicBool::new(preferences.adblock_enabled));
+        let download_preferences = client::SharedDownloadPreferences::from_preferences(preferences);
 
         let mut workspaces = workspaces;
         if workspaces.is_empty() {
@@ -486,6 +491,7 @@ impl TabManager {
             ram_process_mb: 0,
             adblock_engine,
             adblock_enabled,
+            download_preferences,
             idle_timeout: preferences.idle_timeout(),
             home_url: preferences.home_url().to_string(),
             storage,
@@ -510,6 +516,7 @@ impl TabManager {
         let preferences = preferences.clone().normalized();
         self.adblock_enabled
             .store(preferences.adblock_enabled, Ordering::Release);
+        self.download_preferences.apply(&preferences);
         self.idle_timeout = preferences.idle_timeout();
         self.home_url = preferences.home_url().to_string();
     }
@@ -644,14 +651,18 @@ impl TabManager {
     }
 
     fn resolve_download_path(&self, info: &DownloadInfo) -> PathBuf {
-        if !info.full_path.trim().is_empty() {
+        // A path chosen in CEF's native "Save As" dialog must be preserved.
+        // Otherwise always save into the configured/default Downloads folder
+        // rather than CEF's temp location, which can disappear mid-transfer.
+        if self.download_preferences.ask_where_to_save() && !info.full_path.trim().is_empty() {
             return PathBuf::from(&info.full_path);
         }
-        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-        let directory = home
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
-            .join("Downloads");
+        let configured = self.download_preferences.download_directory();
+        let directory = if configured.trim().is_empty() {
+            crate::config::default_download_directory()
+        } else {
+            PathBuf::from(&configured)
+        };
         Self::unique_download_path(&directory, &info.suggested_name)
     }
 
@@ -2119,6 +2130,7 @@ impl TabManager {
             self.event_sender.clone(),
             self.adblock_engine.clone(),
             Arc::clone(&self.adblock_enabled),
+            self.download_preferences.clone(),
         );
         let bounds = cef::Rect {
             x: self.content_rect.x as i32,
@@ -2816,6 +2828,31 @@ impl TabManager {
         // Create browsers only from `about_to_wait`, never from a window event.
         self.drain_browser_spawns();
         self.retry_blank_initial_navigations(now);
+
+        // A part file can vanish before the writer renames it (for example if
+        // a temp directory is cleaned mid-transfer). Never leave the row marked
+        // Completed in that case.
+        for (download_id, ok) in self.download_writer.take_finalized() {
+            if !ok {
+                tracing::error!(
+                    "Native download {download_id} could not be finalized; marking interrupted"
+                );
+                if let Some(info) = self
+                    .downloads
+                    .iter_mut()
+                    .find(|item| item.id == download_id)
+                {
+                    if info.state == DownloadState::Completed {
+                        info.state = DownloadState::Interrupted;
+                        info.current_speed = 0;
+                        info.updated_at = Self::now_unix_secs();
+                        if let Some(ref storage) = self.storage {
+                            storage.save_download(info.clone());
+                        }
+                    }
+                }
+            }
+        }
 
         // 1. Refresh RAM every RAM_CHECK_INTERVAL (5s)
         if now.duration_since(self.last_ram_check) >= RAM_CHECK_INTERVAL {
