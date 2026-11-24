@@ -2566,7 +2566,7 @@ impl ChromeRenderer {
                                             ui.add(
                                                 egui::ProgressBar::new(percent / 100.0)
                                                     .text(format!("{percent:.0}%"))
-                                                    .desired_width((size.x - 84.0).max(40.0)),
+                                                    .desired_width((size.x - 68.0).max(40.0)),
                                             );
                                             match download.state {
                                                 DownloadState::InProgress => {
@@ -2988,19 +2988,25 @@ impl ChromeRenderer {
                                     "Ask where to save each file",
                                 );
                                 ui.add_space(3.0);
-                                ui.label("Download folder (leave empty for the default Downloads folder):");
-                                ui.add(
+                                ui.add_enabled(
+                                    !draft.ask_where_to_save,
+                                    egui::Label::new("Download folder (leave empty for the default Downloads folder):"),
+                                );
+                                ui.add_enabled(
+                                    !draft.ask_where_to_save,
                                     egui::TextEdit::singleline(&mut draft.download_directory)
                                         .desired_width(320.0)
                                         .hint_text("~/Downloads"),
                                 );
-                                if !draft.ask_where_to_save {
-                                    ui.label(
-                                        RichText::new("Files are saved automatically to the folder above.")
-                                            .size(10.0)
-                                            .color(palette.palette_hint),
-                                    );
-                                }
+                                ui.label(
+                                    RichText::new(if draft.ask_where_to_save {
+                                        "The save dialog chooses the destination while this is enabled."
+                                    } else {
+                                        "Files are saved automatically to the folder above."
+                                    })
+                                    .size(10.0)
+                                    .color(palette.palette_hint),
+                                );
                                 }
                                 SettingsTab::Workspaces => {
                                     if workspace_create_mode {
@@ -4469,8 +4475,9 @@ fn material_button(
     ui.add_enabled(enabled, button)
 }
 
-/// A fixed-size, icon-only button used by dense download rows. The hover label
-/// is supplied through egui's own tooltip so the glyph stays crisp and compact.
+/// A small, transparent icon-only button used by dense download rows. Hover
+/// feedback comes from the glyph colour and egui's own tooltip, so no filled
+/// background competes with the transfer progress text.
 fn compact_icon_button(
     ui: &mut Ui,
     icon: RailIcon,
@@ -4478,21 +4485,14 @@ fn compact_icon_button(
     palette: &ChromePalette,
     prominent: bool,
 ) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
-    let fill = if prominent {
-        palette.rail_row_active
-    } else if response.hovered() {
-        palette.rail_row_hover
-    } else {
-        palette.rail_surface
-    };
-    let color = if prominent {
+    let (rect, response) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
+    let color = if prominent || response.hovered() {
         palette.text_strong
     } else {
         palette.text
     };
-    ui.painter().rect_filled(rect, Rounding::same(6.0), fill);
-    paint_rail_icon(ui, rect, icon, color);
+    let icon_rect = egui::Rect::from_center_size(rect.center(), vec2(14.0, 14.0));
+    paint_rail_icon(ui, icon_rect, icon, color);
     response.on_hover_text(label)
 }
 

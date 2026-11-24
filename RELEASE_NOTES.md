@@ -20,6 +20,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 - Downloads now pass CEF a full target path including the suggested filename and preserve that name when the native segmented engine takes over, so files keep their extension instead of being saved as an extensionless `download`.
 - Removed the crashing private `NSProcessInfo.setName:` call; modern macOS now probes `setProcessName:` with a safe fallback.
+- The download-folder field is disabled while **Ask where to save each file** is enabled, and download-row action icons are smaller with no filled background.
 
 ### Verification
 
