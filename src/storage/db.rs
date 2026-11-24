@@ -18,7 +18,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::config::{
     BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, PREFERENCES_DB_KEY,
 };
-use crate::events::{DownloadInfo, DownloadState};
+use crate::events::{DownloadEngine, DownloadInfo, DownloadState};
 
 #[derive(Debug, Clone)]
 pub struct SessionTabSnapshot {
@@ -163,6 +163,25 @@ impl StorageManager {
 
         let conn = Connection::open(db_path)?;
         conn.execute_batch(include_str!("schema.sql"))?;
+
+        // The native segmented engine was added in the same 0.7 release as the
+        // downloads table. Existing development databases still get an in-place
+        // migration so `SaveDownload` never references a missing column.
+        if !table_has_column(&conn, "downloads", "engine")? {
+            conn.execute_batch(
+                "ALTER TABLE downloads ADD COLUMN engine TEXT NOT NULL DEFAULT 'cef';",
+            )?;
+        }
+        if !table_has_column(&conn, "downloads", "segments")? {
+            conn.execute_batch(
+                "ALTER TABLE downloads ADD COLUMN segments INTEGER NOT NULL DEFAULT 1;",
+            )?;
+        }
+        if !table_has_column(&conn, "downloads", "temp_path")? {
+            conn.execute_batch(
+                "ALTER TABLE downloads ADD COLUMN temp_path TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
 
         // Databases created by the first Workspaces build predate the default
         // workspace flag. Add it before any statement references the column;
@@ -374,7 +393,7 @@ impl StorageManager {
         let mut stmt = conn.prepare(
             "SELECT download_id, tab_id, url, suggested_name, full_path, state,
                     received_bytes, total_bytes, percent_complete, current_speed,
-                    started_at, updated_at
+                    engine, segments, temp_path, started_at, updated_at
              FROM downloads ORDER BY updated_at DESC, download_id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -389,8 +408,11 @@ impl StorageManager {
                 total_bytes: row.get(7)?,
                 percent_complete: row.get::<_, i64>(8)? as i32,
                 current_speed: row.get(9)?,
-                started_at: row.get::<_, i64>(10)? as u64,
-                updated_at: row.get::<_, i64>(11)? as u64,
+                engine: DownloadEngine::from_str(&row.get::<_, String>(10)?),
+                segments: row.get::<_, i64>(11)? as u8,
+                temp_path: row.get(12)?,
+                started_at: row.get::<_, i64>(13)? as u64,
+                updated_at: row.get::<_, i64>(14)? as u64,
             })
         })?;
 
@@ -625,8 +647,8 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
                 "INSERT INTO downloads
                  (download_id, tab_id, url, suggested_name, full_path, state,
                   received_bytes, total_bytes, percent_complete, current_speed,
-                  started_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                  engine, segments, temp_path, started_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(download_id) DO UPDATE SET
                      tab_id = excluded.tab_id,
                      url = excluded.url,
@@ -637,6 +659,9 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
                      total_bytes = excluded.total_bytes,
                      percent_complete = excluded.percent_complete,
                      current_speed = excluded.current_speed,
+                     engine = excluded.engine,
+                     segments = excluded.segments,
+                     temp_path = excluded.temp_path,
                      started_at = excluded.started_at,
                      updated_at = excluded.updated_at",
                 params![
@@ -650,6 +675,9 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
                     item.total_bytes,
                     item.percent_complete as i64,
                     item.current_speed,
+                    item.engine.as_str(),
+                    item.segments as i64,
+                    item.temp_path,
                     item.started_at as i64,
                     item.updated_at as i64,
                 ],
@@ -705,7 +733,7 @@ fn run_worker_loop(db_path: PathBuf, mut rx: UnboundedReceiver<DbCommand>) {
 mod tests {
     use super::{apply_command, DbCommand, SessionTabSnapshot, StorageManager};
     use crate::config::{BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon};
-    use crate::events::{DownloadInfo, DownloadState};
+    use crate::events::{DownloadEngine, DownloadInfo, DownloadState};
     use rusqlite::params;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1136,6 +1164,9 @@ mod tests {
             percent_complete: 50,
             current_speed: 2048,
             state,
+            engine: DownloadEngine::Parallel,
+            segments: 4,
+            temp_path: "/Downloads/file.zip.kasumi.part".to_string(),
             started_at: 100,
             updated_at,
         }
@@ -1168,10 +1199,52 @@ mod tests {
         assert_eq!(loaded[0].id, 1);
         assert_eq!(loaded[0].state, DownloadState::Completed);
         assert_eq!(loaded[0].updated_at, 40);
+        assert_eq!(loaded[0].engine, DownloadEngine::Parallel);
+        assert_eq!(loaded[0].segments, 4);
+        assert_eq!(loaded[0].temp_path, "/Downloads/file.zip.kasumi.part");
         assert_eq!(loaded[1].id, 2);
 
         apply_command(&mut conn, DbCommand::FlushWal);
         drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn init_db_migrates_legacy_downloads_with_parallel_columns() {
+        let path = test_db_path("downloads-migration");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("legacy database");
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE downloads (
+                     download_id INTEGER PRIMARY KEY,
+                     tab_id INTEGER NOT NULL DEFAULT 0,
+                     url TEXT NOT NULL,
+                     suggested_name TEXT NOT NULL DEFAULT '',
+                     full_path TEXT NOT NULL DEFAULT '',
+                     state TEXT NOT NULL DEFAULT 'in_progress',
+                     received_bytes INTEGER NOT NULL DEFAULT 0,
+                     total_bytes INTEGER NOT NULL DEFAULT 0,
+                     percent_complete INTEGER NOT NULL DEFAULT 0,
+                     current_speed INTEGER NOT NULL DEFAULT 0,
+                     started_at INTEGER NOT NULL DEFAULT 0,
+                     updated_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO downloads
+                     (download_id, url, suggested_name, full_path, state, updated_at)
+                 VALUES (7, 'https://legacy.example/file.zip', 'file.zip',
+                         '/Downloads/file.zip', 'completed', 9);",
+            )
+            .expect("legacy downloads schema");
+        }
+
+        let loaded = StorageManager::load_downloads(&path).expect("migrated downloads load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, 7);
+        assert_eq!(loaded[0].engine, DownloadEngine::Cef);
+        assert_eq!(loaded[0].segments, 1);
+        assert_eq!(loaded[0].temp_path, "");
+
         remove_test_db(&path);
     }
 

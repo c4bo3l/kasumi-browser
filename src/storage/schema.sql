@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS downloads (
     total_bytes INTEGER NOT NULL DEFAULT 0,
     percent_complete INTEGER NOT NULL DEFAULT 0,
     current_speed INTEGER NOT NULL DEFAULT 0,
+    engine TEXT NOT NULL DEFAULT 'cef',
+    segments INTEGER NOT NULL DEFAULT 1,
+    temp_path TEXT NOT NULL DEFAULT '',
     started_at INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL DEFAULT 0
 );

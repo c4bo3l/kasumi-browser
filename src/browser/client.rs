@@ -1,4 +1,4 @@
-use crate::events::{BrowserEvent, BrowserShortcut, DownloadInfo, DownloadState};
+use crate::events::{BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadState};
 use cef::*;
 use crossbeam_channel::Sender;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -398,6 +398,9 @@ fn snapshot_download(
         percent_complete: item.percent_complete(),
         current_speed: item.current_speed(),
         state: download_state(item),
+        engine: DownloadEngine::Cef,
+        segments: 1,
+        temp_path: String::new(),
         started_at,
         updated_at,
     }

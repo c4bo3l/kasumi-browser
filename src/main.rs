@@ -1485,6 +1485,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             self.shutdown_browsers_closed = true;
             if let Some(tm) = self.tab_manager.as_mut() {
                 tm.sync_session();
+                tm.shutdown_downloads();
                 tm.close_all_browsers();
             }
             if let Some(storage) = self.storage_handle.as_ref() {

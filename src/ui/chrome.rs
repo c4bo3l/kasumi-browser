@@ -29,7 +29,7 @@ use crate::config::{
     WorkspaceIcon, COMMAND_PALETTE_TOP_OFFSET, COMMAND_PALETTE_WIDTH, DEFAULT_SEARCH_URL_PREFIX,
     MAX_IDLE_TIMEOUT_MINUTES, MIN_IDLE_TIMEOUT_MINUTES,
 };
-use crate::events::{DownloadInfo, DownloadState, UiAction};
+use crate::events::{DownloadEngine, DownloadInfo, DownloadState, UiAction};
 
 /// Light or dark chrome appearance. The OS theme decides the default, and
 /// `ChromeTheme::from_winit` maps live `ThemeChanged` events into this enum.
@@ -247,6 +247,21 @@ pub fn download_state_label(state: DownloadState) -> &'static str {
         DownloadState::Completed => "Completed",
         DownloadState::Canceled => "Canceled",
         DownloadState::Interrupted => "Interrupted",
+    }
+}
+
+/// Native segmented transfers display their connection count; CEF-managed
+/// entries remain readable for non-HTTP downloads.
+pub fn download_engine_label(engine: DownloadEngine, segments: u8) -> String {
+    match engine {
+        DownloadEngine::Cef => "CEF".to_string(),
+        DownloadEngine::Parallel => {
+            if segments > 1 {
+                format!("Parallel · {segments} connections")
+            } else {
+                "Native".to_string()
+            }
+        }
     }
 }
 
@@ -2881,6 +2896,14 @@ impl ChromeRenderer {
                                                     .color(palette.palette_hint),
                                                 );
                                             }
+                                            ui.label(
+                                                RichText::new(download_engine_label(
+                                                    download.engine,
+                                                    download.segments,
+                                                ))
+                                                .size(10.0)
+                                                .color(palette.palette_hint),
+                                            );
                                         });
                                         if !download.full_path.is_empty() {
                                             ui.label(
@@ -4463,7 +4486,7 @@ pub fn command_palette_items(
         items.push(CommandPaletteItem {
             icon: "⇩",
             label: "Open Downloads".to_string(),
-            subtitle: "Active and completed downloads".to_string(),
+            subtitle: "Native parallel downloads and history".to_string(),
             action: CommandAction::OpenDownloads,
         });
         items.extend(tabs.iter().take(12).map(tab_item));
@@ -4539,7 +4562,7 @@ pub fn command_palette_items(
         items.push(CommandPaletteItem {
             icon: "⇩",
             label: "Open Downloads".to_string(),
-            subtitle: "Active and completed downloads".to_string(),
+            subtitle: "Native parallel downloads and history".to_string(),
             action: CommandAction::OpenDownloads,
         });
     }
@@ -4648,15 +4671,15 @@ mod tests {
 
     use super::{
         advance_command_selection, apply_command_item, clamp_command_selection,
-        command_palette_click_outside, command_palette_items, download_state_label,
-        effective_theme, focus_request_after_render, format_download_bytes, loading_spinner_angle,
-        loading_spinner_point, page_tooltip_anchor, palette_row_fill, preferred_surface_format,
-        rail_menu_anchor, rail_menu_click_outside, rail_menu_items, rail_menu_metrics,
-        rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled, rail_tooltip_metrics,
-        resolve_omnibox, resolve_omnibox_with_search, tab_close_center, tab_status_center,
-        truncate_title, workspace_form_actions, ChromePalette, ChromeState, ChromeTheme,
-        CommandAction, RailMenuAction, SettingsTab, TabDisplayState, TabInfo, WorkspaceInfo,
-        RAIL_STATUS_BADGE_HEIGHT, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED,
+        command_palette_click_outside, command_palette_items, download_engine_label,
+        download_state_label, effective_theme, focus_request_after_render, format_download_bytes,
+        loading_spinner_angle, loading_spinner_point, page_tooltip_anchor, palette_row_fill,
+        preferred_surface_format, rail_menu_anchor, rail_menu_click_outside, rail_menu_items,
+        rail_menu_metrics, rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled,
+        rail_tooltip_metrics, resolve_omnibox, resolve_omnibox_with_search, tab_close_center,
+        tab_status_center, truncate_title, workspace_form_actions, ChromePalette, ChromeState,
+        ChromeTheme, CommandAction, RailMenuAction, SettingsTab, TabDisplayState, TabInfo,
+        WorkspaceInfo, RAIL_STATUS_BADGE_HEIGHT, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED,
         RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED,
         TOOLTIP_WIDTH,
     };
@@ -4664,7 +4687,7 @@ mod tests {
         BrowserPreferences, SearchEngine, ThemePreference, WorkspaceColor, WorkspaceIcon,
         DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX, RAIL_WIDTH_COLLAPSED,
     };
-    use crate::events::{DownloadState, UiAction};
+    use crate::events::{DownloadEngine, DownloadState, UiAction};
 
     fn tab(id: u64, title: &str, url: &str) -> TabInfo {
         TabInfo {
@@ -5056,6 +5079,12 @@ mod tests {
         assert_eq!(format_download_bytes(512), "512 B");
         assert_eq!(format_download_bytes(2048), "2.0 KB");
         assert_eq!(format_download_bytes(3 * 1024 * 1024), "3.0 MB");
+        assert_eq!(
+            download_engine_label(DownloadEngine::Parallel, 8),
+            "Parallel · 8 connections"
+        );
+        assert_eq!(download_engine_label(DownloadEngine::Parallel, 1), "Native");
+        assert_eq!(download_engine_label(DownloadEngine::Cef, 1), "CEF");
     }
 
     #[test]

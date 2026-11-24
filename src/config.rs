@@ -365,6 +365,13 @@ pub const RAM_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// How often the tab manager watchdog tick runs
 pub const TAB_WATCHDOG_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Simultaneous HTTP Range requests used by the native download manager.
+pub const PARALLEL_DOWNLOAD_SEGMENTS: u8 = 8;
+
+/// Files below this size are downloaded with one request; segment overhead
+/// costs more than it saves for small payloads.
+pub const PARALLEL_DOWNLOAD_MIN_BYTES: i64 = 1024 * 1024;
+
 /// Upper bound on event-loop iterations spent draining CEF events during
 /// shutdown. On macOS `on_before_close` is delivered by `cef::shutdown()`
 /// itself, so waiting for it before shutdown would never complete.
@@ -402,6 +409,12 @@ mod tests {
         assert!(RAM_HIGH_PRESSURE_THRESHOLD < RAM_CRITICAL_PRESSURE_THRESHOLD);
         assert_eq!(RAM_CHECK_INTERVAL, Duration::from_secs(5));
         assert_eq!(TAB_WATCHDOG_TICK_INTERVAL, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn parallel_download_limits_are_sane() {
+        assert_eq!(PARALLEL_DOWNLOAD_SEGMENTS, 8);
+        assert_eq!(PARALLEL_DOWNLOAD_MIN_BYTES, 1024 * 1024);
     }
 
     #[test]
