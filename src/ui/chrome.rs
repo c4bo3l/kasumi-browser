@@ -2869,9 +2869,13 @@ impl ChromeRenderer {
 
                                         let percent =
                                             download.percent_complete.clamp(0, 100) as f32;
+                                        // Let egui size the bar from the available
+                                        // width. An infinite desired width would be
+                                        // cached as the Settings Area width; on the
+                                        // next frame centering that width produces a
+                                        // NaN rect and egui aborts.
                                         ui.add(
                                             egui::ProgressBar::new(percent / 100.0)
-                                                .desired_width(f32::INFINITY)
                                                 .text(format!("{:.0}%", percent)),
                                         );
                                         ui.horizontal(|ui| {
@@ -4677,17 +4681,17 @@ mod tests {
         preferred_surface_format, rail_menu_anchor, rail_menu_click_outside, rail_menu_items,
         rail_menu_metrics, rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled,
         rail_tooltip_metrics, resolve_omnibox, resolve_omnibox_with_search, tab_close_center,
-        tab_status_center, truncate_title, workspace_form_actions, ChromePalette, ChromeState,
-        ChromeTheme, CommandAction, RailMenuAction, SettingsTab, TabDisplayState, TabInfo,
-        WorkspaceInfo, RAIL_STATUS_BADGE_HEIGHT, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED,
-        RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED,
-        TOOLTIP_WIDTH,
+        tab_status_center, truncate_title, workspace_form_actions, ChromePalette, ChromeRenderer,
+        ChromeState, ChromeTheme, CommandAction, RailMenuAction, SettingsTab, TabDisplayState,
+        TabInfo, WorkspaceInfo, RAIL_STATUS_BADGE_HEIGHT, RAIL_STATUS_HEIGHT,
+        RAIL_STATUS_ICON_COLLAPSED, RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED,
+        TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
     };
     use crate::config::{
         BrowserPreferences, SearchEngine, ThemePreference, WorkspaceColor, WorkspaceIcon,
         DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX, RAIL_WIDTH_COLLAPSED,
     };
-    use crate::events::{DownloadEngine, DownloadState, UiAction};
+    use crate::events::{DownloadEngine, DownloadInfo, DownloadState, UiAction};
 
     fn tab(id: u64, title: &str, url: &str) -> TabInfo {
         TabInfo {
@@ -5309,6 +5313,56 @@ mod tests {
         state.close_settings();
         state.open_settings();
         assert_eq!(state.settings_tab, SettingsTab::General);
+    }
+
+    #[test]
+    fn downloads_page_renders_an_active_download_without_invalid_layout() {
+        let ctx = egui::Context::default();
+        let mut state = ChromeState::default();
+        state.open_settings_tab(SettingsTab::Downloads);
+        state.downloads.push(DownloadInfo {
+            id: 1,
+            tab_id: 1,
+            url: "https://example.com/archive.zip".to_string(),
+            suggested_name: "archive.zip".to_string(),
+            full_path: "/Users/test/Downloads/archive.zip".to_string(),
+            received_bytes: 25,
+            total_bytes: 100,
+            percent_complete: 25,
+            current_speed: 4096,
+            state: DownloadState::InProgress,
+            engine: DownloadEngine::Parallel,
+            segments: 8,
+            temp_path: "/Users/test/Downloads/archive.zip.kasumi.part".to_string(),
+            started_at: 100,
+            updated_at: 100,
+        });
+        let mut actions = Vec::new();
+
+        // egui caches an Area's measured size. Render several frames so a widget
+        // that reports an infinite width cannot poison the next frame's centering
+        // math with a NaN max rect.
+        for _ in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        vec2(1280.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| ChromeRenderer::build_settings(ctx, &mut state, &mut actions),
+            );
+            if let Some(area) = egui::AreaState::load(&ctx, egui::Id::new("kasumi_settings")) {
+                let size = area.size.unwrap_or_default();
+                assert!(
+                    size.x.is_finite() && size.y.is_finite(),
+                    "Settings area size must stay finite: {size:?}"
+                );
+            }
+        }
+
+        assert!(actions.is_empty());
     }
 
     #[test]
