@@ -32,12 +32,13 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 - Restoring a session no longer overrides the chosen default workspace with another workspace's saved tab when the default has no saved tabs.
 - Editing a workspace name no longer renames that workspace when **Create workspace** is clicked. The editor and creator now use independent drafts, so changing `Personal` to `asd` and creating a workspace leaves `Personal` intact and creates only the new workspace from the create form.
 - `Cmd+Q` now closes the app gracefully. The macOS app menu includes **Quit Kasumi Browser**, the native event monitor maps `Cmd+Q`, and the main keyboard handler maps `Ctrl/Cmd+Q` to the same deferred CEF/SQLite shutdown path as the window close button.
+- Existing databases created by the first Workspaces build now migrate before the default-workspace row is written, so startup no longer fails with `table workspaces has no column named is_default`. The previously active workspace is promoted to default.
 
 ### Verification
 
 - `cargo fmt --all -- --check`
 - `cargo check --bins`
-- `cargo test --bin kasumi-browser` — 118 tests
+- `cargo test --bin kasumi-browser` — 119 tests
 - `cargo build --release`
 - PR CI checks formatting, binaries, and unit tests on macOS 15 Intel, Windows, and Linux; interactive macOS verification is required before merge.
 

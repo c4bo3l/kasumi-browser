@@ -144,6 +144,16 @@ impl StorageManager {
         let conn = Connection::open(db_path)?;
         conn.execute_batch(include_str!("schema.sql"))?;
 
+        // Databases created by the first Workspaces build predate the default
+        // workspace flag. Add it before any statement references the column;
+        // otherwise the INSERT below fails with "table workspaces has no
+        // column named is_default" and the storage worker never starts.
+        if !table_has_column(&conn, "workspaces", "is_default")? {
+            conn.execute_batch(
+                "ALTER TABLE workspaces ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+
         // Every database, fresh or legacy, gets a stable default workspace.
         // Existing tabs and bookmarks are assigned to it below.
         conn.execute(
@@ -199,15 +209,6 @@ impl StorageManager {
              WHERE workspace_id = ?2 AND folder = 'Toolbar'",
             params![Workspace::DEFAULT_NAME, Workspace::DEFAULT_ID as i64],
         )?;
-
-        // Databases created before default-workspace support gain the column
-        // here. The active workspace becomes the initial default so startup
-        // behaviour is preserved until the user chooses another one.
-        if !table_has_column(&conn, "workspaces", "is_default")? {
-            conn.execute_batch(
-                "ALTER TABLE workspaces ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0;",
-            )?;
-        }
 
         // Keep exactly one active workspace even if an older session wrote
         // several active flags or none at all.
@@ -645,6 +646,41 @@ mod tests {
         );
 
         drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn init_db_migrates_workspaces_without_default_flag() {
+        let path = test_db_path("default-workspace-migration");
+        {
+            // This is the schema shipped by the first Workspaces build.
+            let conn = rusqlite::Connection::open(&path).expect("legacy database");
+            conn.execute_batch(
+                "CREATE TABLE workspaces (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     name TEXT NOT NULL UNIQUE,
+                     icon TEXT NOT NULL DEFAULT 'work',
+                     color TEXT NOT NULL DEFAULT 'blue',
+                     is_active INTEGER NOT NULL DEFAULT 0,
+                     sort_index INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO workspaces (id, name, icon, color, is_active, sort_index)
+                 VALUES
+                     (1, 'Atreus', 'work', 'blue', 0, 0),
+                     (2, 'Atreus 2', 'school', 'purple', 1, 1);",
+            )
+            .expect("legacy workspaces schema");
+        }
+
+        let workspaces = StorageManager::load_workspaces(&path).expect("migrated workspaces load");
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(workspaces[0].name, "Atreus");
+        assert!(!workspaces[0].is_default);
+        assert!(!workspaces[0].is_active);
+        assert_eq!(workspaces[1].name, "Atreus 2");
+        assert!(workspaces[1].is_default);
+        assert!(workspaces[1].is_active);
+
         remove_test_db(&path);
     }
 
