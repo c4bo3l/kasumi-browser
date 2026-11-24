@@ -26,9 +26,9 @@ use crate::browser::parallel_download::{
 };
 use crate::browser::{adblocker, client};
 use crate::config::{
-    BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, PARALLEL_DOWNLOAD_SEGMENTS,
-    RAM_CHECK_INTERVAL, RAM_CRITICAL_PRESSURE_THRESHOLD, RAM_HIGH_PRESSURE_THRESHOLD,
-    TAB_IDLE_TIMEOUT_PRESSURE, TAB_WATCHDOG_TICK_INTERVAL,
+    BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
+    PARALLEL_DOWNLOAD_SEGMENTS, RAM_CHECK_INTERVAL, RAM_CRITICAL_PRESSURE_THRESHOLD,
+    RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_PRESSURE, TAB_WATCHDOG_TICK_INTERVAL,
 };
 use crate::events::{
     BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadState,
@@ -427,20 +427,30 @@ pub struct TabManager {
     favicon_preferences: HashMap<u64, String>,
 }
 
-/// Restore the workspace that was open at shutdown, falling back to the
-/// user-chosen default. `is_default` stays intact so Settings and new windows
-/// keep their own choice independent of the last session.
-fn normalize_workspace_selection(workspaces: &mut [Workspace]) -> u64 {
-    let active_id = workspaces
-        .iter()
-        .find(|workspace| workspace.is_active)
-        .or_else(|| workspaces.iter().find(|workspace| workspace.is_default))
-        .or_else(|| workspaces.first())
-        .map_or(Workspace::DEFAULT_ID, |workspace| workspace.id);
+/// Choose the startup workspace from the persisted preference, then normalize
+/// both flags so later snapshots always carry a single active/default space.
+fn normalize_workspace_selection(
+    workspaces: &mut [Workspace],
+    behavior: WorkspaceStartupBehavior,
+) -> u64 {
     let default_id = workspaces
         .iter()
         .find(|workspace| workspace.is_default)
-        .map_or(active_id, |workspace| workspace.id);
+        .map_or(Workspace::DEFAULT_ID, |workspace| workspace.id);
+    let last_active_id = workspaces
+        .iter()
+        .find(|workspace| workspace.is_active)
+        .map(|workspace| workspace.id);
+    let active_id = match behavior {
+        WorkspaceStartupBehavior::LastActive => last_active_id
+            .or(Some(default_id))
+            .or_else(|| workspaces.first().map(|workspace| workspace.id))
+            .unwrap_or(Workspace::DEFAULT_ID),
+        WorkspaceStartupBehavior::DefaultWorkspace => Some(default_id)
+            .or(last_active_id)
+            .or_else(|| workspaces.first().map(|workspace| workspace.id))
+            .unwrap_or(Workspace::DEFAULT_ID),
+    };
     for workspace in workspaces {
         workspace.is_active = workspace.id == active_id;
         workspace.is_default = workspace.id == default_id;
@@ -471,10 +481,10 @@ impl TabManager {
         if workspaces.is_empty() {
             workspaces.push(Workspace::default_workspace());
         }
-        // The workspace open at shutdown wins so the browser reopens in the
-        // exact space the user left. The separate default flag is only a
-        // fallback for databases written before active-workspace tracking.
-        let active_workspace_id = normalize_workspace_selection(&mut workspaces);
+        // Reopen the last active space by default; the configurable default
+        // workspace is used when the user prefers a fixed landing space.
+        let active_workspace_id =
+            normalize_workspace_selection(&mut workspaces, preferences.workspace_startup);
 
         Self {
             tabs: Vec::new(),
@@ -3040,8 +3050,8 @@ mod tests {
         should_sync_omnibox, BrowserSpawnMode, Tab, TabManager, TabState,
     };
     use crate::config::{
-        BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, TAB_IDLE_TIMEOUT_NORMAL,
-        TAB_IDLE_TIMEOUT_PRESSURE,
+        BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
+        TAB_IDLE_TIMEOUT_NORMAL, TAB_IDLE_TIMEOUT_PRESSURE,
     };
     use crate::storage::db::SessionTabSnapshot;
     use crate::ui::platform_view::ContentRect;
@@ -3566,11 +3576,46 @@ mod tests {
                 is_active: true,
             },
         ];
-        assert_eq!(normalize_workspace_selection(&mut workspaces), 2);
+        assert_eq!(
+            normalize_workspace_selection(&mut workspaces, WorkspaceStartupBehavior::LastActive),
+            2
+        );
         assert!(!workspaces[0].is_active);
         assert!(workspaces[1].is_active);
         assert!(workspaces[0].is_default);
         assert!(!workspaces[1].is_default);
+    }
+
+    #[test]
+    fn workspace_selection_can_prefer_the_default_space() {
+        let mut workspaces = vec![
+            Workspace {
+                id: 1,
+                name: "Personal".to_string(),
+                icon: WorkspaceIcon::Work,
+                color: WorkspaceColor::Blue,
+                is_default: true,
+                is_active: false,
+            },
+            Workspace {
+                id: 2,
+                name: "Studio".to_string(),
+                icon: WorkspaceIcon::Palette,
+                color: WorkspaceColor::Purple,
+                is_default: false,
+                is_active: true,
+            },
+        ];
+        assert_eq!(
+            normalize_workspace_selection(
+                &mut workspaces,
+                WorkspaceStartupBehavior::DefaultWorkspace
+            ),
+            1
+        );
+        assert!(workspaces[0].is_active);
+        assert!(!workspaces[1].is_active);
+        assert!(workspaces[0].is_default);
     }
 
     #[test]

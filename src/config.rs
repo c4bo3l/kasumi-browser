@@ -289,6 +289,33 @@ impl Workspace {
     }
 }
 
+/// Which workspace Kasumi opens when the browser launches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceStartupBehavior {
+    /// Reopen the space that was active when the last session closed.
+    LastActive,
+    /// Always open the space marked as default in Settings.
+    DefaultWorkspace,
+}
+
+impl Default for WorkspaceStartupBehavior {
+    fn default() -> Self {
+        Self::LastActive
+    }
+}
+
+impl WorkspaceStartupBehavior {
+    pub const ALL: [Self; 2] = [Self::LastActive, Self::DefaultWorkspace];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LastActive => "Last used space",
+            Self::DefaultWorkspace => "Default space",
+        }
+    }
+}
+
 /// User-configurable browser preferences. The whole document is persisted as
 /// JSON by the background SQLite worker so adding a field never requires a
 /// schema migration or writes from a CEF callback.
@@ -300,6 +327,8 @@ pub struct BrowserPreferences {
     pub adblock_enabled: bool,
     pub idle_timeout_minutes: u32,
     pub search_engine: SearchEngine,
+    /// Workspace selected when the browser launches.
+    pub workspace_startup: WorkspaceStartupBehavior,
     /// Custom download directory. Empty means the OS default Downloads folder.
     pub download_directory: String,
     /// Show the native save dialog for each download instead of auto-saving.
@@ -314,6 +343,7 @@ impl Default for BrowserPreferences {
             adblock_enabled: true,
             idle_timeout_minutes: 10,
             search_engine: SearchEngine::default(),
+            workspace_startup: WorkspaceStartupBehavior::default(),
             download_directory: String::new(),
             ask_where_to_save: false,
         }
@@ -470,6 +500,10 @@ mod tests {
         assert_eq!(prefs.idle_timeout(), TAB_IDLE_TIMEOUT_NORMAL);
         assert_eq!(prefs.search_engine, SearchEngine::DuckDuckGo);
         assert_eq!(prefs.search_url_prefix(), DEFAULT_SEARCH_URL_PREFIX);
+        assert_eq!(
+            prefs.workspace_startup,
+            WorkspaceStartupBehavior::LastActive
+        );
         assert!(prefs.download_directory.is_empty());
         assert!(!prefs.ask_where_to_save);
         assert!(prefs.download_directory().ends_with("Downloads"));
@@ -483,10 +517,12 @@ mod tests {
             adblock_enabled: false,
             idle_timeout_minutes: 500,
             search_engine: SearchEngine::Bing,
+            workspace_startup: WorkspaceStartupBehavior::DefaultWorkspace,
             download_directory: "/tmp/kasumi-downloads".to_string(),
             ask_where_to_save: true,
         };
         let json = prefs.to_json().unwrap_or_default();
+        assert!(json.contains("\"workspace_startup\":\"default_workspace\""));
         let loaded = BrowserPreferences::from_json(&json).unwrap_or_default();
         assert_eq!(loaded.theme, ThemePreference::Light);
         assert!(!loaded.rail_expanded);
@@ -494,6 +530,10 @@ mod tests {
         assert_eq!(loaded.idle_timeout_minutes, MAX_IDLE_TIMEOUT_MINUTES);
         assert_eq!(loaded.search_engine, SearchEngine::Bing);
         assert_eq!(loaded.idle_timeout(), Duration::from_secs(3600));
+        assert_eq!(
+            loaded.workspace_startup,
+            WorkspaceStartupBehavior::DefaultWorkspace
+        );
         assert_eq!(loaded.download_directory, "/tmp/kasumi-downloads");
         assert!(loaded.ask_where_to_save);
         assert_eq!(

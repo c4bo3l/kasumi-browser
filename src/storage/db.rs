@@ -1040,6 +1040,7 @@ mod tests {
             adblock_enabled: false,
             idle_timeout_minutes: 15,
             search_engine: crate::config::SearchEngine::Google,
+            workspace_startup: crate::config::WorkspaceStartupBehavior::DefaultWorkspace,
             download_directory: "/tmp/downloads".to_string(),
             ask_where_to_save: true,
         };

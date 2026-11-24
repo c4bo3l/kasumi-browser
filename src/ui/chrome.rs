@@ -26,8 +26,8 @@ use egui_wgpu::ScreenDescriptor;
 
 use crate::config::{
     rail_width, BrowserPreferences, SearchEngine, ThemePreference, Workspace, WorkspaceColor,
-    WorkspaceIcon, COMMAND_PALETTE_TOP_OFFSET, COMMAND_PALETTE_WIDTH, DEFAULT_SEARCH_URL_PREFIX,
-    MAX_IDLE_TIMEOUT_MINUTES, MIN_IDLE_TIMEOUT_MINUTES,
+    WorkspaceIcon, WorkspaceStartupBehavior, COMMAND_PALETTE_TOP_OFFSET, COMMAND_PALETTE_WIDTH,
+    DEFAULT_SEARCH_URL_PREFIX, MAX_IDLE_TIMEOUT_MINUTES, MIN_IDLE_TIMEOUT_MINUTES,
 };
 use crate::events::{DownloadEngine, DownloadInfo, DownloadState, UiAction};
 
@@ -3027,6 +3027,31 @@ impl ChromeRenderer {
                                 ui.add_space(10.0);
                                 ui.separator();
                                 ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("STARTUP")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(palette.section_label),
+                                );
+                                ui.add_space(3.0);
+                                ui.label("Open on launch:");
+                                ui.horizontal(|ui| {
+                                    for behavior in WorkspaceStartupBehavior::ALL {
+                                        ui.radio_value(
+                                            &mut draft.workspace_startup,
+                                            behavior,
+                                            behavior.label(),
+                                        );
+                                    }
+                                });
+                                ui.label(
+                                    RichText::new(
+                                        "Last used space restores where you left off; Default space always opens the space selected in Workspaces.",
+                                    )
+                                    .size(10.0)
+                                    .color(palette.palette_hint),
+                                );
+                                ui.add_space(4.0);
                                 ui.checkbox(
                                     &mut draft.rail_expanded,
                                     "Expand the workspace rail on startup",
