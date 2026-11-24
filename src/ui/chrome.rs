@@ -29,7 +29,7 @@ use crate::config::{
     WorkspaceIcon, COMMAND_PALETTE_TOP_OFFSET, COMMAND_PALETTE_WIDTH, DEFAULT_SEARCH_URL_PREFIX,
     MAX_IDLE_TIMEOUT_MINUTES, MIN_IDLE_TIMEOUT_MINUTES,
 };
-use crate::events::UiAction;
+use crate::events::{DownloadInfo, DownloadState, UiAction};
 
 /// Light or dark chrome appearance. The OS theme decides the default, and
 /// `ChromeTheme::from_winit` maps live `ThemeChanged` events into this enum.
@@ -239,6 +239,37 @@ pub fn effective_theme(preference: ThemePreference, system: ChromeTheme) -> Chro
     }
 }
 
+/// Human-readable label for a download's native state badge.
+pub fn download_state_label(state: DownloadState) -> &'static str {
+    match state {
+        DownloadState::InProgress => "Downloading",
+        DownloadState::Paused => "Paused",
+        DownloadState::Completed => "Completed",
+        DownloadState::Canceled => "Canceled",
+        DownloadState::Interrupted => "Interrupted",
+    }
+}
+
+/// Compact binary sizes for the Downloads page. Unknown totals stay `0 B`
+/// instead of rendering misleading negative progress.
+pub fn format_download_bytes(bytes: i64) -> String {
+    if bytes <= 0 {
+        return "0 B".to_string();
+    }
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// Translate the two independent workspace forms into actions. The edit form
 /// only emits on an explicit Save click, and Create only reads the create form;
 /// this prevents a half-finished rename from becoming a new workspace name.
@@ -298,7 +329,7 @@ const TOOLTIP_HEIGHT_COLLAPSED: f32 = 52.0;
 const RAIL_MENU_WIDTH: f32 = 224.0;
 const RAIL_MENU_ROW_HEIGHT: f32 = 28.0;
 const RAIL_MENU_PADDING: f32 = 7.0;
-const RAIL_STATUS_HEIGHT: f32 = 124.0;
+const RAIL_STATUS_HEIGHT: f32 = 160.0;
 const RAIL_STATUS_ICON_EXPANDED: f32 = 15.0;
 const RAIL_STATUS_ICON_COLLAPSED: f32 = 20.0;
 const RAIL_STATUS_BADGE_HEIGHT: f32 = 24.0;
@@ -340,6 +371,11 @@ enum RailIcon {
     Pin,
     PinOff,
     Settings,
+    Download,
+    Pause,
+    Play,
+    Retry,
+    FolderOpen,
     Check,
     Delete,
     Star,
@@ -449,6 +485,7 @@ pub enum CommandAction {
     ToggleRail,
     OpenDevTools,
     OpenSettings,
+    OpenDownloads,
 }
 
 /// One row in the floating command palette.
@@ -509,6 +546,7 @@ pub enum SettingsTab {
     General,
     Workspaces,
     Bookmarks,
+    Downloads,
 }
 
 /// One row in the rail tab context menu.
@@ -526,6 +564,8 @@ pub struct ChromeState {
     pub workspaces: Vec<WorkspaceInfo>,
     pub active_workspace_id: u64,
     pub bookmarks: Vec<BookmarkInfo>,
+    /// WAL-backed download snapshots mirrored from the CEF download handler.
+    pub downloads: Vec<DownloadInfo>,
     /// Text mirrored from the active tab; the command palette edits a copy.
     pub omnibox_text: String,
     /// True while the command palette is editing `omnibox_text`.
@@ -597,6 +637,7 @@ impl Default for ChromeState {
             workspaces: Vec::new(),
             active_workspace_id: 1,
             bookmarks: Vec::new(),
+            downloads: Vec::new(),
             omnibox_text: String::new(),
             omnibox_focused: false,
             last_synced_tab_id: None,
@@ -692,6 +733,11 @@ impl ChromeState {
     /// Open the native Settings overlay on the General page.
     pub fn open_settings(&mut self) {
         self.open_settings_tab(SettingsTab::General);
+    }
+
+    /// Open the native Downloads page inside the shared Settings overlay.
+    pub fn open_downloads(&mut self) {
+        self.open_settings_tab(SettingsTab::Downloads);
     }
 
     /// Open the native Settings overlay on a specific page, seeded from
@@ -1464,6 +1510,24 @@ impl ChromeRenderer {
                                 );
 
                                 ui.add_space(4.0);
+                                let downloads = Self::rail_icon_button(
+                                    ui,
+                                    vec2(34.0, 30.0),
+                                    RailIcon::Download,
+                                    palette,
+                                );
+                                if downloads.clicked() {
+                                    actions.push(UiAction::OpenDownloads);
+                                }
+                                Self::chrome_tooltip(
+                                    tooltip_slot,
+                                    ui,
+                                    &downloads,
+                                    "Downloads (Cmd/Ctrl+J)",
+                                    state.rail_expanded,
+                                );
+
+                                ui.add_space(4.0);
                                 let icon_size = rail_status_icon_size(false);
                                 let badge_width = width - 10.0;
                                 let badge_height = RAIL_STATUS_BADGE_HEIGHT;
@@ -1733,6 +1797,26 @@ impl ChromeRenderer {
                             ui,
                             &settings,
                             "Settings (Cmd/Ctrl+,)",
+                            state.rail_expanded,
+                        );
+
+                        ui.add_space(4.0);
+                        let downloads = Self::rail_action_button(
+                            ui,
+                            width - 12.0,
+                            30.0,
+                            RailIcon::Download,
+                            "Downloads",
+                            palette,
+                        );
+                        if downloads.clicked() {
+                            actions.push(UiAction::OpenDownloads);
+                        }
+                        Self::chrome_tooltip(
+                            tooltip_slot,
+                            ui,
+                            &downloads,
+                            "Downloads (Cmd/Ctrl+J)",
                             state.rail_expanded,
                         );
 
@@ -2172,6 +2256,7 @@ impl ChromeRenderer {
                                 (SettingsTab::General, "General"),
                                 (SettingsTab::Workspaces, "Workspaces"),
                                 (SettingsTab::Bookmarks, "Bookmarks"),
+                                (SettingsTab::Downloads, "Downloads"),
                             ] {
                                 if ui.selectable_label(settings_tab == tab, label).clicked() {
                                     settings_tab = tab;
@@ -2188,6 +2273,7 @@ impl ChromeRenderer {
                             SettingsTab::General => "kasumi_settings_general",
                             SettingsTab::Workspaces => "kasumi_settings_workspaces",
                             SettingsTab::Bookmarks => "kasumi_settings_bookmarks",
+                            SettingsTab::Downloads => "kasumi_settings_downloads",
                         };
                         egui::ScrollArea::vertical()
                             .id_salt(scroll_id)
@@ -2675,6 +2761,279 @@ impl ChromeRenderer {
                                         });
                                 }
                                     }
+                                    SettingsTab::Downloads => {
+                                        let downloads = state.downloads.clone();
+                                        let has_finished =
+                                            downloads.iter().any(|download| download.is_finished());
+
+                                        ui.add_space(10.0);
+                                        ui.separator();
+                                        ui.add_space(6.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new("DOWNLOADS")
+                                                    .size(10.0)
+                                                    .strong()
+                                                    .color(palette.section_label),
+                                            );
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if material_button(
+                                                        ui,
+                                                        RailIcon::Delete,
+                                                        "Clear finished",
+                                                        MaterialButtonStyle::Text,
+                                                        palette,
+                                                        has_finished,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::ClearCompletedDownloads);
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(3.0);
+                                        ui.label(
+                                            RichText::new(
+                                                "Downloads stay in native Chrome and are remembered across restarts.",
+                                            )
+                                            .size(10.0)
+                                            .color(palette.palette_hint),
+                                        );
+
+                                        if downloads.is_empty() {
+                                            ui.add_space(18.0);
+                                            ui.label(
+                                                RichText::new("No downloads yet")
+                                                    .size(13.0)
+                                                    .color(palette.text_dim),
+                                            );
+                                        }
+
+                                    for download in downloads {
+                                        ui.add_space(8.0);
+                                        ui.separator();
+                                        ui.add_space(6.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(truncate_title(
+                                                    if download.suggested_name.is_empty() {
+                                                        &download.url
+                                                    } else {
+                                                        &download.suggested_name
+                                                    },
+                                                    34,
+                                                ))
+                                                .size(12.0)
+                                                .strong(),
+                                            );
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    ui.label(
+                                                        RichText::new(download_state_label(
+                                                            download.state,
+                                                        ))
+                                                        .size(10.0)
+                                                        .color(match download.state {
+                                                            DownloadState::Completed => {
+                                                                palette.shield_ok
+                                                            }
+                                                            DownloadState::Canceled
+                                                            | DownloadState::Interrupted => {
+                                                                palette.close_icon
+                                                            }
+                                                            _ => palette.rail_accent,
+                                                        }),
+                                                    );
+                                                },
+                                            );
+                                        });
+
+                                        let percent =
+                                            download.percent_complete.clamp(0, 100) as f32;
+                                        ui.add(
+                                            egui::ProgressBar::new(percent / 100.0)
+                                                .desired_width(f32::INFINITY)
+                                                .text(format!("{:.0}%", percent)),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} / {}",
+                                                    format_download_bytes(download.received_bytes),
+                                                    format_download_bytes(download.total_bytes)
+                                                ))
+                                                .size(10.0)
+                                                .color(palette.palette_hint),
+                                            );
+                                            if download.current_speed > 0 {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{} /s",
+                                                        format_download_bytes(
+                                                            download.current_speed
+                                                        )
+                                                    ))
+                                                    .size(10.0)
+                                                    .color(palette.palette_hint),
+                                                );
+                                            }
+                                        });
+                                        if !download.full_path.is_empty() {
+                                            ui.label(
+                                                RichText::new(truncate_title(
+                                                    &download.full_path,
+                                                    54,
+                                                ))
+                                                .size(9.0)
+                                                .color(palette.palette_hint),
+                                            );
+                                        }
+
+                                        ui.horizontal_wrapped(|ui| {
+                                            match download.state {
+                                                DownloadState::InProgress => {
+                                                    if material_button(
+                                                        ui,
+                                                        RailIcon::Pause,
+                                                        "Pause",
+                                                        MaterialButtonStyle::Outlined,
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::PauseDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                    if material_button(
+                                                        ui,
+                                                        RailIcon::Close,
+                                                        "Cancel",
+                                                        MaterialButtonStyle::Text,
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::CancelDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                }
+                                                DownloadState::Paused => {
+                                                    if material_button(
+                                                        ui,
+                                                        RailIcon::Play,
+                                                        "Resume",
+                                                        MaterialButtonStyle::Filled,
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::ResumeDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                    if material_button(
+                                                        ui,
+                                                        RailIcon::Close,
+                                                        "Cancel",
+                                                        MaterialButtonStyle::Text,
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::CancelDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                }
+                                                DownloadState::Completed => {
+                                                    if material_button(
+                                                        ui,
+                                                        RailIcon::OpenInNew,
+                                                        "Open",
+                                                        MaterialButtonStyle::Tonal,
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::OpenDownloadFile {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                    if material_button(
+                                                        ui,
+                                                        RailIcon::FolderOpen,
+                                                        "Show in folder",
+                                                        MaterialButtonStyle::Outlined,
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::RevealDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                    if material_button(
+                                                        ui,
+                                                        RailIcon::Delete,
+                                                        "Remove",
+                                                        MaterialButtonStyle::Text,
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::RemoveDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                }
+                                                DownloadState::Canceled
+                                                | DownloadState::Interrupted => {
+                                                    if material_button(
+                                                        ui,
+                                                        RailIcon::Retry,
+                                                        "Retry",
+                                                        MaterialButtonStyle::Tonal,
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::RetryDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                    if material_button(
+                                                        ui,
+                                                        RailIcon::Delete,
+                                                        "Remove",
+                                                        MaterialButtonStyle::Text,
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::RemoveDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
                                 }
                             });
 
@@ -3647,9 +4006,10 @@ impl TooltipRenderer {
 fn rail_icon_glyph(icon: RailIcon) -> &'static str {
     use egui_material_icons::icons::{
         ICON_ADD, ICON_BEDTIME, ICON_BOOK, ICON_BOOKMARK_ADD, ICON_CHECK, ICON_CHEVRON_LEFT,
-        ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_CODE, ICON_DELETE, ICON_EDIT, ICON_MEMORY,
-        ICON_MUSIC_NOTE, ICON_OPEN_IN_NEW, ICON_PALETTE, ICON_PIN, ICON_PUBLIC, ICON_PUSH_PIN,
-        ICON_ROCKET, ICON_SCHOOL, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD, ICON_STAR, ICON_WORK,
+        ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_CODE, ICON_DELETE, ICON_DOWNLOAD, ICON_EDIT,
+        ICON_FOLDER_OPEN, ICON_MEMORY, ICON_MUSIC_NOTE, ICON_OPEN_IN_NEW, ICON_PALETTE, ICON_PAUSE,
+        ICON_PIN, ICON_PLAY_ARROW, ICON_PUBLIC, ICON_PUSH_PIN, ICON_REFRESH, ICON_ROCKET,
+        ICON_SCHOOL, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD, ICON_STAR, ICON_WORK,
     };
 
     match icon {
@@ -3666,6 +4026,11 @@ fn rail_icon_glyph(icon: RailIcon) -> &'static str {
         RailIcon::Pin => ICON_PUSH_PIN,
         RailIcon::PinOff => ICON_PIN,
         RailIcon::Settings => ICON_SETTINGS,
+        RailIcon::Download => ICON_DOWNLOAD,
+        RailIcon::Pause => ICON_PAUSE,
+        RailIcon::Play => ICON_PLAY_ARROW,
+        RailIcon::Retry => ICON_REFRESH,
+        RailIcon::FolderOpen => ICON_FOLDER_OPEN,
         RailIcon::Check => ICON_CHECK,
         RailIcon::Delete => ICON_DELETE,
         RailIcon::Star => ICON_STAR,
@@ -4095,6 +4460,12 @@ pub fn command_palette_items(
             subtitle: "Theme, search, privacy, and performance".to_string(),
             action: CommandAction::OpenSettings,
         });
+        items.push(CommandPaletteItem {
+            icon: "⇩",
+            label: "Open Downloads".to_string(),
+            subtitle: "Active and completed downloads".to_string(),
+            action: CommandAction::OpenDownloads,
+        });
         items.extend(tabs.iter().take(12).map(tab_item));
         return items;
     }
@@ -4164,6 +4535,15 @@ pub fn command_palette_items(
         });
     }
 
+    if needle.contains("download") {
+        items.push(CommandPaletteItem {
+            icon: "⇩",
+            label: "Open Downloads".to_string(),
+            subtitle: "Active and completed downloads".to_string(),
+            action: CommandAction::OpenDownloads,
+        });
+    }
+
     if needle.contains("pin") {
         if let Some(item) = pin_item() {
             items.push(item);
@@ -4196,6 +4576,7 @@ fn apply_command_item(
             }
         }
         CommandAction::OpenSettings => state.open_settings(),
+        CommandAction::OpenDownloads => state.open_downloads(),
     }
     state.close_command_palette();
 }
@@ -4267,14 +4648,14 @@ mod tests {
 
     use super::{
         advance_command_selection, apply_command_item, clamp_command_selection,
-        command_palette_click_outside, command_palette_items, effective_theme,
-        focus_request_after_render, loading_spinner_angle, loading_spinner_point,
-        page_tooltip_anchor, palette_row_fill, preferred_surface_format, rail_menu_anchor,
-        rail_menu_click_outside, rail_menu_items, rail_menu_metrics, rail_menu_ui_action,
-        rail_status_icon_size, rail_tooltip_enabled, rail_tooltip_metrics, resolve_omnibox,
-        resolve_omnibox_with_search, tab_close_center, tab_status_center, truncate_title,
-        workspace_form_actions, ChromePalette, ChromeState, ChromeTheme, CommandAction,
-        RailMenuAction, SettingsTab, TabDisplayState, TabInfo, WorkspaceInfo,
+        command_palette_click_outside, command_palette_items, download_state_label,
+        effective_theme, focus_request_after_render, format_download_bytes, loading_spinner_angle,
+        loading_spinner_point, page_tooltip_anchor, palette_row_fill, preferred_surface_format,
+        rail_menu_anchor, rail_menu_click_outside, rail_menu_items, rail_menu_metrics,
+        rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled, rail_tooltip_metrics,
+        resolve_omnibox, resolve_omnibox_with_search, tab_close_center, tab_status_center,
+        truncate_title, workspace_form_actions, ChromePalette, ChromeState, ChromeTheme,
+        CommandAction, RailMenuAction, SettingsTab, TabDisplayState, TabInfo, WorkspaceInfo,
         RAIL_STATUS_BADGE_HEIGHT, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED,
         RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED,
         TOOLTIP_WIDTH,
@@ -4283,7 +4664,7 @@ mod tests {
         BrowserPreferences, SearchEngine, ThemePreference, WorkspaceColor, WorkspaceIcon,
         DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX, RAIL_WIDTH_COLLAPSED,
     };
-    use crate::events::UiAction;
+    use crate::events::{DownloadState, UiAction};
 
     fn tab(id: u64, title: &str, url: &str) -> TabInfo {
         TabInfo {
@@ -4651,7 +5032,30 @@ mod tests {
         assert_eq!(items[2].action, CommandAction::HibernateAll);
         assert_eq!(items[3].action, CommandAction::ToggleRail);
         assert_eq!(items[4].action, CommandAction::OpenSettings);
-        assert_eq!(items[5].action, CommandAction::SelectTab(1));
+        assert_eq!(items[5].action, CommandAction::OpenDownloads);
+        assert_eq!(items[6].action, CommandAction::SelectTab(1));
+    }
+
+    #[test]
+    fn palette_finds_the_downloads_page() {
+        let items = command_palette_items("download", &[], None, &BrowserPreferences::default());
+        assert!(items
+            .iter()
+            .any(|item| item.action == CommandAction::OpenDownloads));
+    }
+
+    #[test]
+    fn download_labels_and_sizes_are_native_readable() {
+        assert_eq!(
+            download_state_label(DownloadState::InProgress),
+            "Downloading"
+        );
+        assert_eq!(download_state_label(DownloadState::Completed), "Completed");
+        assert_eq!(format_download_bytes(0), "0 B");
+        assert_eq!(format_download_bytes(-5), "0 B");
+        assert_eq!(format_download_bytes(512), "512 B");
+        assert_eq!(format_download_bytes(2048), "2.0 KB");
+        assert_eq!(format_download_bytes(3 * 1024 * 1024), "3.0 MB");
     }
 
     #[test]

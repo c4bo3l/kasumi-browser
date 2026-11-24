@@ -22,7 +22,7 @@ use config::{rail_width, BrowserPreferences, SHUTDOWN_MAX_WAIT_TICKS};
 use events::{BrowserShortcut, UiAction};
 use storage::db::{StorageHandle, StorageManager};
 use ui::chrome::{
-    ChromeOverlayRenderer, ChromeRenderer, ChromeState, ChromeTheme, TooltipRenderer,
+    ChromeOverlayRenderer, ChromeRenderer, ChromeState, ChromeTheme, SettingsTab, TooltipRenderer,
 };
 use ui::platform_view::ContentRect;
 use winit::application::ApplicationHandler;
@@ -369,6 +369,7 @@ mod native_shortcuts {
             't' => Some(BrowserShortcut::NewTab),
             'w' if !shift => Some(BrowserShortcut::CloseTab),
             'l' | 'k' if !shift => Some(BrowserShortcut::OpenCommandPalette),
+            'j' if !shift => Some(BrowserShortcut::OpenDownloads),
             ',' | '.' if !shift => Some(BrowserShortcut::OpenSettings),
             'q' if !shift => Some(BrowserShortcut::Quit),
             'z' if !shift => Some(BrowserShortcut::ReopenClosedTab),
@@ -419,6 +420,10 @@ fn setup_mac_application() {
         send_menu_shortcut(BrowserShortcut::OpenSettings);
     }
 
+    extern "C" fn menu_open_downloads(_this: *mut c_void, _cmd: *mut c_void) {
+        send_menu_shortcut(BrowserShortcut::OpenDownloads);
+    }
+
     extern "C" fn menu_quit(_this: *mut c_void, _cmd: *mut c_void) {
         send_menu_shortcut(BrowserShortcut::Quit);
     }
@@ -455,6 +460,7 @@ fn setup_mac_application() {
             register_action("kasumiNewTab:", menu_new_tab);
             register_action("kasumiCloseTab:", menu_close_tab);
             register_action("kasumiOpenSettings:", menu_open_settings);
+            register_action("kasumiOpenDownloads:", menu_open_downloads);
             register_action("kasumiQuitApp:", menu_quit);
 
             let proto_name = CString::new("CrAppControlProtocol").unwrap();
@@ -494,7 +500,7 @@ fn install_macos_main_menu() {
     let app_menu = NSMenu::new(mtm);
     let app_version = NSMenuItem::new(mtm);
     unsafe {
-        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.6.0"));
+        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.7.0"));
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
@@ -530,6 +536,7 @@ fn install_macos_main_menu() {
     add_item("New Tab", objc2::sel!(kasumiNewTab:), "t");
     add_item("Close Tab", objc2::sel!(kasumiCloseTab:), "w");
     file_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add_item("Downloads…", objc2::sel!(kasumiOpenDownloads:), "j");
     add_item("Settings…", objc2::sel!(kasumiOpenSettings:), ",");
 
     app.setMainMenu(Some(&main_menu));
@@ -883,6 +890,9 @@ impl KasumiBrowserHandler {
             BrowserShortcut::OpenSettings => {
                 self.chrome_state.open_settings();
             }
+            BrowserShortcut::OpenDownloads => {
+                self.chrome_state.open_settings_tab(SettingsTab::Downloads);
+            }
             BrowserShortcut::Quit => self.request_shutdown(),
         }
     }
@@ -939,6 +949,29 @@ impl KasumiBrowserHandler {
             if let UiAction::ApplyPreferences(preferences) = &action {
                 self.apply_preferences(preferences.clone());
             }
+            if let UiAction::OpenDownloads = &action {
+                self.chrome_state.open_settings_tab(SettingsTab::Downloads);
+            }
+            if let UiAction::OpenDownloadFile { download_id } = &action {
+                let path = self
+                    .tab_manager
+                    .as_ref()
+                    .and_then(|tm| tm.download_snapshot(*download_id))
+                    .map(|download| download.full_path);
+                if let Some(path) = path {
+                    open_download_path(&path, false);
+                }
+            }
+            if let UiAction::RevealDownload { download_id } = &action {
+                let path = self
+                    .tab_manager
+                    .as_ref()
+                    .and_then(|tm| tm.download_snapshot(*download_id))
+                    .map(|download| download.full_path);
+                if let Some(path) = path {
+                    open_download_path(&path, true);
+                }
+            }
             if let Some(tm) = self.tab_manager.as_mut() {
                 tm.handle_ui_action(action);
             }
@@ -992,6 +1025,53 @@ fn is_quit_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
         && !modifiers.alt_key()
         && !modifiers.shift_key()
         && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
+}
+
+/// Launch the OS handler for a finished download. This runs on the winit
+/// thread only; CEF callbacks merely send the path in a `BrowserEvent`.
+fn open_download_path(path: &str, reveal: bool) {
+    use std::process::Command;
+
+    if path.is_empty() {
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    let result = if reveal {
+        Command::new("open").arg("-R").arg(path).spawn()
+    } else {
+        Command::new("open").arg(path).spawn()
+    };
+
+    #[cfg(windows)]
+    let result = if reveal {
+        Command::new("explorer")
+            .arg(format!("/select,{path}"))
+            .spawn()
+    } else {
+        Command::new("cmd")
+            .arg("/C")
+            .arg("start")
+            .arg("")
+            .arg(path)
+            .spawn()
+    };
+
+    #[cfg(target_os = "linux")]
+    let result = if reveal {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        Command::new("xdg-open").arg(parent).spawn()
+    } else {
+        Command::new("xdg-open").arg(path).spawn()
+    };
+
+    match result {
+        Ok(_) => {}
+        Err(error) => tracing::warn!("Could not open download {path}: {error}"),
+    }
 }
 
 impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
@@ -1095,6 +1175,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
         let restored_tabs = StorageManager::load_session(&db_path).unwrap_or_default();
         let restored_workspaces = StorageManager::load_workspaces(&db_path).unwrap_or_default();
         let restored_bookmarks = StorageManager::load_bookmarks(&db_path).unwrap_or_default();
+        let restored_downloads = StorageManager::load_downloads(&db_path).unwrap_or_default();
 
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut tab_manager = TabManager::new(
@@ -1107,6 +1188,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             restored_workspaces,
             restored_bookmarks,
         );
+        tab_manager.seed_downloads(restored_downloads);
         tab_manager.restore_session(restored_tabs);
 
         self.window = Some(Arc::clone(&window));
@@ -1305,6 +1387,9 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                             "," | "<" | "." | ">" => {
                                 self.handle_browser_shortcut(BrowserShortcut::OpenSettings);
                             }
+                            "j" | "J" => {
+                                self.handle_browser_shortcut(BrowserShortcut::OpenDownloads);
+                            }
                             "t" | "T" => {
                                 self.handle_browser_shortcut(BrowserShortcut::NewTab);
                             }
@@ -1420,6 +1505,9 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             }
             if tm.consume_settings_request() {
                 self.chrome_state.open_settings();
+            }
+            if tm.consume_downloads_request() {
+                self.chrome_state.open_settings_tab(SettingsTab::Downloads);
             }
             if !self.shutdown_requested {
                 tm.tick();
@@ -1859,6 +1947,10 @@ mod tests {
         assert_eq!(
             shortcut_from_parts('l', 0x25, cmd),
             Some(BrowserShortcut::OpenCommandPalette)
+        );
+        assert_eq!(
+            shortcut_from_parts('j', 0x26, cmd),
+            Some(BrowserShortcut::OpenDownloads)
         );
         assert_eq!(
             shortcut_from_parts('t', 0x11, cmd | shift),

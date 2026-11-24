@@ -43,6 +43,23 @@ CREATE TABLE IF NOT EXISTS session_tabs (
     is_pinned INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS downloads (
+    download_id INTEGER PRIMARY KEY,
+    tab_id INTEGER NOT NULL DEFAULT 0,
+    url TEXT NOT NULL,
+    suggested_name TEXT NOT NULL DEFAULT '',
+    full_path TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'in_progress',
+    received_bytes INTEGER NOT NULL DEFAULT 0,
+    total_bytes INTEGER NOT NULL DEFAULT 0,
+    percent_complete INTEGER NOT NULL DEFAULT 0,
+    current_speed INTEGER NOT NULL DEFAULT 0,
+    started_at INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_downloads_state_updated
+    ON downloads(state, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS preferences (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL

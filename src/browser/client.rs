@@ -1,6 +1,7 @@
-use crate::events::{BrowserEvent, BrowserShortcut};
+use crate::events::{BrowserEvent, BrowserShortcut, DownloadInfo, DownloadState};
 use cef::*;
 use crossbeam_channel::Sender;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 wrap_life_span_handler! {
     pub struct TabLifeSpanHandler {
@@ -191,6 +192,7 @@ const ALT_MODIFIER_FLAG: u32 = 8;
 const REPEAT_EVENT_FLAG: u32 = 8_192;
 
 /// Virtual key codes, using CEF's platform-independent Windows key codes.
+const VK_J: i32 = 0x4A;
 const VK_K: i32 = 0x4B;
 const VK_L: i32 = 0x4C;
 const VK_T: i32 = 0x54;
@@ -254,6 +256,7 @@ pub(crate) fn browser_shortcut(
         VK_T => Some(BrowserShortcut::NewTab),
         VK_W if !shift => Some(BrowserShortcut::CloseTab),
         VK_L | VK_K if !shift => Some(BrowserShortcut::OpenCommandPalette),
+        VK_J if !shift => Some(BrowserShortcut::OpenDownloads),
         VK_OEM_COMMA | VK_OEM_PERIOD if !shift => Some(BrowserShortcut::OpenSettings),
         VK_Z if !shift => Some(BrowserShortcut::ReopenClosedTab),
         _ => None,
@@ -297,6 +300,7 @@ fn browser_shortcut_from_char(
         c if c == 'L' as u16 || c == 'l' as u16 || c == 'K' as u16 || c == 'k' as u16 => {
             Some(BrowserShortcut::OpenCommandPalette)
         }
+        c if c == 'J' as u16 || c == 'j' as u16 => Some(BrowserShortcut::OpenDownloads),
         c if c == 'Z' as u16 || c == 'z' as u16 => Some(BrowserShortcut::ReopenClosedTab),
         _ => None,
     }
@@ -322,6 +326,137 @@ fn handle_pre_key_event(
         return 1;
     }
     0
+}
+
+/// Convert CEF's Windows-epoch microsecond timestamp into Unix seconds. A
+/// zero/invalid value falls back to the current time so the native list always
+/// has a usable value.
+fn basetime_unix_secs(value: cef::Basetime) -> u64 {
+    const WINDOWS_TO_UNIX_MICROS: i64 = 11_644_473_600_000_000;
+    if value.val <= WINDOWS_TO_UNIX_MICROS {
+        return now_unix_secs();
+    }
+    ((value.val - WINDOWS_TO_UNIX_MICROS) / 1_000_000) as u64
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn userfree_string(value: cef::CefStringUserfree) -> String {
+    CefString::from(&value).to_string()
+}
+
+fn download_state(item: &DownloadItem) -> DownloadState {
+    if item.is_canceled() != 0 {
+        DownloadState::Canceled
+    } else if item.is_interrupted() != 0 {
+        DownloadState::Interrupted
+    } else if item.is_complete() != 0 {
+        DownloadState::Completed
+    } else if item.is_paused() != 0 {
+        DownloadState::Paused
+    } else {
+        DownloadState::InProgress
+    }
+}
+
+/// Snapshot only owned values. CEF forbids retaining the `DownloadItem`
+/// outside its callback, so native chrome never sees the CEF object itself.
+fn snapshot_download(
+    tab_id: u64,
+    item: &DownloadItem,
+    suggested_name: Option<&CefString>,
+) -> DownloadInfo {
+    let name = suggested_name
+        .map(|name| name.to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| userfree_string(item.suggested_file_name()));
+    let full_path = userfree_string(item.full_path());
+    let started_at = basetime_unix_secs(item.start_time());
+    let updated_at = if download_state(item).is_finished() {
+        basetime_unix_secs(item.end_time())
+    } else {
+        now_unix_secs()
+    };
+
+    DownloadInfo {
+        id: item.id(),
+        tab_id,
+        url: userfree_string(item.url()),
+        suggested_name: name,
+        full_path: if full_path.is_empty() {
+            String::new()
+        } else {
+            full_path
+        },
+        received_bytes: item.received_bytes(),
+        total_bytes: item.total_bytes(),
+        percent_complete: item.percent_complete(),
+        current_speed: item.current_speed(),
+        state: download_state(item),
+        started_at,
+        updated_at,
+    }
+}
+
+wrap_download_handler! {
+    pub struct TabDownloadHandler {
+        tab_id: u64,
+        event_sender: Sender<BrowserEvent>,
+    }
+
+    impl DownloadHandler {
+        fn can_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            _url: Option<&CefString>,
+            _request_method: Option<&CefString>,
+        ) -> i32 {
+            // Downloads are accepted into Chromium's configured directory and
+            // presented in Kasumi's native Downloads page. Returning 0 here
+            // would cancel every download before `on_before_download` ran.
+            1
+        }
+
+        fn on_before_download(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            suggested_name: Option<&CefString>,
+            callback: Option<&mut BeforeDownloadCallback>,
+        ) -> i32 {
+            let (Some(item), Some(callback)) = (download_item, callback) else {
+                return 0;
+            };
+            let info = snapshot_download(self.tab_id, item, suggested_name);
+            let _ = self.event_sender.send(BrowserEvent::DownloadStarted(info));
+            // No OS save dialog and no second browser view: the native
+            // Downloads page is the single place where progress is shown.
+            callback.cont(None, 0);
+            1
+        }
+
+        fn on_download_updated(
+            &self,
+            _browser: Option<&mut Browser>,
+            download_item: Option<&mut DownloadItem>,
+            callback: Option<&mut DownloadItemCallback>,
+        ) {
+            let Some(item) = download_item else {
+                return;
+            };
+            let info = snapshot_download(self.tab_id, item, None);
+            let item_callback = callback.map(|callback| (*callback).clone());
+            let _ = self.event_sender.send(BrowserEvent::DownloadUpdated {
+                info,
+                callback: item_callback,
+            });
+        }
+    }
 }
 
 wrap_keyboard_handler! {
@@ -410,6 +545,7 @@ wrap_client! {
         load_handler: LoadHandler,
         display_handler: DisplayHandler,
         request_handler: RequestHandler,
+        download_handler: DownloadHandler,
         keyboard_handler: KeyboardHandler,
         context_menu_handler: ContextMenuHandler,
     }
@@ -426,6 +562,9 @@ wrap_client! {
         }
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(self.request_handler.clone())
+        }
+        fn download_handler(&self) -> Option<DownloadHandler> {
+            Some(self.download_handler.clone())
         }
         fn keyboard_handler(&self) -> Option<KeyboardHandler> {
             Some(self.keyboard_handler.clone())
@@ -447,6 +586,7 @@ pub fn create_tab_client(
     let display_handler = TabDisplayHandler::new(tab_id, event_sender.clone());
     let keyboard_handler = TabKeyboardHandler::new(tab_id, event_sender.clone());
     let context_menu_handler = TabContextMenuHandler::new(tab_id, event_sender.clone());
+    let download_handler = TabDownloadHandler::new(tab_id, event_sender.clone());
     let request_handler = super::adblocker::create_tab_request_handler(
         tab_id,
         event_sender,
@@ -459,6 +599,7 @@ pub fn create_tab_client(
         load_handler.into(),
         display_handler.into(),
         request_handler.into(),
+        download_handler.into(),
         keyboard_handler.into(),
         context_menu_handler.into(),
     )
@@ -545,6 +686,10 @@ mod tests {
             Some(BrowserShortcut::OpenCommandPalette)
         );
         assert_eq!(
+            browser_shortcut(true, 0x4A, 128),
+            Some(BrowserShortcut::OpenDownloads)
+        );
+        assert_eq!(
             browser_shortcut(true, 0x7B, 0),
             Some(BrowserShortcut::OpenDevTools)
         );
@@ -581,6 +726,10 @@ mod tests {
         assert_eq!(
             browser_shortcut_from_char(true, 't' as u16, 128),
             Some(BrowserShortcut::NewTab)
+        );
+        assert_eq!(
+            browser_shortcut_from_char(true, 'j' as u16, 128),
+            Some(BrowserShortcut::OpenDownloads)
         );
         assert_eq!(browser_shortcut_from_char(false, ',' as u16, 128), None);
         assert_eq!(

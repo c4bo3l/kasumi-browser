@@ -4,6 +4,17 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
+## v0.7.0 — Unreleased
+
+### Added
+
+- Native download manager with a WAL-backed history, active progress, speed, file path, pause/resume/cancel, retry, remove, clear-finished, open-file, and show-in-folder controls. Downloads run through CEF's existing browser process and native child views, with no save prompt, OSR view, or second renderer.
+- A native Downloads page inside Settings, opened by `Cmd/Ctrl+J`, the rail button in both modes, the macOS File menu, or the command palette. Stale downloads are marked interrupted after a restart so Retry is always available instead of dead controls.
+- Incognito mode research notes in the README future-development roadmap.
+- Version bumped from `0.6.0` to `0.7.0` across the package, lockfile, canonical spec, bundle metadata, About menu, and docs.
+
+---
+
 ## v0.6.0 — 2026-11-24
 
 ### Added

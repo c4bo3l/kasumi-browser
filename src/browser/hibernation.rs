@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cef::{CefString, ImplBrowser, ImplBrowserHost, ImplFrame};
+use cef::{CefString, ImplBrowser, ImplBrowserHost, ImplDownloadItemCallback, ImplFrame};
 use crossbeam_channel::{Receiver, Sender};
 use sysinfo::{ProcessesToUpdate, System};
 
@@ -24,7 +24,7 @@ use crate::config::{
     RAM_CRITICAL_PRESSURE_THRESHOLD, RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_PRESSURE,
     TAB_WATCHDOG_TICK_INTERVAL,
 };
-use crate::events::{BrowserEvent, BrowserShortcut, UiAction};
+use crate::events::{BrowserEvent, BrowserShortcut, DownloadInfo, DownloadState, UiAction};
 use crate::storage::db::{BookmarkItem, SessionTabSnapshot, StorageHandle};
 use crate::ui::chrome::{
     BookmarkInfo, ChromeState, Favicon, TabDisplayState, TabInfo, WorkspaceInfo,
@@ -304,6 +304,10 @@ pub struct TabManager {
     active_tab_by_workspace: HashMap<u64, u64>,
     /// Globally visible bookmarks, grouped by workspace name in `folder`.
     pub bookmarks: Vec<BookmarkItem>,
+    /// Native download snapshots mirrored from CEF into the Downloads page.
+    downloads: Vec<DownloadInfo>,
+    /// CEF item callbacks retained only on the UI thread for native controls.
+    download_callbacks: HashMap<u32, cef::DownloadItemCallback>,
     next_tab_id: u64,
 
     // Lock-free event channels for CEF callbacks -> UI
@@ -355,6 +359,9 @@ pub struct TabManager {
 
     // Set when CEF forwards Cmd/Ctrl+,; consumed by the winit handler.
     settings_requested: bool,
+
+    // Set when CEF forwards Cmd/Ctrl+J; consumed by the winit handler.
+    downloads_requested: bool,
 
     // Favicon URLs already requested, and URLs seen before the browser exists.
     requested_favicons: HashSet<(u64, String)>,
@@ -410,6 +417,8 @@ impl TabManager {
             active_workspace_id,
             active_tab_by_workspace: HashMap::new(),
             bookmarks,
+            downloads: Vec::new(),
+            download_callbacks: HashMap::new(),
             next_tab_id: 1,
             event_sender,
             event_receiver,
@@ -432,6 +441,7 @@ impl TabManager {
             pending_navigation_checks: HashMap::new(),
             command_palette_requested: false,
             settings_requested: false,
+            downloads_requested: false,
             requested_favicons: HashSet::new(),
             pending_favicon_urls: HashMap::new(),
             resolved_favicons: HashSet::new(),
@@ -448,6 +458,71 @@ impl TabManager {
             .store(preferences.adblock_enabled, Ordering::Release);
         self.idle_timeout = preferences.idle_timeout();
         self.home_url = preferences.home_url().to_string();
+    }
+
+    /// Replace startup metadata from SQLite. Active CEF callbacks never survive
+    /// a restart, so restored entries are history only until retried.
+    pub fn seed_downloads(&mut self, mut downloads: Vec<DownloadInfo>) {
+        for download in &mut downloads {
+            if !download.is_finished() {
+                download.state = DownloadState::Interrupted;
+                download.current_speed = 0;
+            }
+        }
+        downloads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
+        self.downloads = downloads;
+    }
+
+    /// Copy a download snapshot for shell actions that must not borrow
+    /// `TabManager` across a filesystem or navigation call.
+    pub fn download_snapshot(&self, download_id: u32) -> Option<DownloadInfo> {
+        self.downloads
+            .iter()
+            .find(|download| download.id == download_id)
+            .cloned()
+    }
+
+    fn record_download(&mut self, info: DownloadInfo, callback: Option<cef::DownloadItemCallback>) {
+        if let Some(existing) = self
+            .downloads
+            .iter_mut()
+            .find(|download| download.id == info.id)
+        {
+            *existing = info.clone();
+        } else {
+            self.downloads.push(info.clone());
+        }
+        self.downloads
+            .sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
+
+        if let Some(callback) = callback {
+            if info.is_finished() {
+                self.download_callbacks.remove(&info.id);
+            } else {
+                self.download_callbacks.insert(info.id, callback);
+            }
+        } else if info.is_finished() {
+            self.download_callbacks.remove(&info.id);
+        }
+
+        if let Some(ref storage) = self.storage {
+            storage.save_download(info);
+        }
+    }
+
+    fn set_download_state(&mut self, download_id: u32, state: DownloadState) {
+        let Some(info) = self
+            .downloads
+            .iter_mut()
+            .find(|download| download.id == download_id)
+        else {
+            return;
+        };
+        info.state = state;
+        let info = info.clone();
+        if let Some(ref storage) = self.storage {
+            storage.save_download(info);
+        }
     }
 
     /// Restore previous session tabs (instant startup: only the active tab of
@@ -1467,8 +1542,17 @@ impl TabManager {
         std::mem::take(&mut self.settings_requested)
     }
 
+    /// Consume a Cmd/Ctrl+J request forwarded from the CEF web view.
+    pub fn consume_downloads_request(&mut self) -> bool {
+        std::mem::take(&mut self.downloads_requested)
+    }
+
     fn handle_browser_event(&mut self, event: BrowserEvent) {
         match event {
+            BrowserEvent::DownloadStarted(info) => self.record_download(info, None),
+            BrowserEvent::DownloadUpdated { info, callback } => {
+                self.record_download(info, callback);
+            }
             BrowserEvent::BrowserCreated { tab_id, browser } => {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.browser = Some(browser);
@@ -1599,6 +1683,11 @@ impl TabManager {
                 }
                 BrowserShortcut::OpenSettings => {
                     self.settings_requested = true;
+                }
+                BrowserShortcut::OpenDownloads => {
+                    // The shell owns the shared Settings overlay. The flag is
+                    // set here so all shortcut sources converge on one path.
+                    self.downloads_requested = true;
                 }
                 BrowserShortcut::Quit => {
                     // The shell exits the event loop from its own shortcut
@@ -1839,6 +1928,60 @@ impl TabManager {
             UiAction::OpenDevTools { tab_id } => {
                 self.show_dev_tools(tab_id);
             }
+            UiAction::OpenDownloads => {
+                // The shell opens the shared Settings overlay; TabManager only
+                // owns the download runtime state.
+            }
+            UiAction::PauseDownload { download_id } => {
+                if let Some(callback) = self.download_callbacks.get(&download_id) {
+                    callback.pause();
+                }
+                self.set_download_state(download_id, DownloadState::Paused);
+            }
+            UiAction::ResumeDownload { download_id } => {
+                if let Some(callback) = self.download_callbacks.get(&download_id) {
+                    callback.resume();
+                }
+                self.set_download_state(download_id, DownloadState::InProgress);
+            }
+            UiAction::CancelDownload { download_id } => {
+                if let Some(callback) = self.download_callbacks.get(&download_id) {
+                    callback.cancel();
+                }
+                self.download_callbacks.remove(&download_id);
+                self.set_download_state(download_id, DownloadState::Canceled);
+            }
+            UiAction::RemoveDownload { download_id } => {
+                self.download_callbacks.remove(&download_id);
+                self.downloads.retain(|download| download.id != download_id);
+                if let Some(ref storage) = self.storage {
+                    storage.remove_download(download_id);
+                }
+            }
+            UiAction::ClearCompletedDownloads => {
+                let finished: Vec<u32> = self
+                    .downloads
+                    .iter()
+                    .filter(|download| download.is_finished())
+                    .map(|download| download.id)
+                    .collect();
+                for id in finished {
+                    self.download_callbacks.remove(&id);
+                }
+                self.downloads.retain(|download| !download.is_finished());
+                if let Some(ref storage) = self.storage {
+                    storage.clear_completed_downloads();
+                }
+            }
+            UiAction::RetryDownload { download_id } => {
+                if let Some(info) = self.download_snapshot(download_id) {
+                    self.create_tab(Some(info.url), true);
+                }
+            }
+            UiAction::OpenDownloadFile { .. } | UiAction::RevealDownload { .. } => {
+                // Handled by the shell, which can launch the OS file manager
+                // without blocking CEF callback threads.
+            }
             UiAction::SwitchWorkspace { workspace_id } => {
                 self.switch_workspace(workspace_id);
             }
@@ -1979,6 +2122,7 @@ impl TabManager {
             })
             .collect();
         state.active_workspace_id = self.active_workspace_id;
+        state.downloads = self.downloads.clone();
         state.bookmarks = self
             .bookmarks
             .iter()
