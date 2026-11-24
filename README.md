@@ -162,8 +162,23 @@ kasumi-browser/
 
 ### Development Run
 
+The easiest way to launch Kasumi in dev mode is the `dev` script (or `make dev`), which is the Rust equivalent of `npm run dev`:
+
 ```bash
-cargo run
+./scripts/dev.sh            # build + run with RUST_LOG=info
+make dev                    # same thing, via Makefile
+./scripts/dev.sh --clean    # clear the CEF cache first
+./scripts/dev.sh --release  # optimized build + run
+./scripts/dev.sh --watch    # auto-restart on source changes (install cargo-watch first)
+./scripts/dev.sh --log=debug  # override the log level
+```
+
+On Windows, use `scripts\dev.bat` instead.
+
+You can also run the raw Cargo command directly:
+
+```bash
+cargo run --bin kasumi-browser
 ```
 
 ### Release Build
