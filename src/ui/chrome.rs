@@ -15,8 +15,9 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use egui::{
     pos2, vec2, Align, Align2, Color32, FontFamily, FontId, Frame, Layout, Order, Response,
@@ -29,7 +30,10 @@ use crate::config::{
     WorkspaceIcon, WorkspaceStartupBehavior, COMMAND_PALETTE_TOP_OFFSET, COMMAND_PALETTE_WIDTH,
     DEFAULT_SEARCH_URL_PREFIX, MAX_IDLE_TIMEOUT_MINUTES, MIN_IDLE_TIMEOUT_MINUTES,
 };
-use crate::events::{DownloadEngine, DownloadInfo, DownloadState, UiAction};
+use crate::events::{
+    DownloadEngine, DownloadInfo, DownloadNotification, DownloadNotificationKind, DownloadState,
+    UiAction,
+};
 
 /// Light or dark chrome appearance. The OS theme decides the default, and
 /// `ChromeTheme::from_winit` maps live `ThemeChanged` events into this enum.
@@ -629,6 +633,7 @@ pub enum CommandAction {
     OpenDevTools,
     OpenSettings,
     OpenDownloads,
+    BookmarkActiveTab,
 }
 
 /// One row in the floating command palette.
@@ -638,6 +643,24 @@ pub struct CommandPaletteItem {
     pub label: String,
     pub subtitle: String,
     pub action: CommandAction,
+}
+
+/// Visual tone of a transient native notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    Success,
+    Error,
+}
+
+/// A short-lived notification painted in the transparent overlay above the CEF
+/// page. It never captures input and disappears automatically.
+#[derive(Debug, Clone)]
+pub struct ChromeToast {
+    pub kind: ToastKind,
+    pub title: String,
+    pub message: String,
+    pub created_at: Instant,
+    pub duration: Duration,
 }
 
 /// A rail tooltip to draw in a transparent overlay above the CEF page.
@@ -706,6 +729,18 @@ pub struct ChromeState {
     pub workspaces: Vec<WorkspaceInfo>,
     pub active_workspace_id: u64,
     pub bookmarks: Vec<BookmarkInfo>,
+    /// Native bookmark manager search and single-row editor drafts.
+    pub bookmark_search_query: String,
+    pub selected_bookmark_key: Option<(u64, String)>,
+    pub bookmark_title_draft: String,
+    pub bookmark_url_draft: String,
+    pub bookmark_workspace_id_draft: u64,
+    pub bookmark_folder_draft: String,
+    /// Transient notification shown above the CEF child view.
+    pub toast: Option<ChromeToast>,
+    /// Notifications held until no modal overlay owns the shared surface. The
+    /// display timer starts only when a toast becomes visible.
+    pub pending_toasts: VecDeque<ChromeToast>,
     /// WAL-backed download snapshots mirrored from the CEF download handler.
     pub downloads: Vec<DownloadInfo>,
     /// Text mirrored from the active tab; the command palette edits a copy.
@@ -781,6 +816,14 @@ impl Default for ChromeState {
             workspaces: Vec::new(),
             active_workspace_id: 1,
             bookmarks: Vec::new(),
+            bookmark_search_query: String::new(),
+            selected_bookmark_key: None,
+            bookmark_title_draft: String::new(),
+            bookmark_url_draft: String::new(),
+            bookmark_workspace_id_draft: 1,
+            bookmark_folder_draft: String::new(),
+            toast: None,
+            pending_toasts: VecDeque::new(),
             downloads: Vec::new(),
             omnibox_text: String::new(),
             omnibox_focused: false,
@@ -820,6 +863,99 @@ impl Default for ChromeState {
 }
 
 impl ChromeState {
+    /// Show a short native notification above the page. Notifications raised
+    /// while a modal owns the overlay are queued instead of expiring unseen.
+    pub fn show_toast(
+        &mut self,
+        kind: ToastKind,
+        title: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        let toast = ChromeToast {
+            kind,
+            title: title.into(),
+            message: message.into(),
+            created_at: Instant::now(),
+            duration: Duration::from_secs(4),
+        };
+        if self.has_modal_overlay() || self.toast.is_some() {
+            const MAX_PENDING_TOASTS: usize = 4;
+            self.pending_toasts.push_back(toast);
+            while self.pending_toasts.len() > MAX_PENDING_TOASTS {
+                self.pending_toasts.pop_front();
+            }
+            return;
+        }
+        self.toast = Some(toast);
+    }
+
+    /// Promote the oldest queued notification once the overlay is free.
+    pub fn promote_pending_toast(&mut self) {
+        if self.toast.is_some() || self.has_modal_overlay() {
+            return;
+        }
+        if let Some(mut toast) = self.pending_toasts.pop_front() {
+            // Start the visibility timer now, not when the event arrived.
+            toast.created_at = Instant::now();
+            self.toast = Some(toast);
+        }
+    }
+
+    /// Surface a terminal download outcome as a native notification.
+    pub fn show_download_notification(&mut self, notification: DownloadNotification) {
+        let name = if notification.file_name.trim().is_empty() {
+            "download".to_string()
+        } else {
+            notification.file_name
+        };
+        match notification.kind {
+            DownloadNotificationKind::Completed => self.show_toast(
+                ToastKind::Success,
+                "Download complete",
+                format!("{name} is ready"),
+            ),
+            DownloadNotificationKind::Failed => self.show_toast(
+                ToastKind::Error,
+                "Download failed",
+                format!("Could not finish {name}"),
+            ),
+        }
+    }
+
+    /// Drop a toast once its display window has elapsed.
+    pub fn expire_toast(&mut self) {
+        let expired = self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.created_at.elapsed() >= toast.duration);
+        if expired {
+            self.toast = None;
+            self.promote_pending_toast();
+        }
+    }
+
+    /// True when the shared overlay must capture pointer/keyboard input.
+    pub fn has_modal_overlay(&self) -> bool {
+        self.command_palette_open
+            || self.menu.is_some()
+            || self.settings_open
+            || self.downloads_open
+    }
+
+    /// True when only a click-through notification is visible.
+    pub fn is_toast_only(&self) -> bool {
+        self.toast.is_some() && !self.has_modal_overlay()
+    }
+
+    fn reset_bookmark_editor(&mut self) {
+        self.bookmark_search_query.clear();
+        self.selected_bookmark_key = None;
+        self.bookmark_title_draft.clear();
+        self.bookmark_url_draft.clear();
+        self.bookmark_workspace_id_draft = self.active_workspace_id;
+        self.bookmark_folder_draft.clear();
+    }
+
     /// Open the command palette seeded with the active tab's current address.
     pub fn open_command_palette(&mut self) {
         if !self.command_palette_open {
@@ -926,6 +1062,7 @@ impl ChromeState {
         self.workspace_create_mode = false;
         self.reset_workspace_create_draft();
         self.sync_workspace_draft();
+        self.reset_bookmark_editor();
         self.settings_open = true;
     }
 
@@ -964,6 +1101,7 @@ impl ChromeState {
         self.settings_draft = self.preferences.clone();
         self.workspace_create_mode = false;
         self.reset_workspace_create_draft();
+        self.reset_bookmark_editor();
     }
 
     /// Close whichever shared overlay is currently visible.
@@ -980,10 +1118,7 @@ impl ChromeState {
     }
 
     pub fn has_overlay(&self) -> bool {
-        self.command_palette_open
-            || self.menu.is_some()
-            || self.settings_open
-            || self.downloads_open
+        self.has_modal_overlay() || self.toast.is_some()
     }
 
     /// Update the OS appearance and recompute the effective chrome theme.
@@ -1516,11 +1651,11 @@ impl ChromeRenderer {
                     paint_rail_icon(ui, icon_rect, RailIcon::Globe, palette.rail_accent);
                     ui.add_space(4.0);
 
-                    // The 22 px copy slot includes its 4 px leading gap. The
-                    // scroll area keeps TextEdit's hidden-text allocation from
-                    // expanding the frame, even for very long URLs.
-                    let copy_slot_width = 22.0;
-                    let input_width = (ui.available_width() - copy_slot_width).max(24.0);
+                    // Each 22 px action slot includes its 4 px trailing gap.
+                    // The scroll area keeps TextEdit's hidden-text allocation
+                    // from expanding the frame, even for very long URLs.
+                    let action_slot_width = 22.0;
+                    let input_width = (ui.available_width() - action_slot_width * 2.0).max(24.0);
                     let url_input = egui::ScrollArea::horizontal()
                         .id_salt("kasumi_rail_url_scroll")
                         .max_width(input_width)
@@ -1556,6 +1691,43 @@ impl ChromeRenderer {
                         }
                     }
 
+                    let (bookmark_rect, bookmark_response) =
+                        ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+                    // Highlight the star from the committed tab URL, not the
+                    // editable omnibox draft: AddBookmark saves the tab.
+                    let active_tab_url = state
+                        .tabs
+                        .iter()
+                        .find(|tab| Some(tab.id) == state.active_tab_id)
+                        .map(|tab| tab.url.as_str());
+                    let is_bookmarked = active_tab_url.is_some_and(|url| {
+                        state.bookmarks.iter().any(|bookmark| {
+                            bookmark.workspace_id == state.active_workspace_id
+                                && bookmark.url == url
+                        })
+                    });
+                    paint_rail_icon(
+                        ui,
+                        egui::Rect::from_center_size(bookmark_rect.center(), vec2(12.0, 12.0)),
+                        RailIcon::Star,
+                        if is_bookmarked {
+                            palette.rail_accent
+                        } else {
+                            palette.text
+                        },
+                    );
+                    if bookmark_response.clicked() {
+                        if let Some(tab_id) = state.active_tab_id {
+                            actions.push(UiAction::AddBookmark { tab_id });
+                            state.show_toast(
+                                ToastKind::Success,
+                                "Bookmark saved",
+                                "Added to this workspace",
+                            );
+                        }
+                    }
+                    bookmark_response.on_hover_text("Bookmark this page");
+
                     let (copy_rect, copy_response) =
                         ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
                     paint_rail_icon(
@@ -1566,6 +1738,7 @@ impl ChromeRenderer {
                     );
                     if copy_response.clicked() {
                         ctx.copy_text(state.omnibox_text.clone());
+                        state.show_toast(ToastKind::Success, "Copied", "Link copied to clipboard");
                     }
                     copy_response.on_hover_text("Copy URL");
                 });
@@ -2833,6 +3006,67 @@ impl ChromeRenderer {
         }
     }
 
+    /// Paint a transient notification in the click-through overlay. The card is
+    /// anchored to the top-right of the browser content so it never covers the
+    /// native rail and remains visible above the CEF child view.
+    pub fn build_toast(ctx: &egui::Context, state: &ChromeState) {
+        let Some(toast) = state.toast.as_ref() else {
+            return;
+        };
+        let palette = state.palette();
+        let screen = ctx.screen_rect();
+        let width = 330.0_f32.min((screen.width() - 32.0).max(220.0));
+        let accent = match toast.kind {
+            ToastKind::Success => palette.shield_ok,
+            ToastKind::Error => palette.close_icon,
+        };
+        let icon = match toast.kind {
+            ToastKind::Success => RailIcon::Check,
+            ToastKind::Error => RailIcon::Close,
+        };
+        ctx.request_repaint_after(toast.duration.saturating_sub(toast.created_at.elapsed()));
+
+        egui::Area::new(egui::Id::new("kasumi_native_toast"))
+            .order(Order::Foreground)
+            .anchor(Align2::RIGHT_TOP, vec2(-16.0, 16.0))
+            .fixed_pos(pos2(screen.right() - 16.0, screen.top() + 16.0))
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                Frame::none()
+                    .fill(palette.palette_bg)
+                    .stroke(Stroke::new(1.0_f32, accent))
+                    .rounding(Rounding::same(10.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (icon_rect, _) =
+                                ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                            paint_rail_icon(
+                                ui,
+                                egui::Rect::from_center_size(icon_rect.center(), vec2(14.0, 14.0)),
+                                icon,
+                                accent,
+                            );
+                            ui.add_space(6.0);
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(&toast.title)
+                                        .size(12.0)
+                                        .strong()
+                                        .color(palette.text_strong),
+                                );
+                                ui.label(
+                                    RichText::new(&toast.message)
+                                        .size(10.0)
+                                        .color(palette.palette_subtext),
+                                );
+                            });
+                        });
+                    });
+            });
+    }
+
     /// Draw the native Settings card in the shared transparent overlay.
     ///
     /// Controls commit immediately to `ChromeState` and emit one
@@ -2856,6 +3090,25 @@ impl ChromeRenderer {
         let mut settings_tab = state.settings_tab;
         let active_tab_id = state.active_tab_id;
         let bookmarks = state.bookmarks.clone();
+        let mut bookmark_search = state.bookmark_search_query.clone();
+        let mut selected_bookmark_key = state.selected_bookmark_key.clone();
+        let mut bookmark_title = state.bookmark_title_draft.clone();
+        let mut bookmark_url = state.bookmark_url_draft.clone();
+        let mut bookmark_workspace_id = state.bookmark_workspace_id_draft;
+        let mut bookmark_folder = state.bookmark_folder_draft.clone();
+        if let Some((workspace_id, url)) = &selected_bookmark_key {
+            let still_present = bookmarks
+                .iter()
+                .any(|bookmark| bookmark.workspace_id == *workspace_id && bookmark.url == *url);
+            if !still_present {
+                selected_bookmark_key = None;
+                bookmark_title.clear();
+                bookmark_url.clear();
+                bookmark_workspace_id = state.active_workspace_id;
+                bookmark_folder.clear();
+            }
+        }
+        let mut bookmark_actions: Vec<UiAction> = Vec::new();
         let mut workspace_actions: Vec<UiAction> = Vec::new();
         let mut selected_workspace_id = state
             .selected_workspace_id
@@ -3442,14 +3695,42 @@ impl ChromeRenderer {
                                     .size(10.0)
                                     .color(palette.palette_hint),
                                 );
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Search")
+                                            .size(10.0)
+                                            .color(palette.section_label),
+                                    );
+                                    ui.add(
+                                        TextEdit::singleline(&mut bookmark_search)
+                                            .id(egui::Id::new("kasumi_bookmark_search"))
+                                            .hint_text("Title, URL, or folder")
+                                            .desired_width((ui.available_width() - 12.0).max(80.0)),
+                                    );
+                                });
+                                ui.add_space(6.0);
+
+                                let filtered = filter_bookmarks(&bookmarks, &bookmark_search);
+                                if filtered.is_empty() {
+                                    ui.label(
+                                        RichText::new(if bookmarks.is_empty() {
+                                            "No bookmarks yet. Bookmark the current tab to get started."
+                                        } else {
+                                            "No bookmarks match that search."
+                                        })
+                                        .size(10.0)
+                                        .color(palette.palette_hint),
+                                    );
+                                }
 
                                 let mut folders: BTreeMap<String, Vec<BookmarkInfo>> =
                                     BTreeMap::new();
-                                for bookmark in &bookmarks {
+                                for bookmark in filtered {
                                     folders
                                         .entry(bookmark.folder.clone())
                                         .or_default()
-                                        .push(bookmark.clone());
+                                        .push(bookmark);
                                 }
                                 for (folder, items) in folders {
                                     let heading = format!("{}  ·  {}", folder, items.len());
@@ -3458,18 +3739,20 @@ impl ChromeRenderer {
                                         .default_open(true)
                                         .show(ui, |ui| {
                                             for bookmark in items {
+                                                let key =
+                                                    (bookmark.workspace_id, bookmark.url.clone());
                                                 ui.horizontal(|ui| {
                                                     ui.label(
                                                         RichText::new(truncate_title(
                                                             &bookmark.title,
-                                                            26,
+                                                            22,
                                                         ))
                                                         .size(11.0),
                                                     );
                                                     ui.label(
                                                         RichText::new(truncate_title(
                                                             &bookmark.url,
-                                                            38,
+                                                            30,
                                                         ))
                                                         .size(9.0)
                                                         .color(palette.palette_hint),
@@ -3477,27 +3760,212 @@ impl ChromeRenderer {
                                                     ui.with_layout(
                                                         Layout::right_to_left(Align::Center),
                                                         |ui| {
-                                                            if material_button(
+                                                            if compact_icon_button(
                                                                 ui,
                                                                 RailIcon::OpenInNew,
-                                                                "Open",
-                                                                MaterialButtonStyle::Outlined,
+                                                                "Open bookmark",
                                                                 palette,
                                                                 true,
                                                             )
                                                             .clicked()
                                                             {
-                                                                workspace_actions.push(
+                                                                bookmark_actions.push(
                                                                     UiAction::OpenBookmark {
                                                                         url: bookmark.url.clone(),
                                                                     },
                                                                 );
+                                                            }
+                                                            if compact_icon_button(
+                                                                ui,
+                                                                RailIcon::Delete,
+                                                                "Delete bookmark",
+                                                                palette,
+                                                                false,
+                                                            )
+                                                            .clicked()
+                                                            {
+                                                                bookmark_actions.push(
+                                                                    UiAction::DeleteBookmark {
+                                                                        workspace_id:
+                                                                            bookmark.workspace_id,
+                                                                        url: bookmark.url.clone(),
+                                                                    },
+                                                                );
+                                                                if selected_bookmark_key.as_ref()
+                                                                    == Some(&key)
+                                                                {
+                                                                    selected_bookmark_key = None;
+                                                                }
+                                                            }
+                                                            if compact_icon_button(
+                                                                ui,
+                                                                RailIcon::Edit,
+                                                                "Edit bookmark",
+                                                                palette,
+                                                                false,
+                                                            )
+                                                            .clicked()
+                                                            {
+                                                                selected_bookmark_key = Some(key);
+                                                                bookmark_title =
+                                                                    bookmark.title.clone();
+                                                                bookmark_url = bookmark.url.clone();
+                                                                bookmark_workspace_id =
+                                                                    bookmark.workspace_id;
+                                                                bookmark_folder =
+                                                                    bookmark.folder.clone();
                                                             }
                                                         },
                                                     );
                                                 });
                                             }
                                         });
+                                }
+
+                                if let Some((workspace_id, url)) = &selected_bookmark_key {
+                                    let original = bookmarks.iter().find(|bookmark| {
+                                        bookmark.workspace_id == *workspace_id
+                                            && bookmark.url == *url
+                                    });
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        RichText::new("EDIT BOOKMARK")
+                                            .size(10.0)
+                                            .strong()
+                                            .color(palette.section_label),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new("Title").size(10.0));
+                                    ui.add(
+                                        TextEdit::singleline(&mut bookmark_title)
+                                            .id(egui::Id::new("kasumi_bookmark_title"))
+                                            .desired_width(ui.available_width()),
+                                    );
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new("URL").size(10.0));
+                                    ui.add(
+                                        TextEdit::singleline(&mut bookmark_url)
+                                            .id(egui::Id::new("kasumi_bookmark_url"))
+                                            .desired_width(ui.available_width()),
+                                    );
+
+                                    let mut folder_options: Vec<(u64, String)> = workspaces
+                                        .iter()
+                                        .map(|workspace| (workspace.id, workspace.name.clone()))
+                                        .collect();
+                                    if let Some(original) = original {
+                                        let archived = (original.workspace_id, original.folder.clone());
+                                        if !folder_options
+                                            .iter()
+                                            .any(|option| *option == archived)
+                                        {
+                                            folder_options.insert(0, archived);
+                                        }
+                                    }
+                                    if folder_options.is_empty() {
+                                        folder_options.push((
+                                            bookmark_workspace_id,
+                                            bookmark_folder.clone(),
+                                        ));
+                                    }
+                                    if !folder_options.iter().any(|(id, folder)| {
+                                        *id == bookmark_workspace_id && *folder == bookmark_folder
+                                    }) {
+                                        if let Some(first) = folder_options.first() {
+                                            bookmark_workspace_id = first.0;
+                                            bookmark_folder = first.1.clone();
+                                        }
+                                    }
+                                    let mut selected_folder = bookmark_folder.clone();
+                                    egui::ComboBox::from_label("Folder")
+                                        .selected_text(selected_folder.clone())
+                                        .show_ui(ui, |ui| {
+                                            for (id, folder) in &folder_options {
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut selected_folder,
+                                                        folder.clone(),
+                                                        folder,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    bookmark_workspace_id = *id;
+                                                    bookmark_folder = folder.clone();
+                                                }
+                                            }
+                                        });
+
+                                    let normalized_url = normalize_bookmark_url(&bookmark_url);
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        if material_button(
+                                            ui,
+                                            RailIcon::Check,
+                                            "Save bookmark",
+                                            MaterialButtonStyle::Tonal,
+                                            palette,
+                                            normalized_url.is_some(),
+                                        )
+                                        .clicked()
+                                        {
+                                            if let (
+                                                Some((original_workspace_id, original_url)),
+                                                Some(url),
+                                            ) = (selected_bookmark_key.clone(), normalized_url)
+                                            {
+                                                bookmark_actions.push(UiAction::SaveBookmark {
+                                                    original_workspace_id,
+                                                    original_url,
+                                                    workspace_id: bookmark_workspace_id,
+                                                    url,
+                                                    title: bookmark_title.trim().to_string(),
+                                                    folder: bookmark_folder.clone(),
+                                                });
+                                                selected_bookmark_key = None;
+                                                bookmark_title.clear();
+                                                bookmark_url.clear();
+                                            }
+                                        }
+                                        if material_button(
+                                            ui,
+                                            RailIcon::Close,
+                                            "Cancel",
+                                            MaterialButtonStyle::Outlined,
+                                            palette,
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            selected_bookmark_key = None;
+                                            bookmark_title.clear();
+                                            bookmark_url.clear();
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                    if material_button(
+                                        ui,
+                                        RailIcon::Delete,
+                                        "Delete bookmark",
+                                        MaterialButtonStyle::Outlined,
+                                        palette,
+                                        true,
+                                    )
+                                    .clicked()
+                                    {
+                                        if let Some((workspace_id, url)) =
+                                            selected_bookmark_key.clone()
+                                        {
+                                            bookmark_actions.push(UiAction::DeleteBookmark {
+                                                workspace_id,
+                                                url,
+                                            });
+                                        }
+                                        selected_bookmark_key = None;
+                                        bookmark_title.clear();
+                                        bookmark_url.clear();
+                                    }
                                 }
                                     }
                                 }
@@ -3554,6 +4022,12 @@ impl ChromeRenderer {
         state.workspace_new_name_draft = new_name.clone();
         state.workspace_new_icon_draft = new_icon;
         state.workspace_new_color_draft = new_color;
+        state.bookmark_search_query = bookmark_search;
+        state.selected_bookmark_key = selected_bookmark_key;
+        state.bookmark_title_draft = bookmark_title;
+        state.bookmark_url_draft = bookmark_url;
+        state.bookmark_workspace_id_draft = bookmark_workspace_id;
+        state.bookmark_folder_draft = bookmark_folder;
 
         if make_default_clicked {
             if let Some(workspace) = &selected_workspace {
@@ -3582,6 +4056,7 @@ impl ChromeRenderer {
             delete_clicked,
         ));
         actions.extend(workspace_actions);
+        actions.extend(bookmark_actions);
 
         if cancel_create_clicked {
             state.close_workspace_creator();
@@ -4119,14 +4594,20 @@ impl ChromeOverlayRenderer {
     ) -> Vec<UiAction> {
         let mut actions = Vec::new();
         let mut raw_input = self.egui_state.take_egui_input(window);
+        state.expire_toast();
+        state.promote_pending_toast();
         // Only one surface may own the shared overlay. Settings has priority,
         // then the context menu, then the command palette, then the downloads
-        // bubble. `ChromeState` openers are mutually exclusive, so this is only
-        // a defensive ordering for state restored between frames.
+        // bubble. A toast paints only when no modal surface is active.
         let settings_open = state.settings_open;
         let menu_open = state.menu.is_some() && !settings_open;
         let palette_open = state.command_palette_open && !menu_open && !settings_open;
         let downloads_open = state.downloads_open && !palette_open && !menu_open && !settings_open;
+        let toast_open = state.toast.is_some()
+            && !settings_open
+            && !menu_open
+            && !palette_open
+            && !downloads_open;
         let focus_before = state.command_palette_focus_requested && palette_open;
         let select_all_before = state.command_palette_select_all_requested && palette_open;
         state.apply_visuals(&self.egui_ctx);
@@ -4156,6 +4637,8 @@ impl ChromeOverlayRenderer {
                 ChromeRenderer::build_command_palette(ctx, state, &mut actions, focus_command);
             } else if downloads_open {
                 ChromeRenderer::build_downloads_bubble(ctx, state, &mut actions);
+            } else if toast_open {
+                ChromeRenderer::build_toast(ctx, state);
             }
         });
         // The rail button raises this flag during the main window's render,
@@ -4986,6 +5469,15 @@ pub fn command_palette_items(
         })
     };
 
+    let bookmark_item = || {
+        active_tab_id.map(|_| CommandPaletteItem {
+            icon: "★",
+            label: "Bookmark this page".to_string(),
+            subtitle: "Save the active page in its workspace folder".to_string(),
+            action: CommandAction::BookmarkActiveTab,
+        })
+    };
+
     if trimmed.is_empty() {
         items.push(CommandPaletteItem {
             icon: "＋",
@@ -5021,6 +5513,9 @@ pub fn command_palette_items(
             action: CommandAction::OpenDownloads,
         });
         items.extend(tabs.iter().take(12).map(tab_item));
+        if let Some(item) = bookmark_item() {
+            items.push(item);
+        }
         return items;
     }
 
@@ -5098,6 +5593,12 @@ pub fn command_palette_items(
         });
     }
 
+    if needle.contains("bookmark") || needle.contains("save page") {
+        if let Some(item) = bookmark_item() {
+            items.push(item);
+        }
+    }
+
     if needle.contains("pin") {
         if let Some(item) = pin_item() {
             items.push(item);
@@ -5131,6 +5632,16 @@ fn apply_command_item(
         }
         CommandAction::OpenSettings => state.open_settings(),
         CommandAction::OpenDownloads => state.open_downloads(),
+        CommandAction::BookmarkActiveTab => {
+            if let Some(tab_id) = state.active_tab_id {
+                actions.push(UiAction::AddBookmark { tab_id });
+                state.show_toast(
+                    ToastKind::Success,
+                    "Bookmark saved",
+                    "Added to this workspace",
+                );
+            }
+        }
     }
     state.close_command_palette();
 }
@@ -5155,6 +5666,45 @@ fn apply_menu_item(
         actions.push(action);
     }
     state.close_tab_menu();
+}
+
+// ---------------------------------------------------------------------------
+// Bookmark manager helpers
+// ---------------------------------------------------------------------------
+
+/// Filter bookmarks by title, URL, or folder without changing their order.
+pub fn filter_bookmarks(bookmarks: &[BookmarkInfo], query: &str) -> Vec<BookmarkInfo> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return bookmarks.to_vec();
+    }
+    bookmarks
+        .iter()
+        .filter(|bookmark| {
+            bookmark.title.to_lowercase().contains(&needle)
+                || bookmark.url.to_lowercase().contains(&needle)
+                || bookmark.folder.to_lowercase().contains(&needle)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Normalize a bookmark URL without silently turning plain text into a search.
+pub fn normalize_bookmark_url(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if url::Url::parse(trimmed).is_ok() {
+        return Some(trimmed.to_string());
+    }
+    if !trimmed.contains(' ') && trimmed.contains('.') {
+        let candidate = format!("https://{trimmed}");
+        if url::Url::parse(&candidate).is_ok() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -5205,22 +5755,26 @@ mod tests {
         command_palette_click_outside, command_palette_items, download_engine_label,
         download_eta_label, download_rail_badge, download_row_uses_progress_bar,
         download_state_label, downloads_bubble_anchor, downloads_bubble_size, effective_theme,
-        focus_request_after_render, format_download_bytes, loading_spinner_angle,
-        loading_spinner_point, page_tooltip_anchor, palette_row_fill, preferred_surface_format,
-        rail_menu_anchor, rail_menu_click_outside, rail_menu_items, rail_menu_metrics,
-        rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled, rail_tooltip_metrics,
-        resolve_omnibox, resolve_omnibox_with_search, tab_close_center, tab_status_center,
-        truncate_title, workspace_form_actions, ChromePalette, ChromeRenderer, ChromeState,
-        ChromeTheme, CommandAction, DownloadBadge, DownloadSummary, RailMenuAction, SettingsTab,
-        TabDisplayState, TabInfo, WorkspaceInfo, RAIL_STATUS_BADGE_HEIGHT, RAIL_STATUS_HEIGHT,
-        RAIL_STATUS_ICON_COLLAPSED, RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED,
-        TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
+        filter_bookmarks, focus_request_after_render, format_download_bytes, loading_spinner_angle,
+        loading_spinner_point, normalize_bookmark_url, page_tooltip_anchor, palette_row_fill,
+        preferred_surface_format, rail_menu_anchor, rail_menu_click_outside, rail_menu_items,
+        rail_menu_metrics, rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled,
+        rail_tooltip_metrics, resolve_omnibox, resolve_omnibox_with_search, tab_close_center,
+        tab_status_center, truncate_title, workspace_form_actions, BookmarkInfo, ChromePalette,
+        ChromeRenderer, ChromeState, ChromeTheme, CommandAction, DownloadBadge, DownloadSummary,
+        RailMenuAction, SettingsTab, TabDisplayState, TabInfo, ToastKind, WorkspaceInfo,
+        RAIL_STATUS_BADGE_HEIGHT, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED,
+        RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED,
+        TOOLTIP_WIDTH,
     };
     use crate::config::{
         BrowserPreferences, SearchEngine, ThemePreference, WorkspaceColor, WorkspaceIcon,
         DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX, RAIL_WIDTH_COLLAPSED, RAIL_WIDTH_EXPANDED,
     };
-    use crate::events::{DownloadEngine, DownloadInfo, DownloadState, UiAction};
+    use crate::events::{
+        DownloadEngine, DownloadInfo, DownloadNotification, DownloadNotificationKind,
+        DownloadState, UiAction,
+    };
 
     fn tab(id: u64, title: &str, url: &str) -> TabInfo {
         TabInfo {
@@ -5236,6 +5790,16 @@ mod tests {
             can_go_forward: false,
             is_pinned: false,
             favicon: None,
+        }
+    }
+
+    fn bookmark(id: i64, title: &str, url: &str, folder: &str) -> BookmarkInfo {
+        BookmarkInfo {
+            id,
+            workspace_id: 1,
+            url: url.to_string(),
+            title: title.to_string(),
+            folder: folder.to_string(),
         }
     }
 
@@ -5320,6 +5884,87 @@ mod tests {
         let unicode = resolve_omnibox("café");
         assert!(unicode.starts_with(DEFAULT_SEARCH_URL_PREFIX));
         assert!(unicode.contains("%C3%A9"));
+    }
+
+    #[test]
+    fn bookmark_search_matches_title_url_and_folder() {
+        let items = vec![
+            bookmark(1, "Rust docs", "https://doc.rust-lang.org", "Work"),
+            bookmark(
+                2,
+                "Release notes",
+                "https://example.com/releases",
+                "Personal",
+            ),
+        ];
+        assert_eq!(filter_bookmarks(&items, "").len(), 2);
+        assert_eq!(filter_bookmarks(&items, "RUST")[0].id, 1);
+        assert_eq!(filter_bookmarks(&items, "example.com")[0].id, 2);
+        assert_eq!(filter_bookmarks(&items, "personal")[0].id, 2);
+        assert!(filter_bookmarks(&items, "missing").is_empty());
+    }
+
+    #[test]
+    fn bookmark_url_normalization_never_creates_a_search_url() {
+        assert_eq!(
+            normalize_bookmark_url("example.com/docs"),
+            Some("https://example.com/docs".to_string())
+        );
+        assert_eq!(
+            normalize_bookmark_url("  https://example.com  "),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(normalize_bookmark_url("hello world"), None);
+        assert_eq!(normalize_bookmark_url("   "), None);
+    }
+
+    #[test]
+    fn download_notifications_map_to_success_and_error_toasts() {
+        let mut state = ChromeState::default();
+        state.show_download_notification(DownloadNotification {
+            download_id: 1,
+            file_name: "archive.zip".to_string(),
+            kind: DownloadNotificationKind::Completed,
+        });
+        let toast = state.toast.clone().expect("completion toast");
+        assert_eq!(toast.kind, ToastKind::Success);
+        assert_eq!(toast.title, "Download complete");
+        assert!(toast.message.contains("archive.zip"));
+
+        state.show_download_notification(DownloadNotification {
+            download_id: 2,
+            file_name: "broken.iso".to_string(),
+            kind: DownloadNotificationKind::Failed,
+        });
+        // A second outcome waits its turn instead of replacing the first.
+        let toast = state.toast.clone().expect("visible completion toast");
+        assert_eq!(toast.title, "Download complete");
+        assert_eq!(state.pending_toasts.len(), 1);
+
+        if let Some(visible) = state.toast.as_mut() {
+            visible.created_at -= std::time::Duration::from_secs(5);
+        }
+        state.expire_toast();
+        let toast = state.toast.expect("failure toast");
+        assert_eq!(toast.kind, ToastKind::Error);
+        assert_eq!(toast.title, "Download failed");
+        assert!(toast.message.contains("broken.iso"));
+        assert!(state.pending_toasts.is_empty());
+    }
+
+    #[test]
+    fn toasts_queue_while_a_modal_owns_the_overlay() {
+        let mut state = ChromeState::default();
+        state.open_settings();
+        state.show_toast(ToastKind::Success, "Copied", "Link copied to clipboard");
+        assert!(state.toast.is_none());
+        assert_eq!(state.pending_toasts.len(), 1);
+
+        state.close_settings();
+        state.promote_pending_toast();
+        let toast = state.toast.expect("promoted toast");
+        assert_eq!(toast.title, "Copied");
+        assert!(toast.created_at.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
@@ -5494,13 +6139,16 @@ mod tests {
 
     #[test]
     fn page_tooltip_anchor_follows_row_and_stays_over_the_page() {
-        let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(180.0, 800.0));
+        let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(RAIL_WIDTH_EXPANDED, 800.0));
         let row = egui::Rect::from_min_size(pos2(6.0, 200.0), vec2(168.0, 36.0));
         let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
         let anchor = page_tooltip_anchor(rail, row, screen, TOOLTIP_WIDTH, TOOLTIP_HEIGHT_EXPANDED);
         assert_eq!(
             anchor,
-            pos2(188.0, row.center().y - TOOLTIP_HEIGHT_EXPANDED * 0.5)
+            pos2(
+                RAIL_WIDTH_EXPANDED + 8.0,
+                row.center().y - TOOLTIP_HEIGHT_EXPANDED * 0.5,
+            )
         );
         assert_eq!(anchor.y + TOOLTIP_HEIGHT_EXPANDED * 0.5, row.center().y);
         assert!(anchor.x >= rail.right());
@@ -5510,7 +6158,7 @@ mod tests {
 
     #[test]
     fn page_tooltip_anchor_clamps_near_screen_bottom() {
-        let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(180.0, 800.0));
+        let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(RAIL_WIDTH_EXPANDED, 800.0));
         let row = egui::Rect::from_min_size(pos2(6.0, 790.0), vec2(168.0, 36.0));
         let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
         let anchor = page_tooltip_anchor(rail, row, screen, TOOLTIP_WIDTH, TOOLTIP_HEIGHT_EXPANDED);
@@ -5650,6 +6298,7 @@ mod tests {
         assert_eq!(items[4].action, CommandAction::OpenSettings);
         assert_eq!(items[5].action, CommandAction::OpenDownloads);
         assert_eq!(items[6].action, CommandAction::SelectTab(1));
+        assert_eq!(items[7].action, CommandAction::BookmarkActiveTab);
     }
 
     #[test]
@@ -5658,6 +6307,32 @@ mod tests {
         assert!(items
             .iter()
             .any(|item| item.action == CommandAction::OpenDownloads));
+    }
+
+    #[test]
+    fn command_palette_bookmarks_the_active_tab_and_confirms() {
+        let items = command_palette_items(
+            "bookmark",
+            &[tab(9, "Docs", "https://docs.example")],
+            Some(9),
+            &BrowserPreferences::default(),
+        );
+        assert!(items
+            .iter()
+            .any(|item| item.action == CommandAction::BookmarkActiveTab));
+
+        let mut state = ChromeState::default();
+        state.active_tab_id = Some(9);
+        state.command_palette_open = true;
+        let mut actions = Vec::new();
+        apply_command_item(&CommandAction::BookmarkActiveTab, &mut state, &mut actions);
+        assert_eq!(actions, vec![UiAction::AddBookmark { tab_id: 9 }]);
+        assert!(!state.command_palette_open);
+        assert_eq!(state.pending_toasts.len(), 1);
+        state.promote_pending_toast();
+        let toast = state.toast.expect("bookmark confirmation toast");
+        assert_eq!(toast.kind, ToastKind::Success);
+        assert_eq!(toast.title, "Bookmark saved");
     }
 
     #[test]
@@ -5997,6 +6672,58 @@ mod tests {
     }
 
     #[test]
+    fn bookmark_manager_renders_search_and_editor_without_invalid_layout() {
+        let ctx = egui::Context::default();
+        let mut state = ChromeState::default();
+        state.settings_open = true;
+        state.settings_tab = SettingsTab::Bookmarks;
+        state.workspaces = vec![WorkspaceInfo {
+            id: 1,
+            name: "Personal".to_string(),
+            icon: WorkspaceIcon::Work,
+            color: WorkspaceColor::Blue,
+            is_default: true,
+            is_active: true,
+        }];
+        state.bookmarks = vec![bookmark(
+            1,
+            "Rust docs",
+            "https://doc.rust-lang.org",
+            "Personal",
+        )];
+        state.bookmark_search_query = "rust".to_string();
+        state.selected_bookmark_key = Some((1, "https://doc.rust-lang.org".to_string()));
+        state.bookmark_title_draft = "Rust docs".to_string();
+        state.bookmark_url_draft = "https://doc.rust-lang.org".to_string();
+        state.bookmark_workspace_id_draft = 1;
+        state.bookmark_folder_draft = "Personal".to_string();
+        let mut actions = Vec::new();
+
+        for _ in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        vec2(1280.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| ChromeRenderer::build_settings(ctx, &mut state, &mut actions),
+            );
+            if let Some(area) = egui::AreaState::load(&ctx, egui::Id::new("kasumi_settings")) {
+                let size = area.size.unwrap_or_default();
+                assert!(
+                    size.x.is_finite() && size.y.is_finite(),
+                    "Settings area size must stay finite: {size:?}"
+                );
+            }
+        }
+
+        assert!(actions.is_empty());
+        assert!(state.settings_open);
+    }
+
+    #[test]
     fn download_summary_aggregates_multiple_downloads() {
         let downloads = vec![
             bubble_download(1, DownloadState::InProgress),
@@ -6086,8 +6813,8 @@ mod tests {
         let size = downloads_bubble_size(screen);
         assert!(size.x.is_finite() && size.y.is_finite());
 
-        let expanded = downloads_bubble_anchor(screen, 180.0);
-        assert!(expanded.x >= 180.0);
+        let expanded = downloads_bubble_anchor(screen, RAIL_WIDTH_EXPANDED);
+        assert!(expanded.x >= RAIL_WIDTH_EXPANDED);
         assert!(expanded.y >= screen.top());
         assert!(expanded.y + size.y <= screen.bottom());
 
@@ -6097,7 +6824,7 @@ mod tests {
 
         let small = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(220.0, 180.0));
         let small_size = downloads_bubble_size(small);
-        let anchor = downloads_bubble_anchor(small, 180.0);
+        let anchor = downloads_bubble_anchor(small, RAIL_WIDTH_EXPANDED);
         assert!(anchor.x >= small.left());
         assert!(anchor.y >= small.top());
         assert!(anchor.x + small_size.x <= small.right());
@@ -6299,7 +7026,7 @@ mod tests {
         assert_eq!(width, 224.0);
         assert_eq!(height, 10.0 * 28.0 + 14.0);
 
-        let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(180.0, 800.0));
+        let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(RAIL_WIDTH_EXPANDED, 800.0));
         let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
         let anchor = rail_menu_anchor(rail, pos2(400.0, 300.0), screen, width, height);
         assert_eq!(anchor, pos2(400.0, 292.0));

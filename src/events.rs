@@ -93,6 +93,33 @@ impl DownloadInfo {
     pub fn is_finished(&self) -> bool {
         self.state.is_finished()
     }
+
+    /// File name used in native completion/error notifications.
+    pub fn display_name(&self) -> String {
+        let name = self.suggested_name.trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+        std::path::Path::new(self.full_path.trim())
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "download".to_string())
+    }
+}
+
+/// Outcome of a download that should be surfaced as a native notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadNotificationKind {
+    Completed,
+    Failed,
+}
+
+/// Plain-data notification emitted when a transfer reaches a terminal outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadNotification {
+    pub download_id: u32,
+    pub file_name: String,
+    pub kind: DownloadNotificationKind,
 }
 
 /// Progress and control results from Kasumi's native segmented downloader.
@@ -463,6 +490,21 @@ pub enum UiAction {
     },
     /// Open a bookmark in the current workspace, regardless of its folder.
     OpenBookmark {
+        url: String,
+    },
+    /// Edit a bookmark's metadata and optionally move it to another folder.
+    /// The original workspace/URL pair identifies the row being changed.
+    SaveBookmark {
+        original_workspace_id: u64,
+        original_url: String,
+        workspace_id: u64,
+        url: String,
+        title: String,
+        folder: String,
+    },
+    /// Remove a bookmark identified by its workspace and URL.
+    DeleteBookmark {
+        workspace_id: u64,
         url: String,
     },
     /// Open the native downloads bubble.

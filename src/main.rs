@@ -506,7 +506,7 @@ fn install_macos_main_menu() {
     let app_menu = NSMenu::new(mtm);
     let app_version = NSMenuItem::new(mtm);
     unsafe {
-        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.7.0"));
+        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.8.0"));
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
@@ -678,6 +678,8 @@ struct KasumiBrowserHandler {
     overlay_window_id: Option<WindowId>,
     overlay: Option<ChromeOverlayRenderer>,
     overlay_visible: bool,
+    overlay_click_through: bool,
+    overlay_focused: bool,
 
     // Transparent, click-through overlay for rail tooltips. A native window is
     // required so tooltips can appear above the CEF child view.
@@ -728,6 +730,8 @@ impl KasumiBrowserHandler {
             overlay_window_id: None,
             overlay: None,
             overlay_visible: false,
+            overlay_click_through: false,
+            overlay_focused: false,
             tooltip_window: None,
             tooltip_window_id: None,
             tooltip: None,
@@ -745,21 +749,51 @@ impl KasumiBrowserHandler {
     }
 
     fn sync_chrome_overlay(&mut self, event_loop: &ActiveEventLoop) {
+        self.chrome_state.promote_pending_toast();
         if self.shutdown_requested {
             self.hide_chrome_overlay();
             return;
         }
         if self.chrome_state.has_overlay() {
             self.ensure_chrome_overlay(event_loop);
+            let Some(window) = self.overlay_window.as_ref() else {
+                return;
+            };
+            let toast_only = self.chrome_state.is_toast_only();
+
+            // Configure hit-testing before the window is shown so a toast can
+            // never intercept a click meant for the CEF page.
+            if toast_only != self.overlay_click_through {
+                if let Err(e) = window.set_cursor_hittest(!toast_only) {
+                    tracing::warn!("Overlay hit-test update unavailable: {e}");
+                }
+                self.overlay_click_through = toast_only;
+            }
+            if !self.overlay_visible {
+                window.set_visible(true);
+                self.position_chrome_overlay();
+                self.overlay_visible = true;
+            }
+
+            // Modal overlays must own the keyboard; toast-only overlays must
+            // leave focus on the main window so typing still reaches the page.
+            let wants_overlay_focus = !toast_only;
+            if wants_overlay_focus != self.overlay_focused {
+                if wants_overlay_focus {
+                    window.focus_window();
+                } else if let Some(main) = self.window.as_ref() {
+                    main.focus_window();
+                }
+                self.overlay_focused = wants_overlay_focus;
+            }
+            window.request_redraw();
         } else {
             self.hide_chrome_overlay();
         }
     }
 
     fn ensure_chrome_overlay(&mut self, event_loop: &ActiveEventLoop) {
-        let mut created_window = false;
         if self.overlay_window.is_none() {
-            created_window = true;
             let Some(main) = self.window.as_ref() else {
                 return;
             };
@@ -769,6 +803,7 @@ impl KasumiBrowserHandler {
                 .with_transparent(true)
                 .with_decorations(false)
                 .with_resizable(false)
+                .with_visible(false)
                 .with_window_level(WindowLevel::Normal);
             let overlay_window = match event_loop.create_window(attrs) {
                 Ok(window) => Arc::new(window),
@@ -797,22 +832,6 @@ impl KasumiBrowserHandler {
                 return;
             };
             self.overlay = Some(overlay);
-        }
-
-        if created_window || !self.overlay_visible {
-            self.position_chrome_overlay();
-        }
-        if let Some(window) = self.overlay_window.as_ref() {
-            if !self.overlay_visible {
-                window.set_visible(true);
-                // AppKit can re-center a newly visible window on the primary
-                // display, so reapply the main window's current position after
-                // the overlay is visible as well as before it is shown.
-                self.position_chrome_overlay();
-                window.focus_window();
-                self.overlay_visible = true;
-            }
-            window.request_redraw();
         }
     }
 
@@ -853,9 +872,16 @@ impl KasumiBrowserHandler {
     fn hide_chrome_overlay(&mut self) {
         if self.overlay_visible {
             if let Some(window) = self.overlay_window.as_ref() {
+                if self.overlay_click_through {
+                    if let Err(e) = window.set_cursor_hittest(true) {
+                        tracing::warn!("Overlay hit-test reset unavailable: {e}");
+                    }
+                }
                 let _ = window.set_visible(false);
             }
             self.overlay_visible = false;
+            self.overlay_click_through = false;
+            self.overlay_focused = false;
             if let Some(window) = self.window.as_ref() {
                 window.focus_window();
                 window.request_redraw();
@@ -1627,7 +1653,10 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             tm.pump_events();
             let new_download = tm.consume_download_bubble_request();
             let explicit_downloads_request = tm.consume_downloads_request();
-            if new_download && !self.chrome_state.has_overlay() {
+            for notification in tm.consume_download_notifications() {
+                self.chrome_state.show_download_notification(notification);
+            }
+            if new_download && !self.chrome_state.has_modal_overlay() {
                 self.chrome_state.open_downloads();
             } else if explicit_downloads_request {
                 self.chrome_state.toggle_downloads();
@@ -1937,6 +1966,7 @@ mod tests {
         is_primary_shortcut_modifier, is_quit_shortcut, is_reopen_tab_shortcut,
         overlay_screen_position, pointer_is_past_rail, BrowserShortcut,
     };
+    use crate::config::rail_width;
     use winit::dpi::PhysicalPosition;
     use winit::keyboard::{Key, ModifiersState};
 
@@ -2008,13 +2038,14 @@ mod tests {
 
     #[test]
     fn pointer_past_rail_uses_logical_rail_width() {
-        // Expanded rail is 180 logical points: 360 physical pixels at 2x.
-        assert!(!pointer_is_past_rail(359.0, 2.0, true));
-        assert!(pointer_is_past_rail(360.0, 2.0, true));
+        // The rail width is logical points, scaled to physical pixels.
+        let expanded_physical = f64::from(rail_width(true)) * 2.0;
+        assert!(!pointer_is_past_rail(expanded_physical - 1.0, 2.0, true));
+        assert!(pointer_is_past_rail(expanded_physical, 2.0, true));
 
-        // Collapsed rail is 44 logical points.
-        assert!(!pointer_is_past_rail(43.0, 1.0, false));
-        assert!(pointer_is_past_rail(44.0, 1.0, false));
+        let collapsed_physical = f64::from(rail_width(false));
+        assert!(!pointer_is_past_rail(collapsed_physical - 1.0, 1.0, false));
+        assert!(pointer_is_past_rail(collapsed_physical, 1.0, false));
 
         // Invalid scale factors must not clear tooltips spuriously.
         assert!(!pointer_is_past_rail(1_000.0, 0.0, true));

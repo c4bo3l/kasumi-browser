@@ -11,7 +11,7 @@ pub const DEFAULT_HOME_URL: &str = "https://duckduckgo.com";
 pub const DEFAULT_SEARCH_URL_PREFIX: &str = "https://duckduckgo.com/?q=";
 
 /// Expanded width of the collapsible vertical workspace rail, in logical points.
-pub const RAIL_WIDTH_EXPANDED: f32 = 180.0;
+pub const RAIL_WIDTH_EXPANDED: f32 = 208.0;
 
 /// Width of the favicon-only strip left visible when the rail is collapsed.
 pub const RAIL_WIDTH_COLLAPSED: f32 = 44.0;
@@ -453,7 +453,7 @@ mod tests {
 
     #[test]
     fn rail_widths_match_spec() {
-        assert_eq!(RAIL_WIDTH_EXPANDED, 180.0);
+        assert_eq!(RAIL_WIDTH_EXPANDED, 208.0);
         assert_eq!(RAIL_WIDTH_COLLAPSED, 44.0);
         assert_eq!(rail_width(true), RAIL_WIDTH_EXPANDED);
         assert_eq!(rail_width(false), RAIL_WIDTH_COLLAPSED);

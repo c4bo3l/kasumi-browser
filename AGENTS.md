@@ -59,7 +59,7 @@ Use these exact crate versions and release profile settings:
 ```toml
 [package]
 name = "kasumi-browser"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 
 [dependencies]
@@ -216,7 +216,7 @@ pub struct Tab {
 
 ### 5.4 Native UI Chrome & Child Viewport (`src/ui/`)
 - **Layout Geometry (logical points / DIPs):**
-  - Default rail: expanded at `RAIL_WIDTH_EXPANDED = 180.0` px so vertical tabs are visible immediately.
+  - Default rail: expanded at `RAIL_WIDTH_EXPANDED = 208.0` px so vertical tabs and the framed address field have comfortable room.
   - Collapsed rail: `RAIL_WIDTH_COLLAPSED = 44.0` px favicon-only strip with clickable tab icons and active-tab indicator.
   - Command palette: `COMMAND_PALETTE_WIDTH = 560.0` px, top offset `72.0` px.
   - CEF Child Viewport Rect: `x = rail_width`, `y = 0`, `width = logical_window_width - rail_width`, `height = logical_window_height`.

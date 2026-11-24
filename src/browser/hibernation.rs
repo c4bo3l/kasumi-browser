@@ -31,8 +31,8 @@ use crate::config::{
     RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_PRESSURE, TAB_WATCHDOG_TICK_INTERVAL,
 };
 use crate::events::{
-    BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadState,
-    ParallelDownloadEvent, UiAction,
+    BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadNotification,
+    DownloadNotificationKind, DownloadState, ParallelDownloadEvent, UiAction,
 };
 use crate::storage::db::{BookmarkItem, SessionTabSnapshot, StorageHandle};
 use crate::ui::chrome::{
@@ -345,6 +345,8 @@ pub struct TabManager {
     /// Set when a genuinely new transfer starts so the shell can reveal the
     /// native downloads bubble without reopening it for restored history.
     download_bubble_requested: bool,
+    /// Terminal download outcomes waiting to be shown as native notifications.
+    download_notifications: Vec<DownloadNotification>,
     /// CEF item callbacks retained only on the UI thread for native controls.
     download_callbacks: HashMap<u32, cef::DownloadItemCallback>,
     /// CEF ids that Kasumi took over with the native segmented engine. Their
@@ -495,6 +497,7 @@ impl TabManager {
             bookmarks,
             downloads: Vec::new(),
             download_bubble_requested: false,
+            download_notifications: Vec::new(),
             download_callbacks: HashMap::new(),
             superseded_cef_downloads: HashSet::new(),
             parallel_downloads: HashMap::new(),
@@ -565,6 +568,21 @@ impl TabManager {
             .cloned()
     }
 
+    fn queue_download_notification(&mut self, info: &DownloadInfo, kind: DownloadNotificationKind) {
+        if self
+            .download_notifications
+            .iter()
+            .any(|notification| notification.download_id == info.id)
+        {
+            return;
+        }
+        self.download_notifications.push(DownloadNotification {
+            download_id: info.id,
+            file_name: info.display_name(),
+            kind,
+        });
+    }
+
     fn record_download(&mut self, info: DownloadInfo, callback: Option<cef::DownloadItemCallback>) {
         // After the native engine takes over, CEF may deliver one canceled
         // update from the copy we just stopped. It must not be persisted.
@@ -573,6 +591,11 @@ impl TabManager {
         }
 
         let is_new = !self.downloads.iter().any(|download| download.id == info.id);
+        let previous_state = self
+            .downloads
+            .iter()
+            .find(|download| download.id == info.id)
+            .map(|download| download.state);
         if let Some(existing) = self
             .downloads
             .iter_mut()
@@ -584,6 +607,26 @@ impl TabManager {
         }
         self.downloads
             .sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
+
+        // A transfer can be first observed already in a terminal state (for
+        // example, CEF reports a short download as completed on its first
+        // update). Treat that like a transition so the outcome is never lost.
+        let reached_terminal_state = matches!(
+            info.state,
+            DownloadState::Completed | DownloadState::Interrupted
+        ) && previous_state
+            .map_or(true, |previous| previous != info.state);
+        if reached_terminal_state {
+            match info.state {
+                DownloadState::Completed => {
+                    self.queue_download_notification(&info, DownloadNotificationKind::Completed);
+                }
+                DownloadState::Interrupted => {
+                    self.queue_download_notification(&info, DownloadNotificationKind::Failed);
+                }
+                DownloadState::InProgress | DownloadState::Paused | DownloadState::Canceled => {}
+            }
+        }
 
         if is_new
             && matches!(
@@ -1257,6 +1300,9 @@ impl TabManager {
         self.download_writer.flush(download_id);
         self.sync_native_download_info(download_id, true);
         self.set_download_state(download_id, DownloadState::Interrupted);
+        if let Some(info) = self.download_snapshot(download_id) {
+            self.queue_download_notification(&info, DownloadNotificationKind::Failed);
+        }
     }
 
     fn finish_native_download(&mut self, download_id: u32) {
@@ -1287,6 +1333,9 @@ impl TabManager {
             if let Some(ref storage) = self.storage {
                 storage.save_download(snapshot);
             }
+        }
+        if let Some(info) = self.download_snapshot(download_id) {
+            self.queue_download_notification(&info, DownloadNotificationKind::Completed);
         }
     }
 
@@ -2037,6 +2086,73 @@ impl TabManager {
         }
     }
 
+    /// Apply edits to an existing bookmark, including moving it to a folder.
+    pub fn save_bookmark(
+        &mut self,
+        original_workspace_id: u64,
+        original_url: String,
+        workspace_id: u64,
+        url: String,
+        title: String,
+        folder: String,
+    ) {
+        let Some(index) = self.bookmarks.iter().position(|bookmark| {
+            bookmark.workspace_id == original_workspace_id && bookmark.url == original_url
+        }) else {
+            return;
+        };
+        // The row being edited is allowed to already have this URL; only a
+        // *different* row in the target workspace would violate the
+        // (workspace_id, url) uniqueness constraint in SQLite.
+        let moves_to_existing = self
+            .bookmarks
+            .iter()
+            .enumerate()
+            .any(|(other_index, bookmark)| {
+                other_index != index && bookmark.workspace_id == workspace_id && bookmark.url == url
+            });
+        if moves_to_existing {
+            tracing::warn!(
+                "Bookmark {url} already exists in workspace {workspace_id}; keeping the original"
+            );
+            return;
+        }
+
+        let id = self.bookmarks[index].id;
+        self.bookmarks[index] = BookmarkItem {
+            id,
+            workspace_id,
+            url: url.clone(),
+            title: title.clone(),
+            folder: folder.clone(),
+        };
+        if let Some(storage) = self.storage.as_ref() {
+            storage.save_bookmark(
+                original_workspace_id,
+                original_url,
+                workspace_id,
+                url,
+                title,
+                folder,
+            );
+        }
+    }
+
+    /// Remove a bookmark without touching the page it points to.
+    pub fn delete_bookmark(&mut self, workspace_id: u64, url: String) {
+        let Some(index) = self
+            .bookmarks
+            .iter()
+            .position(|bookmark| bookmark.workspace_id == workspace_id && bookmark.url == url)
+        else {
+            return;
+        };
+        self.bookmarks.remove(index);
+        if let Some(storage) = self.storage.as_ref() {
+            storage.delete_bookmark(workspace_id, url);
+        }
+    }
+
     /// Open a bookmark in whichever workspace is currently visible.
     pub fn open_bookmark(&mut self, url: String) {
         self.create_tab(Some(url), true);
@@ -2333,6 +2449,11 @@ impl TabManager {
     /// Consume a request to reveal the downloads bubble after a new transfer.
     pub fn consume_download_bubble_request(&mut self) -> bool {
         std::mem::take(&mut self.download_bubble_requested)
+    }
+
+    /// Consume terminal download notifications for the native toast surface.
+    pub fn consume_download_notifications(&mut self) -> Vec<DownloadNotification> {
+        std::mem::take(&mut self.download_notifications)
     }
 
     fn handle_browser_event(&mut self, event: BrowserEvent) {
@@ -2851,6 +2972,26 @@ impl TabManager {
             UiAction::OpenBookmark { url } => {
                 self.open_bookmark(url);
             }
+            UiAction::SaveBookmark {
+                original_workspace_id,
+                original_url,
+                workspace_id,
+                url,
+                title,
+                folder,
+            } => {
+                self.save_bookmark(
+                    original_workspace_id,
+                    original_url,
+                    workspace_id,
+                    url,
+                    title,
+                    folder,
+                );
+            }
+            UiAction::DeleteBookmark { workspace_id, url } => {
+                self.delete_bookmark(workspace_id, url);
+            }
             UiAction::ApplyPreferences(preferences) => {
                 self.apply_preferences(&preferences);
             }
@@ -3053,9 +3194,101 @@ mod tests {
         BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
         TAB_IDLE_TIMEOUT_NORMAL, TAB_IDLE_TIMEOUT_PRESSURE,
     };
-    use crate::storage::db::SessionTabSnapshot;
+    use crate::events::{DownloadEngine, DownloadInfo, DownloadNotificationKind, DownloadState};
+    use crate::storage::db::{BookmarkItem, SessionTabSnapshot};
     use crate::ui::platform_view::ContentRect;
     use std::time::{Duration, Instant};
+
+    fn test_download_info_with_id(id: u32, state: DownloadState) -> DownloadInfo {
+        DownloadInfo {
+            id,
+            tab_id: 1,
+            url: "https://example.com/file.zip".to_string(),
+            suggested_name: "file.zip".to_string(),
+            full_path: "/Downloads/file.zip".to_string(),
+            received_bytes: 10,
+            total_bytes: 10,
+            percent_complete: 100,
+            current_speed: 0,
+            state,
+            engine: DownloadEngine::Cef,
+            segments: 0,
+            temp_path: String::new(),
+            started_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    fn test_download_info(state: DownloadState) -> DownloadInfo {
+        test_download_info_with_id(7, state)
+    }
+
+    #[test]
+    fn terminal_downloads_queue_native_notifications_once() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut manager = TabManager::new(
+            tx,
+            rx,
+            std::ptr::null_mut(),
+            ContentRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                scale_factor: 1.0,
+            },
+            None,
+            &BrowserPreferences::default(),
+            vec![Workspace::default_workspace()],
+            vec![],
+        );
+
+        manager.record_download(test_download_info(DownloadState::InProgress), None);
+        assert!(manager.consume_download_notifications().is_empty());
+
+        manager.record_download(test_download_info(DownloadState::Completed), None);
+        let notifications = manager.consume_download_notifications();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].download_id, 7);
+        assert_eq!(notifications[0].file_name, "file.zip");
+        assert_eq!(notifications[0].kind, DownloadNotificationKind::Completed);
+        assert!(manager.consume_download_notifications().is_empty());
+
+        manager.record_download(test_download_info(DownloadState::Interrupted), None);
+        let notifications = manager.consume_download_notifications();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].kind, DownloadNotificationKind::Failed);
+    }
+
+    #[test]
+    fn first_observed_terminal_download_still_notifies() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut manager = TabManager::new(
+            tx,
+            rx,
+            std::ptr::null_mut(),
+            ContentRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                scale_factor: 1.0,
+            },
+            None,
+            &BrowserPreferences::default(),
+            vec![Workspace::default_workspace()],
+            vec![],
+        );
+
+        manager.record_download(
+            test_download_info_with_id(8, DownloadState::Completed),
+            None,
+        );
+        let notifications = manager.consume_download_notifications();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].download_id, 8);
+        assert_eq!(notifications[0].kind, DownloadNotificationKind::Completed);
+    }
 
     #[test]
     fn background_browser_spawns_run_while_another_tab_is_active() {
@@ -3481,6 +3714,84 @@ mod tests {
             manager.tabs.len()
         );
         assert_eq!(manager.bookmarks[0].folder, "Archived Studio");
+
+        let original_url = manager.bookmarks[0].url.clone();
+        manager.save_bookmark(
+            2,
+            original_url,
+            1,
+            "https://edited.example".to_string(),
+            "Edited title".to_string(),
+            "Personal".to_string(),
+        );
+        assert_eq!(manager.bookmarks[0].workspace_id, 1);
+        assert_eq!(manager.bookmarks[0].folder, "Personal");
+        assert_eq!(manager.bookmarks[0].title, "Edited title");
+        assert_eq!(manager.bookmarks[0].url, "https://edited.example");
+
+        manager.delete_bookmark(1, "https://edited.example".to_string());
+        assert!(manager.bookmarks.is_empty());
+    }
+
+    #[test]
+    fn moving_a_bookmark_onto_an_existing_url_is_rejected() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut workspaces = vec![Workspace::default_workspace()];
+        let mut work = Workspace::default_workspace();
+        work.id = 2;
+        work.name = "Work".to_string();
+        work.is_default = false;
+        work.is_active = false;
+        workspaces.push(work);
+
+        let mut manager = TabManager::new(
+            tx,
+            rx,
+            std::ptr::null_mut(),
+            ContentRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                scale_factor: 1.0,
+            },
+            None,
+            &BrowserPreferences::default(),
+            workspaces,
+            vec![],
+        );
+        // Same URL in two workspaces. Moving the Personal row into Work must
+        // be rejected because Work already owns that URL.
+        manager.bookmarks.push(BookmarkItem {
+            id: -1,
+            workspace_id: 1,
+            url: "https://shared.example".to_string(),
+            title: "Old".to_string(),
+            folder: "Personal".to_string(),
+        });
+        manager.bookmarks.push(BookmarkItem {
+            id: -1,
+            workspace_id: 2,
+            url: "https://shared.example".to_string(),
+            title: "Target".to_string(),
+            folder: "Work".to_string(),
+        });
+
+        manager.save_bookmark(
+            1,
+            "https://shared.example".to_string(),
+            2,
+            "https://shared.example".to_string(),
+            "Edited".to_string(),
+            "Work".to_string(),
+        );
+
+        assert_eq!(manager.bookmarks.len(), 2);
+        assert_eq!(manager.bookmarks[0].workspace_id, 1);
+        assert_eq!(manager.bookmarks[0].url, "https://shared.example");
+        assert_eq!(manager.bookmarks[0].title, "Old");
+        assert_eq!(manager.bookmarks[1].workspace_id, 2);
+        assert_eq!(manager.bookmarks[1].title, "Target");
     }
 
     #[test]

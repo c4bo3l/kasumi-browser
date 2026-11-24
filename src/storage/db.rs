@@ -67,6 +67,18 @@ pub enum DbCommand {
         title: String,
         folder: String,
     },
+    SaveBookmark {
+        original_workspace_id: u64,
+        original_url: String,
+        workspace_id: u64,
+        url: String,
+        title: String,
+        folder: String,
+    },
+    DeleteBookmark {
+        workspace_id: u64,
+        url: String,
+    },
     RenameBookmarkFolder {
         workspace_id: u64,
         from: String,
@@ -114,6 +126,29 @@ impl StorageHandle {
             title,
             folder,
         });
+    }
+
+    pub fn save_bookmark(
+        &self,
+        original_workspace_id: u64,
+        original_url: String,
+        workspace_id: u64,
+        url: String,
+        title: String,
+        folder: String,
+    ) {
+        self.send(DbCommand::SaveBookmark {
+            original_workspace_id,
+            original_url,
+            workspace_id,
+            url,
+            title,
+            folder,
+        });
+    }
+
+    pub fn delete_bookmark(&self, workspace_id: u64, url: String) {
+        self.send(DbCommand::DeleteBookmark { workspace_id, url });
     }
 
     pub fn rename_bookmark_folder(&self, workspace_id: u64, from: String, to: String) {
@@ -611,6 +646,40 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
                 tracing::warn!("Failed to add bookmark: {}", e);
             }
         }
+        DbCommand::SaveBookmark {
+            original_workspace_id,
+            original_url,
+            workspace_id,
+            url,
+            title,
+            folder,
+        } => {
+            let res = conn.execute(
+                "UPDATE bookmarks
+                 SET workspace_id = ?1, url = ?2, title = ?3, folder = ?4
+                 WHERE workspace_id = ?5 AND url = ?6",
+                params![
+                    workspace_id as i64,
+                    url,
+                    title,
+                    folder,
+                    original_workspace_id as i64,
+                    original_url
+                ],
+            );
+            if let Err(e) = res {
+                tracing::warn!("Failed to save bookmark edits: {}", e);
+            }
+        }
+        DbCommand::DeleteBookmark { workspace_id, url } => {
+            let res = conn.execute(
+                "DELETE FROM bookmarks WHERE workspace_id = ?1 AND url = ?2",
+                params![workspace_id as i64, url],
+            );
+            if let Err(e) = res {
+                tracing::warn!("Failed to delete bookmark: {}", e);
+            }
+        }
         DbCommand::RenameBookmarkFolder {
             workspace_id,
             from,
@@ -1021,6 +1090,52 @@ mod tests {
         assert!(bookmarks.iter().any(|bookmark| {
             bookmark.folder == "Archived Work" && bookmark.url == "https://archived.example"
         }));
+
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn bookmarks_can_be_edited_moved_and_deleted() {
+        let (path, mut conn) = fresh_db("bookmark-edits");
+        apply_command(
+            &mut conn,
+            DbCommand::AddBookmark {
+                workspace_id: 1,
+                url: "https://old.example/page".to_string(),
+                title: "Old title".to_string(),
+                folder: "Personal".to_string(),
+            },
+        );
+        apply_command(
+            &mut conn,
+            DbCommand::SaveBookmark {
+                original_workspace_id: 1,
+                original_url: "https://old.example/page".to_string(),
+                workspace_id: 2,
+                url: "https://new.example/page".to_string(),
+                title: "New title".to_string(),
+                folder: "Work".to_string(),
+            },
+        );
+
+        let bookmarks = StorageManager::load_bookmarks(&path).expect("saved bookmarks");
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].workspace_id, 2);
+        assert_eq!(bookmarks[0].url, "https://new.example/page");
+        assert_eq!(bookmarks[0].title, "New title");
+        assert_eq!(bookmarks[0].folder, "Work");
+
+        apply_command(
+            &mut conn,
+            DbCommand::DeleteBookmark {
+                workspace_id: 2,
+                url: "https://new.example/page".to_string(),
+            },
+        );
+        assert!(StorageManager::load_bookmarks(&path)
+            .expect("bookmarks after delete")
+            .is_empty());
 
         drop(conn);
         remove_test_db(&path);
