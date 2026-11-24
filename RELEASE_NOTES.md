@@ -9,16 +9,16 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 ### Added
 
 - Native Workspaces. Each workspace owns its pinned and regular tabs, remembers the tab selected in it, and can be switched from a dedicated strip in both rail modes. Workspace metadata and per-workspace session tabs persist in SQLite, and startup still spawns only the active tab while restoring every other tab as hibernated.
-- The native Settings dialog is split into **General**, **Workspaces**, and **Bookmarks** pages. The Workspaces page lists every workspace with Default/Active badges and uses Material Symbols icon buttons. Workspace selection, editing, creation, deletion, switching, and default selection are separate explicit actions. The accent tints only native chrome accents — rail, command palette, tab borders, loading indicator, and tooltips — so CEF page colours are untouched.
+- The native Settings dialog is split into **General**, **Workspaces**, and **Bookmarks** pages. The Workspaces page lists every workspace with Default/Active badges and edits the selected workspace with Material Symbols icon buttons. Creation uses a dedicated mode opened by **New workspace** or the rail `+`; its form replaces the list/editor instead of appearing beside an existing workspace, **Back** returns without creating, and a successful create returns to the list with the new workspace selected. Switching, default selection, and deletion remain explicit actions. The accent tints only native chrome accents — rail, command palette, tab borders, loading indicator, and tooltips — so CEF page colours are untouched.
 - Any workspace can be selected as the default workspace. The default controls which workspace opens at startup; switching workspaces during the current session still takes effect immediately. Deleting the default workspace promotes another workspace instead of leaving the browser without a startup space.
 - Workspace-named bookmark folders. Saving a bookmark uses the active workspace name; every bookmark remains globally visible and can be opened from any other workspace. The Bookmarks Settings page lists folders and includes an **Open** action for each saved page.
 - SQLite schema and migrations for `workspaces`, workspace-aware `session_tabs`, and workspace-scoped bookmarks. Legacy databases gain a default `Personal` workspace, legacy `Toolbar` bookmarks are moved into it, and session/bookmark reads tolerate older column layouts. A persisted `is_default` flag is backfilled from the previous active workspace.
-- Unit tests for workspace tab/pin/bookmark ownership, workspace-aware insertion order, unique workspace names, accent tinting, workspace persistence, stale-workspace normalization, default-workspace startup/selection/deletion and empty-workspace restore, separate edit/create workspace drafts, Settings page selection, bookmark folder isolation, `Cmd/Ctrl+Q` routing, and closing the last tab in a workspace.
+- Unit tests for workspace tab/pin/bookmark ownership, workspace-aware insertion order, unique workspace names, accent tinting, workspace persistence, stale-workspace normalization, default-workspace startup/selection/deletion and empty-workspace restore, separate edit/create drafts, dedicated create-mode state, collapsed workspace switching and tooltips, Settings page selection, bookmark folder isolation, `Cmd/Ctrl+Q` routing, legacy database migration, and closing the last tab in a workspace.
 
 ### Changed
 
-- The collapsed and expanded rails now show a coloured workspace switcher above the tab list; tabs are filtered to the active workspace, and pinned tabs remain at the top of each workspace group.
-- The rail's **New workspace** button opens directly on the Workspaces Settings page; the regular Settings button and `Cmd/Ctrl+,` still open General first. Settings actions use Material-style filled/tonal/outlined icon buttons, and the Workspaces page has distinct **Save changes** and **Create workspace** forms.
+- The collapsed and expanded rails now show a workspace switcher above the tab list; tabs are filtered to the active workspace, and pinned tabs remain at the top of each workspace group. Collapsed mode uses larger 34×34 icon buttons, accent borders, a current-space dot, and name tooltips so spaces can be changed without expanding the rail. The redundant `KASUMI` rail title was removed.
+- The rail's **New workspace** button opens directly in Workspaces create mode; the regular Settings button and `Cmd/Ctrl+,` still open General first. Settings actions use Material-style filled/tonal/outlined icon buttons, and editing uses an explicit **Save changes** action.
 - Command-palette tab results now show their workspace name alongside the URL.
 - Closing the active tab keeps the user in the same workspace when other tabs remain, and opens a fresh tab there instead of jumping to another workspace when it was the workspace's last tab.
 - Bookmark folder renames are scoped by workspace id, so archived folders from deleted workspaces are never accidentally renamed with an unrelated active workspace.
@@ -30,7 +30,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 - Duplicate workspace names are rejected by appending `2`, `3`, and so on, keeping bookmark folder names unambiguous.
 - Closing the last tab in one workspace no longer silently switches to a different workspace.
 - Restoring a session no longer overrides the chosen default workspace with another workspace's saved tab when the default has no saved tabs.
-- Editing a workspace name no longer renames that workspace when **Create workspace** is clicked. The editor and creator now use independent drafts, so changing `Personal` to `asd` and creating a workspace leaves `Personal` intact and creates only the new workspace from the create form.
+- Editing a workspace name no longer renames that workspace when **Create workspace** is clicked. Creation now has its own mode and draft, so changing `Personal` to `asd` and creating a workspace leaves `Personal` intact and creates only the new workspace from the create form.
 - `Cmd+Q` now closes the app gracefully. The macOS app menu includes **Quit Kasumi Browser**, the native event monitor maps `Cmd+Q`, and the main keyboard handler maps `Ctrl/Cmd+Q` to the same deferred CEF/SQLite shutdown path as the window close button.
 - Existing databases created by the first Workspaces build now migrate before the default-workspace row is written, so startup no longer fails with `table workspaces has no column named is_default`. The previously active workspace is promoted to default.
 
@@ -38,7 +38,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 - `cargo fmt --all -- --check`
 - `cargo check --bins`
-- `cargo test --bin kasumi-browser` — 119 tests
+- `cargo test --bin kasumi-browser` — 122 tests
 - `cargo build --release`
 - PR CI checks formatting, binaries, and unit tests on macOS 15 Intel, Windows, and Linux; interactive macOS verification is required before merge.
 

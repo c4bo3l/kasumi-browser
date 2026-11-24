@@ -575,9 +575,12 @@ pub struct ChromeState {
     pub workspace_edit_name_draft: String,
     pub workspace_edit_icon_draft: WorkspaceIcon,
     pub workspace_edit_color_draft: WorkspaceColor,
-    /// Separate draft for creating a new workspace. Keeping this distinct from
-    /// the editor is what prevents "Create" from accidentally renaming the
-    /// selected workspace.
+    /// When true, the Workspaces page shows only the dedicated create form.
+    /// Manage mode never shows create fields beside an existing workspace.
+    pub workspace_create_mode: bool,
+    /// Draft used only while `workspace_create_mode` is active. Keeping it
+    /// distinct from the editor prevents "Create" from renaming the selected
+    /// workspace.
     pub workspace_new_name_draft: String,
     pub workspace_new_icon_draft: WorkspaceIcon,
     pub workspace_new_color_draft: WorkspaceColor,
@@ -619,6 +622,7 @@ impl Default for ChromeState {
             workspace_edit_name_draft: String::new(),
             workspace_edit_icon_draft: WorkspaceIcon::default(),
             workspace_edit_color_draft: WorkspaceColor::default(),
+            workspace_create_mode: false,
             workspace_new_name_draft: "New workspace".to_string(),
             workspace_new_icon_draft: WorkspaceIcon::default(),
             workspace_new_color_draft: WorkspaceColor::default(),
@@ -700,16 +704,47 @@ impl ChromeState {
         self.tooltip = None;
         self.settings_tab = tab;
         self.settings_draft = self.preferences.clone();
+        self.workspace_create_mode = false;
+        self.reset_workspace_create_draft();
+        self.sync_workspace_draft();
+        self.settings_open = true;
+    }
+
+    /// Open Workspaces directly in the dedicated creation form. The rail's
+    /// **New workspace** button uses this so creation is never mixed into the
+    /// list of existing workspaces.
+    pub fn open_workspace_creator(&mut self) {
+        self.open_settings_tab(SettingsTab::Workspaces);
+        self.workspace_create_mode = true;
+    }
+
+    fn reset_workspace_create_draft(&mut self) {
         self.workspace_new_name_draft = "New workspace".to_string();
         self.workspace_new_icon_draft = WorkspaceIcon::default();
         self.workspace_new_color_draft = WorkspaceColor::default();
-        self.sync_workspace_draft();
-        self.settings_open = true;
+    }
+
+    /// Leave creation mode without emitting an action. Used by Cancel/Back.
+    pub fn close_workspace_creator(&mut self) {
+        self.workspace_create_mode = false;
+        self.reset_workspace_create_draft();
+    }
+
+    /// Re-seed the editor from whichever workspace becomes active after a
+    /// create/delete action. The next frame has fresh workspace metadata by
+    /// then, so the newly created or remaining workspace is selected.
+    pub fn follow_active_workspace(&mut self) {
+        self.selected_workspace_id = None;
+        self.workspace_edit_name_draft.clear();
+        self.workspace_edit_icon_draft = WorkspaceIcon::default();
+        self.workspace_edit_color_draft = WorkspaceColor::default();
     }
 
     pub fn close_settings(&mut self) {
         self.settings_open = false;
         self.settings_draft = self.preferences.clone();
+        self.workspace_create_mode = false;
+        self.reset_workspace_create_draft();
     }
 
     /// Close whichever shared overlay is currently visible.
@@ -1084,6 +1119,7 @@ impl ChromeRenderer {
         ui: &mut Ui,
         state: &mut ChromeState,
         actions: &mut Vec<UiAction>,
+        tooltip_slot: &mut Option<RailTooltip>,
         palette: &ChromePalette,
         width: f32,
         expanded: bool,
@@ -1094,32 +1130,60 @@ impl ChromeRenderer {
         }
 
         if !expanded {
-            ui.horizontal_wrapped(|ui| {
+            // The collapsed rail is the primary workspace switcher, so each
+            // space gets a large, high-contrast target with an explicit accent
+            // border and a name tooltip instead of a tiny colour dot.
+            ui.vertical(|ui| {
                 for workspace in &workspaces {
                     let active = workspace.id == state.active_workspace_id;
-                    let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
+                    let (rect, response) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
                     let (r, g, b) = workspace.color.rgb();
-                    ui.painter().rect_filled(
-                        rect,
-                        Rounding::same(7.0),
-                        if active {
-                            Color32::from_rgb(r, g, b)
-                        } else if response.hovered() {
-                            palette.rail_surface
-                        } else {
-                            Color32::TRANSPARENT
-                        },
+                    let accent = Color32::from_rgb(r, g, b);
+                    let fill = if active {
+                        mix_color(palette.rail_surface, accent, 0.42)
+                    } else if response.hovered() {
+                        palette.rail_row_hover
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    ui.painter().rect_filled(rect, Rounding::same(9.0), fill);
+                    ui.painter().rect_stroke(
+                        rect.shrink(0.5),
+                        Rounding::same(9.0),
+                        Stroke::new(
+                            if active { 2.0_f32 } else { 1.0_f32 },
+                            if active {
+                                accent
+                            } else {
+                                palette.palette_border
+                            },
+                        ),
                     );
                     paint_rail_icon(
                         ui,
-                        rect.shrink(5.0),
+                        rect.shrink(9.0),
                         workspace.icon.into(),
                         if active {
-                            Color32::from_rgb(12, 16, 24)
+                            palette.text_strong
                         } else {
                             palette.text
                         },
                     );
+                    if active {
+                        ui.painter().circle_filled(
+                            pos2(rect.center().x, rect.max.y - 4.0),
+                            2.0,
+                            accent,
+                        );
+                    }
+                    let tooltip = if active {
+                        format!("{} — current space", workspace.name)
+                    } else if workspace.is_default {
+                        format!("Switch to {} (default)", workspace.name)
+                    } else {
+                        format!("Switch to {}", workspace.name)
+                    };
+                    Self::chrome_tooltip(tooltip_slot, ui, &response, tooltip, false);
                     if response.clicked() {
                         actions.push(UiAction::SwitchWorkspace {
                             workspace_id: workspace.id,
@@ -1191,8 +1255,9 @@ impl ChromeRenderer {
             palette,
         );
         if add.clicked() {
-            // Workspace creation values live on the dedicated Settings page.
-            state.open_settings_tab(SettingsTab::Workspaces);
+            // Open the dedicated create form instead of mixing creation into
+            // the list of existing workspaces.
+            state.open_workspace_creator();
         }
     }
 
@@ -1243,7 +1308,15 @@ impl ChromeRenderer {
                         );
 
                         ui.add_space(4.0);
-                        Self::build_workspace_switcher(ui, state, actions, &palette, width, false);
+                        Self::build_workspace_switcher(
+                            ui,
+                            state,
+                            actions,
+                            tooltip_slot,
+                            &palette,
+                            width,
+                            false,
+                        );
                         ui.add_space(4.0);
 
                         ui.add_space(3.0);
@@ -1430,17 +1503,6 @@ impl ChromeRenderer {
                     if collapse.clicked() {
                         state.toggle_rail();
                     }
-                    ui.add_space(3.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(10.0);
-                        ui.label(
-                            RichText::new("KASUMI")
-                                .size(12.0)
-                                .strong()
-                                .color(palette.brand),
-                        );
-                    });
-
                     ui.add_space(6.0);
                     ui.separator();
                     ui.add_space(6.0);
@@ -1508,7 +1570,15 @@ impl ChromeRenderer {
                     );
 
                     ui.add_space(8.0);
-                    Self::build_workspace_switcher(ui, state, actions, &palette, width, true);
+                    Self::build_workspace_switcher(
+                        ui,
+                        state,
+                        actions,
+                        tooltip_slot,
+                        &palette,
+                        width,
+                        true,
+                    );
                     ui.add_space(6.0);
 
                     if state
@@ -1997,8 +2067,11 @@ impl ChromeRenderer {
                 .find(|workspace| workspace.id == id)
                 .cloned()
         });
+        let workspace_create_mode = state.workspace_create_mode;
         let mut save_clicked = false;
         let mut create_clicked = false;
+        let mut cancel_create_clicked = false;
+        let mut new_workspace_clicked = false;
         let mut delete_clicked = false;
         let mut make_default_clicked = false;
         let mut switch_clicked = false;
@@ -2168,133 +2241,25 @@ impl ChromeRenderer {
                                 );
                                 }
                                 SettingsTab::Workspaces => {
-                                    ui.label(
-                                        RichText::new("WORKSPACES")
-                                            .size(10.0)
-                                            .strong()
-                                            .color(palette.section_label),
-                                    );
-                                    ui.label(
-                                        RichText::new(
-                                            "Pick a workspace to edit, then use its own Save action. Creating a workspace never changes an existing one.",
-                                        )
-                                        .size(10.0)
-                                        .color(palette.palette_hint),
-                                    );
-                                    ui.add_space(6.0);
-
-                                    ui.label(
-                                        RichText::new("YOUR WORKSPACES")
-                                            .size(9.0)
-                                            .color(palette.section_label),
-                                    );
-                                    for workspace in &workspaces {
-                                        let is_selected = Some(workspace.id) == selected_workspace_id;
-                                        let width = ui.available_width();
-                                        let (rect, response) =
-                                            ui.allocate_exact_size(vec2(width, 32.0), Sense::click());
-                                        let fill = if is_selected {
-                                            palette.rail_row_active
-                                        } else if response.hovered() {
-                                            palette.rail_row_hover
-                                        } else {
-                                            Color32::TRANSPARENT
-                                        };
-                                        ui.painter().rect_filled(rect, Rounding::same(8.0), fill);
-                                        let (r, g, b) = workspace.color.rgb();
-                                        paint_rail_icon(
-                                            ui,
-                                            egui::Rect::from_center_size(
-                                                pos2(rect.min.x + 18.0, rect.center().y),
-                                                vec2(18.0, 18.0),
-                                            ),
-                                            workspace.icon.into(),
-                                            Color32::from_rgb(r, g, b),
-                                        );
-                                        let mut badges = Vec::new();
-                                        if workspace.is_default {
-                                            badges.push("Default");
-                                        }
-                                        if workspace.is_active {
-                                            badges.push("Active");
-                                        }
-                                        let suffix = if badges.is_empty() {
-                                            String::new()
-                                        } else {
-                                            format!("  ·  {}", badges.join(" · "))
-                                        };
-                                        ui.painter().text(
-                                            pos2(rect.min.x + 36.0, rect.center().y),
-                                            Align2::LEFT_CENTER,
-                                            format!("{}{}", truncate_title(&workspace.name, 24), suffix),
-                                            FontId::new(11.0, FontFamily::Proportional),
-                                            if is_selected {
-                                                palette.text_strong
-                                            } else {
-                                                palette.text
-                                            },
-                                        );
-                                        if response.clicked() {
-                                            selected_workspace_id = Some(workspace.id);
-                                            edit_name = workspace.name.clone();
-                                            edit_icon = workspace.icon;
-                                            edit_color = workspace.color;
-                                        }
-                                    }
-
-                                    ui.add_space(8.0);
-                                    ui.separator();
-                                    ui.add_space(6.0);
-                                    if let Some(workspace) = &selected_workspace {
+                                    if workspace_create_mode {
                                         ui.label(
-                                            RichText::new(format!("EDIT “{}”", workspace.name))
+                                            RichText::new("CREATE A WORKSPACE")
                                                 .size(10.0)
                                                 .strong()
-                                                .color(palette.palette_subtext),
+                                                .color(palette.section_label),
                                         );
-                                        ui.add_space(3.0);
-                                        ui.horizontal(|ui| {
-                                            if workspace.is_default {
-                                                ui.label(
-                                                    RichText::new("DEFAULT WORKSPACE")
-                                                        .size(9.0)
-                                                        .color(palette.rail_accent),
-                                                );
-                                            } else {
-                                                make_default_clicked = material_button(
-                                                    ui,
-                                                    RailIcon::Star,
-                                                    "Make default",
-                                                    MaterialButtonStyle::Tonal,
-                                                    palette,
-                                                    true,
-                                                )
-                                                .clicked();
-                                            }
-                                            if !workspace.is_active {
-                                                switch_clicked = material_button(
-                                                    ui,
-                                                    RailIcon::OpenInNew,
-                                                    "Switch to",
-                                                    MaterialButtonStyle::Outlined,
-                                                    palette,
-                                                    true,
-                                                )
-                                                .clicked();
-                                            }
-                                        });
                                         ui.label(
                                             RichText::new(
-                                                "The default opens at startup; switching changes only the current session.",
+                                                "Choose a name, icon, and accent. Your current workspace stays untouched until you create it.",
                                             )
-                                            .size(9.0)
+                                            .size(10.0)
                                             .color(palette.palette_hint),
                                         );
-                                        ui.add_space(5.0);
+                                        ui.add_space(6.0);
                                         ui.horizontal(|ui| {
                                             ui.label("Name");
                                             ui.add(
-                                                TextEdit::singleline(&mut edit_name)
+                                                TextEdit::singleline(&mut new_name)
                                                     .desired_width(240.0),
                                             );
                                         });
@@ -2307,10 +2272,10 @@ impl ChromeRenderer {
                                         ui.horizontal_wrapped(|ui| {
                                             for icon in WorkspaceIcon::ALL {
                                                 if ui
-                                                    .selectable_label(edit_icon == icon, icon.label())
+                                                    .selectable_label(new_icon == icon, icon.label())
                                                     .clicked()
                                                 {
-                                                    edit_icon = icon;
+                                                    new_icon = icon;
                                                 }
                                             }
                                         });
@@ -2327,111 +2292,251 @@ impl ChromeRenderer {
                                                     RichText::new(format!("● {}", color.label()))
                                                         .color(Color32::from_rgb(r, g, b));
                                                 if ui
-                                                    .selectable_label(edit_color == color, swatch)
+                                                    .selectable_label(new_color == color, swatch)
                                                     .clicked()
                                                 {
-                                                    edit_color = color;
+                                                    new_color = color;
                                                 }
                                             }
                                         });
-                                        ui.add_space(6.0);
+                                        ui.add_space(8.0);
                                         ui.horizontal(|ui| {
-                                            save_clicked = material_button(
+                                            create_clicked = material_button(
                                                 ui,
-                                                RailIcon::Check,
-                                                "Save changes",
+                                                RailIcon::Plus,
+                                                "Create workspace",
                                                 MaterialButtonStyle::Filled,
                                                 palette,
                                                 true,
                                             )
                                             .clicked();
-                                            delete_clicked = material_button(
+                                            cancel_create_clicked = material_button(
                                                 ui,
-                                                RailIcon::Delete,
-                                                "Delete",
-                                                MaterialButtonStyle::Text,
+                                                RailIcon::ChevronLeft,
+                                                "Back",
+                                                MaterialButtonStyle::Outlined,
                                                 palette,
-                                                workspace_count > 1,
+                                                true,
                                             )
                                             .clicked();
                                         });
+                                    } else {
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new("WORKSPACES")
+                                                    .size(10.0)
+                                                    .strong()
+                                                    .color(palette.section_label),
+                                            );
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    new_workspace_clicked = material_button(
+                                                        ui,
+                                                        RailIcon::Plus,
+                                                        "New workspace",
+                                                        MaterialButtonStyle::Tonal,
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked();
+                                                },
+                                            );
+                                        });
                                         ui.label(
                                             RichText::new(
-                                                "Saving renames this workspace's bookmark folder. Deleting archives its bookmarks instead of removing them.",
+                                                "Pick a workspace to edit. Creation happens in its own form.",
                                             )
                                             .size(10.0)
                                             .color(palette.palette_hint),
                                         );
-                                    }
+                                        ui.add_space(6.0);
 
-                                    ui.add_space(10.0);
-                                    ui.separator();
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        RichText::new("CREATE WORKSPACE")
-                                            .size(10.0)
-                                            .strong()
-                                            .color(palette.section_label),
-                                    );
-                                    ui.label(
-                                        RichText::new(
-                                            "This form is independent from the editor above.",
-                                        )
-                                        .size(10.0)
-                                        .color(palette.palette_hint),
-                                    );
-                                    ui.horizontal(|ui| {
-                                        ui.label("Name");
-                                        ui.add(
-                                            TextEdit::singleline(&mut new_name).desired_width(240.0),
+                                        ui.label(
+                                            RichText::new("YOUR WORKSPACES")
+                                                .size(9.0)
+                                                .color(palette.section_label),
                                         );
-                                    });
-                                    ui.add_space(5.0);
-                                    ui.label(
-                                        RichText::new("ICON")
-                                            .size(9.0)
-                                            .color(palette.section_label),
-                                    );
-                                    ui.horizontal_wrapped(|ui| {
-                                        for icon in WorkspaceIcon::ALL {
-                                            if ui
-                                                .selectable_label(new_icon == icon, icon.label())
-                                                .clicked()
-                                            {
-                                                new_icon = icon;
+                                        for workspace in &workspaces {
+                                            let is_selected = Some(workspace.id) == selected_workspace_id;
+                                            let width = ui.available_width();
+                                            let (rect, response) =
+                                                ui.allocate_exact_size(vec2(width, 32.0), Sense::click());
+                                            let fill = if is_selected {
+                                                palette.rail_row_active
+                                            } else if response.hovered() {
+                                                palette.rail_row_hover
+                                            } else {
+                                                Color32::TRANSPARENT
+                                            };
+                                            ui.painter().rect_filled(rect, Rounding::same(8.0), fill);
+                                            let (r, g, b) = workspace.color.rgb();
+                                            paint_rail_icon(
+                                                ui,
+                                                egui::Rect::from_center_size(
+                                                    pos2(rect.min.x + 18.0, rect.center().y),
+                                                    vec2(18.0, 18.0),
+                                                ),
+                                                workspace.icon.into(),
+                                                Color32::from_rgb(r, g, b),
+                                            );
+                                            let mut badges = Vec::new();
+                                            if workspace.is_default {
+                                                badges.push("Default");
+                                            }
+                                            if workspace.is_active {
+                                                badges.push("Active");
+                                            }
+                                            let suffix = if badges.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!("  ·  {}", badges.join(" · "))
+                                            };
+                                            ui.painter().text(
+                                                pos2(rect.min.x + 36.0, rect.center().y),
+                                                Align2::LEFT_CENTER,
+                                                format!(
+                                                    "{}{}",
+                                                    truncate_title(&workspace.name, 24),
+                                                    suffix
+                                                ),
+                                                FontId::new(11.0, FontFamily::Proportional),
+                                                if is_selected {
+                                                    palette.text_strong
+                                                } else {
+                                                    palette.text
+                                                },
+                                            );
+                                            if response.clicked() {
+                                                selected_workspace_id = Some(workspace.id);
+                                                edit_name = workspace.name.clone();
+                                                edit_icon = workspace.icon;
+                                                edit_color = workspace.color;
                                             }
                                         }
-                                    });
-                                    ui.add_space(5.0);
-                                    ui.label(
-                                        RichText::new("ACCENT")
-                                            .size(9.0)
-                                            .color(palette.section_label),
-                                    );
-                                    ui.horizontal_wrapped(|ui| {
-                                        for color in WorkspaceColor::ALL {
-                                            let (r, g, b) = color.rgb();
-                                            let swatch =
-                                                RichText::new(format!("● {}", color.label()))
-                                                    .color(Color32::from_rgb(r, g, b));
-                                            if ui
-                                                .selectable_label(new_color == color, swatch)
-                                                .clicked()
-                                            {
-                                                new_color = color;
-                                            }
+
+                                        ui.add_space(8.0);
+                                        ui.separator();
+                                        ui.add_space(6.0);
+                                        if let Some(workspace) = &selected_workspace {
+                                            ui.label(
+                                                RichText::new(format!("EDIT “{}”", workspace.name))
+                                                    .size(10.0)
+                                                    .strong()
+                                                    .color(palette.palette_subtext),
+                                            );
+                                            ui.add_space(3.0);
+                                            ui.horizontal(|ui| {
+                                                if workspace.is_default {
+                                                    ui.label(
+                                                        RichText::new("DEFAULT WORKSPACE")
+                                                            .size(9.0)
+                                                            .color(palette.rail_accent),
+                                                    );
+                                                } else {
+                                                    make_default_clicked = material_button(
+                                                        ui,
+                                                        RailIcon::Star,
+                                                        "Make default",
+                                                        MaterialButtonStyle::Tonal,
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked();
+                                                }
+                                                if !workspace.is_active {
+                                                    switch_clicked = material_button(
+                                                        ui,
+                                                        RailIcon::OpenInNew,
+                                                        "Switch to",
+                                                        MaterialButtonStyle::Outlined,
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked();
+                                                }
+                                            });
+                                            ui.label(
+                                                RichText::new(
+                                                    "The default opens at startup; switching changes only the current session.",
+                                                )
+                                                .size(9.0)
+                                                .color(palette.palette_hint),
+                                            );
+                                            ui.add_space(5.0);
+                                            ui.horizontal(|ui| {
+                                                ui.label("Name");
+                                                ui.add(
+                                                    TextEdit::singleline(&mut edit_name)
+                                                        .desired_width(240.0),
+                                                );
+                                            });
+                                            ui.add_space(5.0);
+                                            ui.label(
+                                                RichText::new("ICON")
+                                                    .size(9.0)
+                                                    .color(palette.section_label),
+                                            );
+                                            ui.horizontal_wrapped(|ui| {
+                                                for icon in WorkspaceIcon::ALL {
+                                                    if ui
+                                                        .selectable_label(edit_icon == icon, icon.label())
+                                                        .clicked()
+                                                    {
+                                                        edit_icon = icon;
+                                                    }
+                                                }
+                                            });
+                                            ui.add_space(5.0);
+                                            ui.label(
+                                                RichText::new("ACCENT")
+                                                    .size(9.0)
+                                                    .color(palette.section_label),
+                                            );
+                                            ui.horizontal_wrapped(|ui| {
+                                                for color in WorkspaceColor::ALL {
+                                                    let (r, g, b) = color.rgb();
+                                                    let swatch =
+                                                        RichText::new(format!("● {}", color.label()))
+                                                            .color(Color32::from_rgb(r, g, b));
+                                                    if ui
+                                                        .selectable_label(edit_color == color, swatch)
+                                                        .clicked()
+                                                    {
+                                                        edit_color = color;
+                                                    }
+                                                }
+                                            });
+                                            ui.add_space(6.0);
+                                            ui.horizontal(|ui| {
+                                                save_clicked = material_button(
+                                                    ui,
+                                                    RailIcon::Check,
+                                                    "Save changes",
+                                                    MaterialButtonStyle::Filled,
+                                                    palette,
+                                                    true,
+                                                )
+                                                .clicked();
+                                                delete_clicked = material_button(
+                                                    ui,
+                                                    RailIcon::Delete,
+                                                    "Delete",
+                                                    MaterialButtonStyle::Text,
+                                                    palette,
+                                                    workspace_count > 1,
+                                                )
+                                                .clicked();
+                                            });
+                                            ui.label(
+                                                RichText::new(
+                                                    "Saving renames this workspace's bookmark folder. Deleting archives its bookmarks instead of removing them.",
+                                                )
+                                                .size(10.0)
+                                                .color(palette.palette_hint),
+                                            );
                                         }
-                                    });
-                                    ui.add_space(6.0);
-                                    create_clicked = material_button(
-                                        ui,
-                                        RailIcon::Plus,
-                                        "Create workspace",
-                                        MaterialButtonStyle::Filled,
-                                        palette,
-                                        true,
-                                    )
-                                    .clicked();
+                                    }
                                 }
                                 SettingsTab::Bookmarks => {
                                 ui.add_space(10.0);
@@ -2557,7 +2662,12 @@ impl ChromeRenderer {
                     .expand(8.0);
             });
 
+        if settings_tab != state.settings_tab && settings_tab != SettingsTab::Workspaces {
+            state.workspace_create_mode = false;
+            state.reset_workspace_create_draft();
+        }
         state.settings_tab = settings_tab;
+        state.workspace_create_mode = workspace_create_mode;
 
         let next = draft.normalized();
         state.settings_draft = next.clone();
@@ -2601,10 +2711,18 @@ impl ChromeRenderer {
             delete_clicked,
         ));
         actions.extend(workspace_actions);
-        // Creating or deleting a workspace changes the workspace list; close
-        // the editor so the next open re-seeds both forms from current state.
-        if create_clicked || delete_clicked {
-            state.close_settings();
+
+        if cancel_create_clicked {
+            state.close_workspace_creator();
+        }
+        if create_clicked {
+            // Creation returns to the manage list. Clear the selection so the
+            // next frame follows the newly created, now-active workspace.
+            state.close_workspace_creator();
+            state.follow_active_workspace();
+        }
+        if delete_clicked {
+            state.follow_active_workspace();
         }
 
         let outside_click = ctx.input(|i| {
@@ -2614,8 +2732,15 @@ impl ChromeRenderer {
                 i.pointer.primary_clicked(),
             )
         });
-        if requested_close || done_clicked || outside_click {
+        if workspace_create_mode && requested_close && !create_clicked {
+            // Escape in the create form goes back instead of closing Settings.
+            state.close_workspace_creator();
+        } else if requested_close || done_clicked || outside_click {
             state.close_settings();
+        }
+
+        if new_workspace_clicked {
+            state.open_workspace_creator();
         }
     }
 
@@ -4785,6 +4910,50 @@ mod tests {
         assert_eq!(state.workspace_edit_name_draft, "Personal");
         assert_eq!(state.workspace_edit_color_draft, WorkspaceColor::Blue);
         assert_eq!(state.workspace_new_name_draft, "New workspace");
+    }
+
+    #[test]
+    fn workspace_creator_is_a_separate_settings_mode() {
+        let mut state = ChromeState::default();
+        state.open_settings();
+        assert!(!state.workspace_create_mode);
+
+        state.open_workspace_creator();
+        assert!(state.settings_open);
+        assert_eq!(state.settings_tab, SettingsTab::Workspaces);
+        assert!(state.workspace_create_mode);
+
+        state.workspace_new_name_draft = "Half-finished".to_string();
+        state.close_workspace_creator();
+        assert!(!state.workspace_create_mode);
+        assert_eq!(state.workspace_new_name_draft, "New workspace");
+    }
+
+    #[test]
+    fn closing_settings_resets_the_workspace_creator() {
+        let mut state = ChromeState::default();
+        state.open_workspace_creator();
+        state.workspace_new_name_draft = "Half-finished".to_string();
+
+        state.close_settings();
+        assert!(!state.settings_open);
+        assert!(!state.workspace_create_mode);
+        assert_eq!(state.workspace_new_name_draft, "New workspace");
+    }
+
+    #[test]
+    fn following_active_workspace_clears_the_stale_editor_selection() {
+        let mut state = ChromeState::default();
+        state.selected_workspace_id = Some(7);
+        state.workspace_edit_name_draft = "Stale".to_string();
+        state.workspace_edit_icon_draft = WorkspaceIcon::Palette;
+        state.workspace_edit_color_draft = WorkspaceColor::Purple;
+
+        state.follow_active_workspace();
+        assert_eq!(state.selected_workspace_id, None);
+        assert!(state.workspace_edit_name_draft.is_empty());
+        assert_eq!(state.workspace_edit_icon_draft, WorkspaceIcon::default());
+        assert_eq!(state.workspace_edit_color_draft, WorkspaceColor::default());
     }
 
     #[test]
