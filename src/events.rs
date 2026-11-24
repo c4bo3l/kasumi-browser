@@ -28,7 +28,7 @@ impl DownloadEngine {
 }
 
 /// Lifecycle state of a native download. Stored as text in SQLite and mirrored
-/// into the Downloads Settings page without exposing CEF objects to the UI.
+/// into the native downloads bubble without exposing CEF objects to the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadState {
     InProgress,
@@ -465,7 +465,7 @@ pub enum UiAction {
     OpenBookmark {
         url: String,
     },
-    /// Open the native Downloads page.
+    /// Open the native downloads bubble.
     OpenDownloads,
     /// Pause an active download through its CEF item callback.
     PauseDownload {

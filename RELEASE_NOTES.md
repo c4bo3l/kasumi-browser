@@ -8,9 +8,10 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ### Added
 
-- Native download manager with a WAL-backed history, active progress, speed, file path, pause/resume/cancel, retry, remove, clear-finished, open-file, and show-in-folder controls. Downloads run through CEF's existing browser process and native child views, with no save prompt, OSR view, or second renderer.
-- Parallel segmented HTTP(S) downloads. After CEF resolves the destination, Kasumi cancels the CEF copy and fetches up to eight balanced `Range` segments through CEF `URLRequest`s, writing to a `.kasumi.part` file on a background Rust thread and renaming it on completion. Pause cancels active requests; resume continues from each segment's last byte; retry starts a fresh generation so late callbacks cannot corrupt the file. The Downloads page shows the active connection count, and non-HTTP or non-range-capable transfers still work as a single native request.
-- A native Downloads page inside Settings, opened by `Cmd/Ctrl+J`, the rail button in both modes, the macOS File menu, or the command palette. Stale downloads are marked interrupted after a restart so Retry is always available instead of dead controls.
+- Native download manager with a WAL-backed history, active progress, speed, file path, pause/resume/cancel, retry, remove-info, clear-finished, open-file, and show-in-folder controls. Downloads run through CEF's existing browser process and native child views, with no save prompt, OSR view, or second renderer.
+- Parallel segmented HTTP(S) downloads. After CEF resolves the destination, Kasumi cancels the CEF copy and fetches up to eight balanced `Range` segments through CEF `URLRequest`s, writing to a `.kasumi.part` file on a background Rust thread and renaming it on completion. Pause cancels active requests; resume continues from each segment's last byte; retry starts a fresh generation so late callbacks cannot corrupt the file. Each download row shows the active connection count, and non-HTTP or non-range-capable transfers still work as a single native request.
+- An Arc/Edge-style native downloads bubble replaces the former Settings page. Its header aggregates active/done/failed transfers and overall progress, and each row reports individual progress with open/remove controls. Open it from the rail button in both modes, `Cmd/Ctrl+J`, the macOS **Kasumi Browser** app menu, or the command palette; a new transfer reveals it automatically. Stale downloads are marked interrupted after a restart so Retry is always available instead of dead controls.
+- Rail and menu refinements: the collapse/expand control now sits at the bottom of the tab manager with a clearer sidebar glyph, the expanded rail has an editable/copyable address field, macOS shell actions live directly in the **Kasumi Browser** app menu rather than a separate File menu, and the app-menu title is `Kasumi Browser` for unbundled binaries. Rail tooltips are now compact and translucent so the page stays visible through the native overlay.
 - Incognito mode research notes in the README future-development roadmap.
 - Version bumped from `0.6.0` to `0.7.0` across the package, lockfile, canonical spec, bundle metadata, About menu, and docs.
 
@@ -18,7 +19,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 - `cargo fmt --all -- --check`
 - `cargo check --bins`
-- `cargo test --bin kasumi-browser` — 142 tests
+- `cargo test --bin kasumi-browser` — 146 tests
 - `cargo build --release`
 - PR CI checks formatting, binaries, and unit tests on macOS 15 Intel, Windows, and Linux; interactive macOS verification is required before merge.
 

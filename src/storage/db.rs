@@ -379,11 +379,11 @@ impl StorageManager {
         Ok(bookmarks)
     }
 
-    /// Load persisted downloads, newest first, for the native Downloads page.
+    /// Load persisted downloads, newest first, for the native downloads bubble.
     pub fn load_downloads(db_path: &Path) -> Result<Vec<DownloadInfo>, rusqlite::Error> {
         let conn = Self::init_db(db_path)?;
         // CEF download callbacks never survive a restart. Normalize stale
-        // active rows so the native page offers Retry instead of dead controls.
+        // active rows so the bubble offers Retry instead of dead controls.
         conn.execute(
             "UPDATE downloads
              SET state = 'interrupted', current_speed = 0

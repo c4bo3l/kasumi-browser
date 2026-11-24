@@ -22,7 +22,7 @@ use config::{rail_width, BrowserPreferences, SHUTDOWN_MAX_WAIT_TICKS};
 use events::{BrowserShortcut, UiAction};
 use storage::db::{StorageHandle, StorageManager};
 use ui::chrome::{
-    ChromeOverlayRenderer, ChromeRenderer, ChromeState, ChromeTheme, SettingsTab, TooltipRenderer,
+    ChromeOverlayRenderer, ChromeRenderer, ChromeState, ChromeTheme, TooltipRenderer,
 };
 use ui::platform_view::ContentRect;
 use winit::application::ApplicationHandler;
@@ -479,8 +479,8 @@ fn setup_mac_application() {
     }
 }
 
-/// Build the native macOS menu bar. The File menu mirrors the shell shortcuts
-/// so Settings is discoverable without knowing `Cmd+,`.
+/// Build the native macOS menu bar. Shell actions live directly in the app
+/// menu so Settings and Downloads are discoverable without a separate File menu.
 #[cfg(target_os = "macos")]
 fn install_macos_main_menu() {
     use objc2::runtime::AnyObject;
@@ -490,6 +490,12 @@ fn install_macos_main_menu() {
     // This function is only called from the main thread in `resumed()`.
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     let app = NSApplication::sharedApplication(mtm);
+
+    // An unbundled binary otherwise takes its app-menu title from the
+    // executable name (`kasumi-browser`). Seed the bundle name as well as the
+    // menu title so AppKit does not overwrite "Kasumi Browser" when installing
+    // the main menu.
+    unsafe { set_macos_bundle_name("Kasumi Browser") };
 
     let main_menu = NSMenu::new(mtm);
     unsafe { main_menu.setTitle(&NSString::from_str("Kasumi Browser")) };
@@ -505,6 +511,25 @@ fn install_macos_main_menu() {
     }
     app_menu.addItem(&app_version);
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+    let add_item = |title: &str, selector: objc2::runtime::Sel, key: &str| {
+        let item = unsafe {
+            app_menu.addItemWithTitle_action_keyEquivalent(
+                &NSString::from_str(title),
+                Some(selector),
+                &NSString::from_str(key),
+            )
+        };
+        unsafe { item.setTarget(Some(target)) };
+    };
+
+    add_item("New Tab", objc2::sel!(kasumiNewTab:), "t");
+    add_item("Close Tab", objc2::sel!(kasumiCloseTab:), "w");
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add_item("Downloads…", objc2::sel!(kasumiOpenDownloads:), "j");
+    add_item("Settings…", objc2::sel!(kasumiOpenSettings:), ",");
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
     let quit_item = unsafe {
         app_menu.addItemWithTitle_action_keyEquivalent(
             &NSString::from_str("Quit Kasumi Browser"),
@@ -516,30 +541,54 @@ fn install_macos_main_menu() {
     app_item.setSubmenu(Some(&app_menu));
     main_menu.addItem(&app_item);
 
-    let file_item = NSMenuItem::new(mtm);
-    unsafe { file_item.setTitle(&NSString::from_str("File")) };
-    let file_menu = NSMenu::new(mtm);
-    file_item.setSubmenu(Some(&file_menu));
-    main_menu.addItem(&file_item);
-
-    let add_item = |title: &str, selector: objc2::runtime::Sel, key: &str| {
-        let item = unsafe {
-            file_menu.addItemWithTitle_action_keyEquivalent(
-                &NSString::from_str(title),
-                Some(selector),
-                &NSString::from_str(key),
-            )
-        };
-        unsafe { item.setTarget(Some(target)) };
-    };
-
-    add_item("New Tab", objc2::sel!(kasumiNewTab:), "t");
-    add_item("Close Tab", objc2::sel!(kasumiCloseTab:), "w");
-    file_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    add_item("Downloads…", objc2::sel!(kasumiOpenDownloads:), "j");
-    add_item("Settings…", objc2::sel!(kasumiOpenSettings:), ",");
-
     app.setMainMenu(Some(&main_menu));
+    // AppKit may rename the application item from the process bundle while the
+    // menu is installed; reassert the visible label afterwards.
+    unsafe {
+        app_item.setTitle(&NSString::from_str("Kasumi Browser"));
+        main_menu.setTitle(&NSString::from_str("Kasumi Browser"));
+    }
+}
+
+/// Seed `CFBundleName` for an unbundled development binary so the macOS app
+/// menu shows the product name instead of the executable name.
+#[cfg(target_os = "macos")]
+unsafe fn set_macos_bundle_name(name: &str) {
+    use std::ffi::{c_void, CString};
+
+    let Ok(class_name) = CString::new("NSUserDefaults") else {
+        return;
+    };
+    let cls = objc2::ffi::objc_getClass(class_name.as_ptr());
+    if cls.is_null() {
+        return;
+    }
+
+    let Ok(selector_name) = CString::new("standardUserDefaults") else {
+        return;
+    };
+    let standard_sel = objc2::ffi::sel_registerName(selector_name.as_ptr());
+    let standard: unsafe extern "C" fn(*mut c_void, *const c_void) -> *mut c_void =
+        std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
+    let defaults = standard(cls as *mut c_void, standard_sel as *const c_void);
+    if defaults.is_null() {
+        return;
+    }
+
+    let Ok(setter_name) = CString::new("setObject:forKey:") else {
+        return;
+    };
+    let setter_sel = objc2::ffi::sel_registerName(setter_name.as_ptr());
+    let setter: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void, *mut c_void) =
+        std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
+    let value = objc2_foundation::NSString::from_str(name);
+    let key = objc2_foundation::NSString::from_str("CFBundleName");
+    setter(
+        defaults,
+        setter_sel as *const c_void,
+        &*value as *const objc2_foundation::NSString as *mut c_void,
+        &*key as *const objc2_foundation::NSString as *mut c_void,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -891,7 +940,7 @@ impl KasumiBrowserHandler {
                 self.chrome_state.open_settings();
             }
             BrowserShortcut::OpenDownloads => {
-                self.chrome_state.open_settings_tab(SettingsTab::Downloads);
+                self.chrome_state.toggle_downloads();
             }
             BrowserShortcut::Quit => self.request_shutdown(),
         }
@@ -950,7 +999,7 @@ impl KasumiBrowserHandler {
                 self.apply_preferences(preferences.clone());
             }
             if let UiAction::OpenDownloads = &action {
-                self.chrome_state.open_settings_tab(SettingsTab::Downloads);
+                self.chrome_state.toggle_downloads();
             }
             if let UiAction::OpenDownloadFile { download_id } = &action {
                 let path = self
@@ -1501,14 +1550,18 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
 
         if let Some(tm) = self.tab_manager.as_mut() {
             tm.pump_events();
+            let new_download = tm.consume_download_bubble_request();
+            let explicit_downloads_request = tm.consume_downloads_request();
+            if new_download && !self.chrome_state.has_overlay() {
+                self.chrome_state.open_downloads();
+            } else if explicit_downloads_request {
+                self.chrome_state.toggle_downloads();
+            }
             if tm.consume_command_palette_request() {
                 self.chrome_state.open_command_palette();
             }
             if tm.consume_settings_request() {
                 self.chrome_state.open_settings();
-            }
-            if tm.consume_downloads_request() {
-                self.chrome_state.open_settings_tab(SettingsTab::Downloads);
             }
             if !self.shutdown_requested {
                 tm.tick();

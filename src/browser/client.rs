@@ -420,7 +420,7 @@ wrap_download_handler! {
             _request_method: Option<&CefString>,
         ) -> i32 {
             // Downloads are accepted into Chromium's configured directory and
-            // presented in Kasumi's native Downloads page. Returning 0 here
+            // presented in Kasumi's native downloads bubble. Returning 0 here
             // would cancel every download before `on_before_download` ran.
             1
         }
@@ -438,7 +438,7 @@ wrap_download_handler! {
             let info = snapshot_download(self.tab_id, item, suggested_name);
             let _ = self.event_sender.send(BrowserEvent::DownloadStarted(info));
             // No OS save dialog and no second browser view: the native
-            // Downloads page is the single place where progress is shown.
+            // downloads bubble is the single place where progress is shown.
             callback.cont(None, 0);
             1
         }

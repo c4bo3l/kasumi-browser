@@ -340,8 +340,11 @@ pub struct TabManager {
     active_tab_by_workspace: HashMap<u64, u64>,
     /// Globally visible bookmarks, grouped by workspace name in `folder`.
     pub bookmarks: Vec<BookmarkItem>,
-    /// Native download snapshots mirrored from CEF into the Downloads page.
+    /// Native download snapshots mirrored from CEF into the downloads bubble.
     downloads: Vec<DownloadInfo>,
+    /// Set when a genuinely new transfer starts so the shell can reveal the
+    /// native downloads bubble without reopening it for restored history.
+    download_bubble_requested: bool,
     /// CEF item callbacks retained only on the UI thread for native controls.
     download_callbacks: HashMap<u32, cef::DownloadItemCallback>,
     /// CEF ids that Kasumi took over with the native segmented engine. Their
@@ -464,6 +467,7 @@ impl TabManager {
             active_tab_by_workspace: HashMap::new(),
             bookmarks,
             downloads: Vec::new(),
+            download_bubble_requested: false,
             download_callbacks: HashMap::new(),
             superseded_cef_downloads: HashSet::new(),
             parallel_downloads: HashMap::new(),
@@ -539,6 +543,7 @@ impl TabManager {
             return;
         }
 
+        let is_new = !self.downloads.iter().any(|download| download.id == info.id);
         if let Some(existing) = self
             .downloads
             .iter_mut()
@@ -550,6 +555,15 @@ impl TabManager {
         }
         self.downloads
             .sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
+
+        if is_new
+            && matches!(
+                info.state,
+                DownloadState::InProgress | DownloadState::Paused
+            )
+        {
+            self.download_bubble_requested = true;
+        }
 
         if let Some(callback) = callback {
             if info.is_finished() {
@@ -2282,6 +2296,11 @@ impl TabManager {
         std::mem::take(&mut self.downloads_requested)
     }
 
+    /// Consume a request to reveal the downloads bubble after a new transfer.
+    pub fn consume_download_bubble_request(&mut self) -> bool {
+        std::mem::take(&mut self.download_bubble_requested)
+    }
+
     fn handle_browser_event(&mut self, event: BrowserEvent) {
         match event {
             BrowserEvent::DownloadStarted(info) => self.record_download(info, None),
@@ -2437,8 +2456,8 @@ impl TabManager {
                     self.settings_requested = true;
                 }
                 BrowserShortcut::OpenDownloads => {
-                    // The shell owns the shared Settings overlay. The flag is
-                    // set here so all shortcut sources converge on one path.
+                    // The shell owns the shared overlay and downloads bubble.
+                    // This flag makes all shortcut sources converge on one path.
                     self.downloads_requested = true;
                 }
                 BrowserShortcut::Quit => {
@@ -2681,7 +2700,7 @@ impl TabManager {
                 self.show_dev_tools(tab_id);
             }
             UiAction::OpenDownloads => {
-                // The shell opens the shared Settings overlay; TabManager only
+                // The shell opens the native downloads bubble; TabManager only
                 // owns the download runtime state.
             }
             UiAction::PauseDownload { download_id } => {
@@ -2822,7 +2841,7 @@ impl TabManager {
         self.last_tick = now;
 
         // Native transfer speeds are sampled once per watchdog tick and then
-        // mirrored into the Downloads page by `update_chrome_state`.
+        // mirrored into the downloads bubble by `update_chrome_state`.
         self.tick_native_downloads(now);
 
         let ram_ratio = ram_pressure(self.ram_used_bytes, self.ram_total_bytes);
