@@ -244,8 +244,9 @@ pub struct Workspace {
     pub name: String,
     pub icon: WorkspaceIcon,
     pub color: WorkspaceColor,
-    /// The workspace selected when the browser starts. This is intentionally
-    /// separate from `is_active`, which follows the workspace open at shutdown.
+    /// Fallback workspace when no last-active workspace is available, and the
+    /// choice offered to new windows. `is_active` follows the workspace open at
+    /// shutdown and wins on startup.
     pub is_default: bool,
     pub is_active: bool,
 }

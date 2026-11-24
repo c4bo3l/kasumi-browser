@@ -284,6 +284,29 @@ pub fn format_download_bytes(bytes: i64) -> String {
     }
 }
 
+/// Estimated time remaining for a transfer. Unknown totals, finished transfers,
+/// and paused/zero-speed transfers render nothing rather than a misleading ETA.
+pub fn download_eta_label(received: i64, total: i64, speed: i64) -> String {
+    if speed <= 0 || total <= 0 {
+        return String::new();
+    }
+    let remaining = total.saturating_sub(received.max(0)).max(0);
+    if remaining == 0 {
+        return String::new();
+    }
+    let seconds = ((remaining as f64 / speed as f64).ceil() as u64)
+        .max(1)
+        .min(u64::MAX);
+    let duration = if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60)
+    };
+    format!("ETA {duration}")
+}
+
 /// Aggregate state for the downloads bubble header. Failed/canceled entries are
 /// counted separately so a stale partial transfer cannot drag the overall bar
 /// down forever.
@@ -821,9 +844,10 @@ impl ChromeState {
         self.close_tab_menu();
     }
 
-    pub fn toggle_rail(&mut self) {
+    pub fn toggle_rail(&mut self, actions: &mut Vec<UiAction>) {
         self.rail_expanded = !self.rail_expanded;
         self.close_tab_menu();
+        actions.push(UiAction::SetRailExpanded(self.rail_expanded));
     }
 
     pub fn open_tab_menu(&mut self, tab_id: u64, anchor: egui::Pos2) {
@@ -1333,8 +1357,11 @@ impl ChromeRenderer {
             // The collapsed rail is the primary workspace switcher, so each
             // space gets a large, high-contrast target with an explicit accent
             // border and a name tooltip instead of a tiny colour dot.
-            ui.vertical(|ui| {
-                for workspace in &workspaces {
+            ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                for (index, workspace) in workspaces.iter().enumerate() {
+                    if index > 0 {
+                        ui.add_space(6.0);
+                    }
                     let active = workspace.id == state.active_workspace_id;
                     let (rect, response) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
                     let (r, g, b) = workspace.color.rgb();
@@ -1444,6 +1471,7 @@ impl ChromeRenderer {
                     workspace_id: workspace.id,
                 });
             }
+            ui.add_space(3.0);
         }
 
         let add = Self::rail_action_button(
@@ -1616,7 +1644,7 @@ impl ChromeRenderer {
                                     palette,
                                 );
                                 if expand.clicked() {
-                                    state.toggle_rail();
+                                    state.toggle_rail(actions);
                                 }
                                 Self::chrome_tooltip(
                                     tooltip_slot,
@@ -1825,16 +1853,16 @@ impl ChromeRenderer {
                     ui.separator();
                     ui.add_space(8.0);
 
-                    // Framed omnibox: a subtle surface with a globe glyph, a
-                    // readable address field, and a compact copy action.
-                    let field_width = width - 12.0;
+                    // Framed omnibox: the outer margin keeps the frame inside
+                    // the rail, and the input is sized from the space actually
+                    // left after the fixed glyphs so it can never overflow.
                     Frame::none()
                         .fill(palette.rail_surface)
                         .stroke(Stroke::new(1.0_f32, palette.palette_border))
                         .rounding(Rounding::same(9.0))
+                        .outer_margin(egui::Margin::symmetric(6.0, 0.0))
                         .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                         .show(ui, |ui| {
-                            ui.set_width(field_width - 16.0);
                             ui.horizontal(|ui| {
                                 let (icon_rect, _) =
                                     ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
@@ -1844,10 +1872,12 @@ impl ChromeRenderer {
                                     RailIcon::Globe,
                                     palette.rail_accent,
                                 );
-                                ui.add_space(5.0);
+                                ui.add_space(4.0);
 
-                                let input_width =
-                                    (field_width - 16.0 - 14.0 - 5.0 - 20.0).max(40.0);
+                                // Reserve the copy glyph and its spacing before
+                                // giving the remainder to the text field.
+                                let copy_width = 22.0;
+                                let input_width = (ui.available_width() - copy_width).max(24.0);
                                 let url_input = ui.add(
                                     TextEdit::singleline(&mut state.omnibox_text)
                                         .id(egui::Id::new("kasumi_rail_url"))
@@ -1874,19 +1904,22 @@ impl ChromeRenderer {
                                     }
                                 }
 
-                                ui.add_space(2.0);
-                                if material_button(
+                                ui.add_space(4.0);
+                                let (copy_rect, copy_response) =
+                                    ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+                                paint_rail_icon(
                                     ui,
+                                    egui::Rect::from_center_size(
+                                        copy_rect.center(),
+                                        vec2(12.0, 12.0),
+                                    ),
                                     RailIcon::Copy,
-                                    "",
-                                    MaterialButtonStyle::Text,
-                                    palette,
-                                    true,
-                                )
-                                .clicked()
-                                {
+                                    palette.text,
+                                );
+                                if copy_response.clicked() {
                                     ctx.copy_text(state.omnibox_text.clone());
                                 }
+                                copy_response.on_hover_text("Copy URL");
                             });
                         });
                     ui.add_space(6.0);
@@ -1986,7 +2019,7 @@ impl ChromeRenderer {
                             palette,
                         );
                         if collapse.clicked() {
-                            state.toggle_rail();
+                            state.toggle_rail(actions);
                         }
                         Self::chrome_tooltip(
                             tooltip_slot,
@@ -2477,13 +2510,23 @@ impl ChromeRenderer {
                                 },
                             ));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let speed = if summary.speed > 0 {
-                                    format!("{} /s", format_download_bytes(summary.speed))
-                                } else {
-                                    String::new()
-                                };
+                                let mut parts = vec![format!("{}%", summary.percent())];
+                                if summary.speed > 0 {
+                                    parts.push(format!(
+                                        "{} /s",
+                                        format_download_bytes(summary.speed)
+                                    ));
+                                }
+                                let eta = download_eta_label(
+                                    summary.received,
+                                    summary.total,
+                                    summary.speed,
+                                );
+                                if !eta.is_empty() {
+                                    parts.push(eta);
+                                }
                                 ui.label(
-                                    RichText::new(format!("{}%  {speed}", summary.percent()))
+                                    RichText::new(parts.join("  ·  "))
                                         .size(10.0)
                                         .color(palette.palette_hint),
                                 );
@@ -2677,6 +2720,15 @@ impl ChromeRenderer {
                                             _ => {}
                                         });
                                     }
+                                    let eta = if download.state == DownloadState::InProgress {
+                                        download_eta_label(
+                                            download.received_bytes,
+                                            download.total_bytes,
+                                            download.current_speed,
+                                        )
+                                    } else {
+                                        String::new()
+                                    };
                                     ui.horizontal(|ui| {
                                         ui.label(
                                             RichText::new(format!(
@@ -2696,6 +2748,13 @@ impl ChromeRenderer {
                                                 ))
                                                 .size(11.0)
                                                 .color(palette.text),
+                                            );
+                                        }
+                                        if !eta.is_empty() {
+                                            ui.label(
+                                                RichText::new(eta)
+                                                    .size(11.0)
+                                                    .color(palette.palette_hint),
                                             );
                                         }
                                         ui.label(
@@ -5020,7 +5079,7 @@ fn apply_command_item(
             actions.push(UiAction::TogglePinTab { tab_id: *tab_id })
         }
         CommandAction::HibernateAll => actions.push(UiAction::HibernateAllBackground),
-        CommandAction::ToggleRail => state.toggle_rail(),
+        CommandAction::ToggleRail => state.toggle_rail(actions),
         CommandAction::OpenDevTools => {
             if let Some(tab_id) = state.active_tab_id {
                 actions.push(UiAction::OpenDevTools { tab_id });
@@ -5100,8 +5159,8 @@ mod tests {
     use super::{
         advance_command_selection, apply_command_item, clamp_command_selection,
         command_palette_click_outside, command_palette_items, download_engine_label,
-        download_rail_badge, download_row_uses_progress_bar, download_state_label,
-        downloads_bubble_anchor, downloads_bubble_size, effective_theme,
+        download_eta_label, download_rail_badge, download_row_uses_progress_bar,
+        download_state_label, downloads_bubble_anchor, downloads_bubble_size, effective_theme,
         focus_request_after_render, format_download_bytes, loading_spinner_angle,
         loading_spinner_point, page_tooltip_anchor, palette_row_fill, preferred_surface_format,
         rail_menu_anchor, rail_menu_click_outside, rail_menu_items, rail_menu_metrics,
@@ -5528,6 +5587,20 @@ mod tests {
     }
 
     #[test]
+    fn download_eta_formats_remaining_time() {
+        assert_eq!(download_eta_label(0, 1_000, 100), "ETA 10s");
+        assert_eq!(download_eta_label(0, 120_000, 1_000), "ETA 2m 0s");
+        assert_eq!(download_eta_label(0, 7_200_000, 1_000), "ETA 2h 0m");
+    }
+
+    #[test]
+    fn download_eta_is_hidden_without_usable_speed_or_remaining_bytes() {
+        assert_eq!(download_eta_label(0, 1_000, 0), "");
+        assert_eq!(download_eta_label(0, 0, 100), "");
+        assert_eq!(download_eta_label(1_000, 1_000, 100), "");
+    }
+
+    #[test]
     fn palette_filters_tabs_case_insensitively() {
         let tabs = [
             tab(1, "Rust Language", "https://rust-lang.org"),
@@ -5716,6 +5789,19 @@ mod tests {
 
         assert!(!state.rail_expanded);
         assert_eq!(state.preferences.search_engine, SearchEngine::Google);
+    }
+
+    #[test]
+    fn rail_toggle_emits_a_persistable_action() {
+        let mut state = ChromeState::default();
+        let initial = state.rail_expanded;
+        let mut actions = Vec::new();
+        state.toggle_rail(&mut actions);
+
+        assert_eq!(state.rail_expanded, !initial);
+        assert!(
+            matches!(actions.as_slice(), [UiAction::SetRailExpanded(expanded)] if *expanded == state.rail_expanded)
+        );
     }
 
     #[test]

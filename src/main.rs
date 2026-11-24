@@ -1062,6 +1062,11 @@ impl KasumiBrowserHandler {
             if let UiAction::ApplyPreferences(preferences) = &action {
                 self.apply_preferences(preferences.clone());
             }
+            if let UiAction::SetRailExpanded(expanded) = &action {
+                let mut preferences = self.chrome_state.preferences.clone();
+                preferences.rail_expanded = *expanded;
+                self.apply_preferences(preferences);
+            }
             if let UiAction::OpenDownloads = &action {
                 self.chrome_state.toggle_downloads();
             }

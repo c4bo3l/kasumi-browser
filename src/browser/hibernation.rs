@@ -427,6 +427,27 @@ pub struct TabManager {
     favicon_preferences: HashMap<u64, String>,
 }
 
+/// Restore the workspace that was open at shutdown, falling back to the
+/// user-chosen default. `is_default` stays intact so Settings and new windows
+/// keep their own choice independent of the last session.
+fn normalize_workspace_selection(workspaces: &mut [Workspace]) -> u64 {
+    let active_id = workspaces
+        .iter()
+        .find(|workspace| workspace.is_active)
+        .or_else(|| workspaces.iter().find(|workspace| workspace.is_default))
+        .or_else(|| workspaces.first())
+        .map_or(Workspace::DEFAULT_ID, |workspace| workspace.id);
+    let default_id = workspaces
+        .iter()
+        .find(|workspace| workspace.is_default)
+        .map_or(active_id, |workspace| workspace.id);
+    for workspace in workspaces {
+        workspace.is_active = workspace.id == active_id;
+        workspace.is_default = workspace.id == default_id;
+    }
+    active_id
+}
+
 impl TabManager {
     pub fn new(
         event_sender: Sender<BrowserEvent>,
@@ -450,19 +471,10 @@ impl TabManager {
         if workspaces.is_empty() {
             workspaces.push(Workspace::default_workspace());
         }
-        let startup_workspace_id = workspaces
-            .iter()
-            .find(|workspace| workspace.is_default)
-            .or_else(|| workspaces.iter().find(|workspace| workspace.is_active))
-            .or_else(|| workspaces.first())
-            .map_or(Workspace::DEFAULT_ID, |workspace| workspace.id);
-        // Persist exactly one default, even if a stale database wrote several.
-        for workspace in &mut workspaces {
-            workspace.is_default = workspace.id == startup_workspace_id;
-        }
-        // The user-chosen default wins on startup. `is_active` remains a
-        // fallback for databases written before default selection existed.
-        let active_workspace_id = startup_workspace_id;
+        // The workspace open at shutdown wins so the browser reopens in the
+        // exact space the user left. The separate default flag is only a
+        // fallback for databases written before active-workspace tracking.
+        let active_workspace_id = normalize_workspace_selection(&mut workspaces);
 
         Self {
             tabs: Vec::new(),
@@ -2832,6 +2844,9 @@ impl TabManager {
             UiAction::ApplyPreferences(preferences) => {
                 self.apply_preferences(&preferences);
             }
+            // The winit handler persists the live rail toggle; tab state needs
+            // no change for a chrome width update.
+            UiAction::SetRailExpanded(_) => {}
         }
     }
 
@@ -3020,9 +3035,9 @@ mod tests {
     use super::{
         closed_tab_from, fallback_favicon_url, idle_timeout_for_pressure, insertion_index,
         is_blank_navigation_url, is_critical_pressure, needs_initial_navigation,
-        next_navigation_retry_delay, pinned_insert_index, preferred_favicon_url, ram_pressure,
-        restore_insert_index, should_hibernate_tab, should_sync_omnibox, BrowserSpawnMode, Tab,
-        TabManager, TabState,
+        next_navigation_retry_delay, normalize_workspace_selection, pinned_insert_index,
+        preferred_favicon_url, ram_pressure, restore_insert_index, should_hibernate_tab,
+        should_sync_omnibox, BrowserSpawnMode, Tab, TabManager, TabState,
     };
     use crate::config::{
         BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, TAB_IDLE_TIMEOUT_NORMAL,
@@ -3532,7 +3547,34 @@ mod tests {
     }
 
     #[test]
-    fn default_workspace_controls_startup_and_can_change() {
+    fn workspace_selection_prefers_last_active_over_default() {
+        let mut workspaces = vec![
+            Workspace {
+                id: 1,
+                name: "Personal".to_string(),
+                icon: WorkspaceIcon::Work,
+                color: WorkspaceColor::Blue,
+                is_default: true,
+                is_active: false,
+            },
+            Workspace {
+                id: 2,
+                name: "Studio".to_string(),
+                icon: WorkspaceIcon::Palette,
+                color: WorkspaceColor::Purple,
+                is_default: false,
+                is_active: true,
+            },
+        ];
+        assert_eq!(normalize_workspace_selection(&mut workspaces), 2);
+        assert!(!workspaces[0].is_active);
+        assert!(workspaces[1].is_active);
+        assert!(workspaces[0].is_default);
+        assert!(!workspaces[1].is_default);
+    }
+
+    #[test]
+    fn last_active_workspace_restores_and_default_stays_separate() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut manager = TabManager::new(
             tx,
@@ -3548,7 +3590,10 @@ mod tests {
             None,
             &BrowserPreferences::default(),
             vec![
-                Workspace::default_workspace(),
+                Workspace {
+                    is_active: false,
+                    ..Workspace::default_workspace()
+                },
                 Workspace {
                     id: 2,
                     name: "Studio".to_string(),
@@ -3561,17 +3606,21 @@ mod tests {
             vec![],
         );
 
-        // The persisted default, not the last active workspace, opens at startup.
-        assert_eq!(manager.active_workspace_id, 1);
+        // The workspace open at shutdown, not the default, opens at startup.
+        assert_eq!(manager.active_workspace_id, 2);
+        assert!(manager.workspaces[0].is_default);
+        assert!(!manager.workspaces[1].is_default);
 
         manager.set_default_workspace(2);
         assert!(!manager.workspaces[0].is_default);
         assert!(manager.workspaces[1].is_default);
-        assert_eq!(manager.active_workspace_id, 1);
+        assert_eq!(manager.active_workspace_id, 2);
 
         let snapshots = manager.workspace_snapshots();
         assert!(!snapshots[0].is_default);
         assert!(snapshots[1].is_default);
+        assert!(!snapshots[0].is_active);
+        assert!(snapshots[1].is_active);
 
         let (restart_tx, restart_rx) = crossbeam_channel::unbounded();
         let restarted = TabManager::new(
@@ -3612,6 +3661,7 @@ mod tests {
             vec![
                 Workspace {
                     is_default: false,
+                    is_active: false,
                     ..Workspace::default_workspace()
                 },
                 Workspace {

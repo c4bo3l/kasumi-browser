@@ -497,6 +497,8 @@ pub enum UiAction {
     RevealDownload {
         download_id: u32,
     },
+    /// Persist a live rail expand/collapse change so the next launch restores it.
+    SetRailExpanded(bool),
     /// Apply preferences changed in the native Settings overlay.
     ApplyPreferences(BrowserPreferences),
 }
