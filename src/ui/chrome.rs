@@ -298,7 +298,10 @@ const TOOLTIP_HEIGHT_COLLAPSED: f32 = 52.0;
 const RAIL_MENU_WIDTH: f32 = 224.0;
 const RAIL_MENU_ROW_HEIGHT: f32 = 28.0;
 const RAIL_MENU_PADDING: f32 = 7.0;
-const RAIL_STATUS_HEIGHT: f32 = 112.0;
+const RAIL_STATUS_HEIGHT: f32 = 124.0;
+const RAIL_STATUS_ICON_EXPANDED: f32 = 15.0;
+const RAIL_STATUS_ICON_COLLAPSED: f32 = 20.0;
+const RAIL_STATUS_BADGE_HEIGHT: f32 = 24.0;
 const SETTINGS_WIDTH: f32 = 660.0;
 const SETTINGS_MAX_CONTENT_HEIGHT: f32 = 560.0;
 
@@ -1424,7 +1427,7 @@ impl ChromeRenderer {
                         );
                         ui.allocate_new_ui(UiBuilder::new().max_rect(status_rect), |ui| {
                             ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-                                ui.add_space(6.0);
+                                ui.add_space(5.0);
                                 let hibernate = Self::rail_icon_button(
                                     ui,
                                     vec2(34.0, 30.0),
@@ -1460,28 +1463,69 @@ impl ChromeRenderer {
                                     state.rail_expanded,
                                 );
 
-                                ui.add_space(5.0);
-                                ui.horizontal(|ui| {
-                                    let (icon_rect, _) =
-                                        ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
-                                    paint_rail_icon(
-                                        ui,
-                                        icon_rect,
-                                        RailIcon::Shield,
-                                        palette.text_dim,
-                                    );
-                                });
+                                ui.add_space(4.0);
+                                let icon_size = rail_status_icon_size(false);
+                                let badge_width = width - 10.0;
+                                let badge_height = RAIL_STATUS_BADGE_HEIGHT;
+
+                                let (blocked_rect, blocked_response) = ui.allocate_exact_size(
+                                    vec2(badge_width, badge_height),
+                                    Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    blocked_rect,
+                                    Rounding::same(7.0),
+                                    palette.rail_surface,
+                                );
+                                paint_rail_icon(
+                                    ui,
+                                    egui::Rect::from_center_size(
+                                        blocked_rect.center(),
+                                        vec2(icon_size, icon_size),
+                                    ),
+                                    RailIcon::Shield,
+                                    palette.shield_ok,
+                                );
+                                let blocked_requests = state
+                                    .tabs
+                                    .iter()
+                                    .find(|tab| Some(tab.id) == state.active_tab_id)
+                                    .map(|tab| tab.blocked_requests)
+                                    .unwrap_or(0);
+                                Self::chrome_tooltip(
+                                    tooltip_slot,
+                                    ui,
+                                    &blocked_response,
+                                    format!("{blocked_requests} ad/tracker requests blocked"),
+                                    false,
+                                );
+
                                 ui.add_space(3.0);
-                                ui.horizontal(|ui| {
-                                    let (icon_rect, _) =
-                                        ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
-                                    paint_rail_icon(
-                                        ui,
-                                        icon_rect,
-                                        RailIcon::Chip,
-                                        palette.text_dim,
-                                    );
-                                });
+                                let (ram_rect, ram_response) = ui.allocate_exact_size(
+                                    vec2(badge_width, badge_height),
+                                    Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    ram_rect,
+                                    Rounding::same(7.0),
+                                    palette.rail_surface,
+                                );
+                                paint_rail_icon(
+                                    ui,
+                                    egui::Rect::from_center_size(
+                                        ram_rect.center(),
+                                        vec2(icon_size, icon_size),
+                                    ),
+                                    RailIcon::Chip,
+                                    palette.text,
+                                );
+                                Self::chrome_tooltip(
+                                    tooltip_slot,
+                                    ui,
+                                    &ram_response,
+                                    format!("RAM {} MB", state.ram_mb),
+                                    false,
+                                );
                             });
                         });
                     });
@@ -1695,8 +1739,9 @@ impl ChromeRenderer {
                         ui.add_space(5.0);
                         ui.horizontal(|ui| {
                             ui.add_space(10.0);
+                            let icon_size = rail_status_icon_size(true);
                             let (icon_rect, _) =
-                                ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
+                                ui.allocate_exact_size(vec2(icon_size, icon_size), Sense::hover());
                             paint_rail_icon(ui, icon_rect, RailIcon::Shield, palette.text_dim);
                             ui.add_space(3.0);
                             let blocked = state
@@ -1715,8 +1760,9 @@ impl ChromeRenderer {
                         ui.add_space(3.0);
                         ui.horizontal(|ui| {
                             ui.add_space(10.0);
+                            let icon_size = rail_status_icon_size(true);
                             let (icon_rect, _) =
-                                ui.allocate_exact_size(vec2(15.0, 15.0), Sense::hover());
+                                ui.allocate_exact_size(vec2(icon_size, icon_size), Sense::hover());
                             paint_rail_icon(ui, icon_rect, RailIcon::Chip, palette.text_dim);
                             ui.add_space(3.0);
                             ui.label(
@@ -3713,6 +3759,17 @@ pub fn rail_tooltip_metrics(expanded: bool) -> (f32, f32) {
     }
 }
 
+/// Icon size for the RAM/ad-block status rows. The collapsed rail uses larger
+/// glyphs so both badges stay legible at 44 px wide; expanded rows keep the
+/// compact icon because their labels carry the value.
+pub fn rail_status_icon_size(expanded: bool) -> f32 {
+    if expanded {
+        RAIL_STATUS_ICON_EXPANDED
+    } else {
+        RAIL_STATUS_ICON_COLLAPSED
+    }
+}
+
 /// Fixed card size for the rail tab context menu.
 pub fn rail_menu_metrics() -> (f32, f32) {
     const ITEM_COUNT: usize = 10;
@@ -4214,14 +4271,17 @@ mod tests {
         focus_request_after_render, loading_spinner_angle, loading_spinner_point,
         page_tooltip_anchor, palette_row_fill, preferred_surface_format, rail_menu_anchor,
         rail_menu_click_outside, rail_menu_items, rail_menu_metrics, rail_menu_ui_action,
-        rail_tooltip_enabled, rail_tooltip_metrics, resolve_omnibox, resolve_omnibox_with_search,
-        tab_close_center, tab_status_center, truncate_title, workspace_form_actions, ChromePalette,
-        ChromeState, ChromeTheme, CommandAction, RailMenuAction, SettingsTab, TabDisplayState,
-        TabInfo, WorkspaceInfo, TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
+        rail_status_icon_size, rail_tooltip_enabled, rail_tooltip_metrics, resolve_omnibox,
+        resolve_omnibox_with_search, tab_close_center, tab_status_center, truncate_title,
+        workspace_form_actions, ChromePalette, ChromeState, ChromeTheme, CommandAction,
+        RailMenuAction, SettingsTab, TabDisplayState, TabInfo, WorkspaceInfo,
+        RAIL_STATUS_BADGE_HEIGHT, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED,
+        RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED,
+        TOOLTIP_WIDTH,
     };
     use crate::config::{
         BrowserPreferences, SearchEngine, ThemePreference, WorkspaceColor, WorkspaceIcon,
-        DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX,
+        DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX, RAIL_WIDTH_COLLAPSED,
     };
     use crate::events::UiAction;
 
@@ -4383,6 +4443,27 @@ mod tests {
         assert_eq!(normal, pos2(159.0, 118.0));
         assert_eq!(shifted, pos2(140.0, 118.0));
         assert!(shifted.x < normal.x);
+    }
+
+    #[test]
+    fn collapsed_status_icons_scale_up_for_the_narrow_rail() {
+        assert_eq!(rail_status_icon_size(true), RAIL_STATUS_ICON_EXPANDED);
+        assert_eq!(rail_status_icon_size(false), RAIL_STATUS_ICON_COLLAPSED);
+        assert!(RAIL_STATUS_ICON_COLLAPSED > RAIL_STATUS_ICON_EXPANDED);
+        assert!(RAIL_STATUS_ICON_COLLAPSED < RAIL_WIDTH_COLLAPSED);
+    }
+
+    #[test]
+    fn collapsed_status_badges_fit_inside_the_reserved_block() {
+        let used_height = 5.0
+            + 30.0
+            + 4.0
+            + 30.0
+            + 4.0
+            + RAIL_STATUS_BADGE_HEIGHT
+            + 3.0
+            + RAIL_STATUS_BADGE_HEIGHT;
+        assert!(used_height <= RAIL_STATUS_HEIGHT);
     }
 
     #[test]
