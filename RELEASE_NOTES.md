@@ -16,11 +16,16 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 - Incognito mode research notes in the README future-development roadmap.
 - Version bumped from `0.6.0` to `0.7.0` across the package, lockfile, canonical spec, bundle metadata, About menu, and docs.
 
+### Fixed
+
+- Downloads now pass CEF a full target path including the suggested filename and preserve that name when the native segmented engine takes over, so files keep their extension instead of being saved as an extensionless `download`.
+- Removed the crashing private `NSProcessInfo.setName:` call; modern macOS now probes `setProcessName:` with a safe fallback.
+
 ### Verification
 
 - `cargo fmt --all -- --check`
 - `cargo check --bins`
-- `cargo test --bin kasumi-browser` — 148 tests
+- `cargo test --bin kasumi-browser` — 149 tests
 - `cargo build --release`
 - PR CI checks formatting, binaries, and unit tests on macOS 15 Intel, Windows, and Linux; interactive macOS verification is required before merge.
 

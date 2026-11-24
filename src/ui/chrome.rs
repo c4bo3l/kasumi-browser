@@ -1823,46 +1823,73 @@ impl ChromeRenderer {
 
                     ui.add_space(8.0);
                     ui.separator();
-                    ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        let input_width = (width - 58.0).max(48.0);
-                        let url_input = ui.add(
-                            TextEdit::singleline(&mut state.omnibox_text)
-                                .id(egui::Id::new("kasumi_rail_url"))
-                                .hint_text("Address or search")
-                                .text_color(palette.text_strong)
-                                .desired_width(input_width)
-                                .frame(false),
-                        );
-                        if url_input.has_focus() {
-                            state.omnibox_focused = true;
-                        } else if state.omnibox_focused && !state.command_palette_open {
-                            state.omnibox_focused = false;
-                        }
-                        if url_input.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter))
-                        {
-                            if let Some(tab_id) = state.active_tab_id {
-                                let url = resolve_omnibox_with_search(
-                                    &state.omnibox_text,
-                                    state.preferences.search_url_prefix(),
+                    ui.add_space(8.0);
+
+                    // Framed omnibox: a subtle surface with a globe glyph, a
+                    // readable address field, and a compact copy action.
+                    let field_width = width - 12.0;
+                    Frame::none()
+                        .fill(palette.rail_surface)
+                        .stroke(Stroke::new(1.0_f32, palette.palette_border))
+                        .rounding(Rounding::same(9.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.set_width(field_width - 16.0);
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) =
+                                    ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                                paint_rail_icon(
+                                    ui,
+                                    icon_rect,
+                                    RailIcon::Globe,
+                                    palette.rail_accent,
                                 );
-                                actions.push(UiAction::Navigate { tab_id, url });
-                            }
-                        }
-                        if material_button(
-                            ui,
-                            RailIcon::Copy,
-                            "",
-                            MaterialButtonStyle::Tonal,
-                            palette,
-                            true,
-                        )
-                        .clicked()
-                        {
-                            ctx.copy_text(state.omnibox_text.clone());
-                        }
-                    });
-                    ui.add_space(4.0);
+                                ui.add_space(5.0);
+
+                                let input_width =
+                                    (field_width - 16.0 - 14.0 - 5.0 - 20.0).max(40.0);
+                                let url_input = ui.add(
+                                    TextEdit::singleline(&mut state.omnibox_text)
+                                        .id(egui::Id::new("kasumi_rail_url"))
+                                        .hint_text("Address or search")
+                                        .text_color(palette.text_strong)
+                                        .font(egui::TextStyle::Body)
+                                        .desired_width(input_width)
+                                        .frame(false),
+                                );
+                                if url_input.has_focus() {
+                                    state.omnibox_focused = true;
+                                } else if state.omnibox_focused && !state.command_palette_open {
+                                    state.omnibox_focused = false;
+                                }
+                                if url_input.lost_focus()
+                                    && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+                                {
+                                    if let Some(tab_id) = state.active_tab_id {
+                                        let url = resolve_omnibox_with_search(
+                                            &state.omnibox_text,
+                                            state.preferences.search_url_prefix(),
+                                        );
+                                        actions.push(UiAction::Navigate { tab_id, url });
+                                    }
+                                }
+
+                                ui.add_space(2.0);
+                                if material_button(
+                                    ui,
+                                    RailIcon::Copy,
+                                    "",
+                                    MaterialButtonStyle::Text,
+                                    palette,
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    ctx.copy_text(state.omnibox_text.clone());
+                                }
+                            });
+                        });
+                    ui.add_space(6.0);
                     ui.separator();
                     ui.add_space(6.0);
 

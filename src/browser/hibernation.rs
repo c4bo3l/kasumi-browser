@@ -2316,7 +2316,21 @@ impl TabManager {
     fn handle_browser_event(&mut self, event: BrowserEvent) {
         match event {
             BrowserEvent::DownloadStarted(info) => self.record_download(info, None),
-            BrowserEvent::DownloadUpdated { info, callback } => {
+            BrowserEvent::DownloadUpdated { mut info, callback } => {
+                // CEF's first update can omit the suggested filename even when
+                // `on_before_download` supplied a good one. Keep that name so
+                // the native segmented writer never falls back to "download".
+                if info.suggested_name.trim().is_empty() {
+                    if let Some(existing) = self
+                        .downloads
+                        .iter()
+                        .find(|download| download.id == info.id)
+                    {
+                        if !existing.suggested_name.trim().is_empty() {
+                            info.suggested_name = existing.suggested_name.clone();
+                        }
+                    }
+                }
                 let should_take_over = info.engine == DownloadEngine::Cef
                     && !self.superseded_cef_downloads.contains(&info.id)
                     && !info.full_path.trim().is_empty()

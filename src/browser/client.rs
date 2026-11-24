@@ -1,6 +1,7 @@
 use crate::events::{BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadState};
 use cef::*;
 use crossbeam_channel::Sender;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -406,6 +407,20 @@ fn download_state(item: &DownloadItem) -> DownloadState {
     }
 }
 
+/// Build the absolute path CEF should hand to the native save dialog. CEF
+/// expects a full file path (not just a directory); without the filename it
+/// can lose the suggested extension and fall back to an extensionless name.
+fn download_target_path(directory: &Path, suggested_name: &str) -> Option<PathBuf> {
+    if suggested_name.trim().is_empty() {
+        return None;
+    }
+    let file_name = crate::browser::parallel_download::safe_file_name(suggested_name);
+    if file_name.is_empty() || file_name == "download" {
+        return None;
+    }
+    Some(directory.join(file_name))
+}
+
 /// Snapshot only owned values. CEF forbids retaining the `DownloadItem`
 /// outside its callback, so native chrome never sees the CEF object itself.
 fn snapshot_download(
@@ -479,22 +494,34 @@ wrap_download_handler! {
                 return 0;
             };
             let info = snapshot_download(self.tab_id, item, suggested_name);
+            let suggested_name = suggested_name
+                .map(|name| name.to_string())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| info.suggested_name.clone());
             let _ = self.event_sender.send(BrowserEvent::DownloadStarted(info));
 
             // "Ask where to save" delegates the destination to CEF's native
             // save dialog. Otherwise seed CEF with the configured Downloads
             // folder so non-segmentable downloads (blob:, data:, file:) also
-            // land there instead of CEF's temp directory.
+            // land there instead of CEF's temp directory. CEF's `download_path`
+            // must include the filename so the suggested extension survives.
             let ask = self.download_preferences.ask_where_to_save();
             let configured = self.download_preferences.download_directory();
             let directory = if configured.trim().is_empty() {
                 crate::config::default_download_directory()
             } else {
-                std::path::PathBuf::from(&configured)
+                PathBuf::from(&configured)
             };
-            let path = directory.to_string_lossy().to_string();
-            let cef_path = CefString::from(path.as_str());
-            callback.cont(Some(&cef_path), if ask { 1 } else { 0 });
+            let show_dialog = if ask { 1 } else { 0 };
+            if let Some(path) = download_target_path(&directory, &suggested_name) {
+                let path_text = path.to_string_lossy().to_string();
+                let cef_path = CefString::from(path_text.as_str());
+                callback.cont(Some(&cef_path), show_dialog);
+            } else {
+                // No usable server-provided name: let CEF derive one from the
+                // URL and Content-Disposition instead of forcing "download".
+                callback.cont(None, show_dialog);
+            }
             1
         }
 
@@ -667,10 +694,26 @@ pub fn create_tab_client(
 
 #[cfg(test)]
 mod tests {
+    use super::download_target_path;
     use super::new_tab_disposition;
     use super::{browser_shortcut, browser_shortcut_from_char, is_internal_view_url};
     use crate::events::BrowserShortcut;
     use cef::WindowOpenDisposition;
+    use std::path::Path;
+
+    #[test]
+    fn download_target_keeps_suggested_filename_and_extension() {
+        let directory = Path::new("/tmp/kasumi-downloads");
+        assert_eq!(
+            download_target_path(directory, "report (1).pdf"),
+            Some(directory.join("report (1).pdf"))
+        );
+        assert_eq!(
+            download_target_path(directory, "../../etc/passwd"),
+            Some(directory.join("passwd"))
+        );
+        assert_eq!(download_target_path(directory, "   "), None);
+    }
 
     #[test]
     fn middle_click_disposition_opens_a_background_tab() {
