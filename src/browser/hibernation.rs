@@ -389,11 +389,19 @@ impl TabManager {
         if workspaces.is_empty() {
             workspaces.push(Workspace::default_workspace());
         }
-        let active_workspace_id = workspaces
+        let startup_workspace_id = workspaces
             .iter()
-            .find(|workspace| workspace.is_active)
+            .find(|workspace| workspace.is_default)
+            .or_else(|| workspaces.iter().find(|workspace| workspace.is_active))
             .or_else(|| workspaces.first())
             .map_or(Workspace::DEFAULT_ID, |workspace| workspace.id);
+        // Persist exactly one default, even if a stale database wrote several.
+        for workspace in &mut workspaces {
+            workspace.is_default = workspace.id == startup_workspace_id;
+        }
+        // The user-chosen default wins on startup. `is_active` remains a
+        // fallback for databases written before default selection existed.
+        let active_workspace_id = startup_workspace_id;
 
         Self {
             tabs: Vec::new(),
@@ -518,11 +526,15 @@ impl TabManager {
             .active_tab_by_workspace
             .get(&self.active_workspace_id)
             .copied()
-            .or(first_in_active_workspace)
-            .or_else(|| self.tabs.first().map(|tab| tab.id));
+            .or(first_in_active_workspace);
 
         if let Some(id) = target_active {
             self.focus_tab(id);
+        } else {
+            // The default workspace may have no saved tabs. Open a fresh tab
+            // there instead of focusing another workspace and overriding the
+            // user's startup choice.
+            self.create_tab(None, true);
         }
 
         self.sync_session();
@@ -965,6 +977,22 @@ impl TabManager {
         }
     }
 
+    /// Choose the workspace that opens at startup. This does not change which
+    /// workspace is visible in the current session.
+    pub fn set_default_workspace(&mut self, workspace_id: u64) {
+        if !self
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id)
+        {
+            return;
+        }
+        for workspace in &mut self.workspaces {
+            workspace.is_default = workspace.id == workspace_id;
+        }
+        self.sync_session();
+    }
+
     /// Choose a unique workspace name. Names double as bookmark folder names,
     /// so collisions would merge two workspaces' bookmarks in the UI.
     fn unique_workspace_name(&self, requested: &str, exclude_id: Option<u64>) -> String {
@@ -1007,6 +1035,7 @@ impl TabManager {
             name,
             icon,
             color,
+            is_default: false,
             is_active: false,
         });
         self.switch_workspace(id);
@@ -1069,6 +1098,11 @@ impl TabManager {
             .unwrap_or(Workspace::DEFAULT_ID);
         let old_name = self.workspace_name(workspace_id);
         let archived = Workspace::archived_folder(&old_name);
+        let default_was_deleted = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .is_some_and(|workspace| workspace.is_default);
         let active_was_deleted = self.active_workspace_id == workspace_id;
         let active_tab_in_deleted = self
             .active_tab_id
@@ -1094,6 +1128,12 @@ impl TabManager {
             self.active_workspace_id = target_id;
             if self.active_tab_id.is_some() {
                 self.show_active_tab_view();
+            }
+        }
+        if default_was_deleted {
+            // Never leave the browser without a startup workspace.
+            for workspace in &mut self.workspaces {
+                workspace.is_default = workspace.id == target_id;
             }
         }
 
@@ -1812,6 +1852,9 @@ impl TabManager {
             UiAction::DeleteWorkspace { workspace_id } => {
                 self.delete_workspace(workspace_id);
             }
+            UiAction::SetDefaultWorkspace { workspace_id } => {
+                self.set_default_workspace(workspace_id);
+            }
             UiAction::AddBookmark { tab_id } => {
                 self.add_bookmark(tab_id);
             }
@@ -1927,6 +1970,7 @@ impl TabManager {
                 name: workspace.name.clone(),
                 icon: workspace.icon,
                 color: workspace.color,
+                is_default: workspace.is_default,
                 is_active: workspace.id == self.active_workspace_id,
             })
             .collect();
@@ -2487,6 +2531,156 @@ mod tests {
 
         assert_eq!(manager.active_workspace_id, 1);
         assert!(manager.tabs.iter().all(|tab| tab.workspace_id == 1));
+    }
+
+    #[test]
+    fn default_workspace_controls_startup_and_can_change() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut manager = TabManager::new(
+            tx,
+            rx,
+            std::ptr::null_mut(),
+            ContentRect {
+                x: 180,
+                y: 0,
+                width: 1100,
+                height: 800,
+                scale_factor: 1.0,
+            },
+            None,
+            &BrowserPreferences::default(),
+            vec![
+                Workspace::default_workspace(),
+                Workspace {
+                    id: 2,
+                    name: "Studio".to_string(),
+                    icon: WorkspaceIcon::Palette,
+                    color: WorkspaceColor::Purple,
+                    is_default: false,
+                    is_active: true,
+                },
+            ],
+            vec![],
+        );
+
+        // The persisted default, not the last active workspace, opens at startup.
+        assert_eq!(manager.active_workspace_id, 1);
+
+        manager.set_default_workspace(2);
+        assert!(!manager.workspaces[0].is_default);
+        assert!(manager.workspaces[1].is_default);
+        assert_eq!(manager.active_workspace_id, 1);
+
+        let snapshots = manager.workspace_snapshots();
+        assert!(!snapshots[0].is_default);
+        assert!(snapshots[1].is_default);
+
+        let (restart_tx, restart_rx) = crossbeam_channel::unbounded();
+        let restarted = TabManager::new(
+            restart_tx,
+            restart_rx,
+            std::ptr::null_mut(),
+            ContentRect {
+                x: 180,
+                y: 0,
+                width: 1100,
+                height: 800,
+                scale_factor: 1.0,
+            },
+            None,
+            &BrowserPreferences::default(),
+            snapshots,
+            vec![],
+        );
+        assert_eq!(restarted.active_workspace_id, 2);
+    }
+
+    #[test]
+    fn restore_keeps_default_workspace_when_it_has_no_saved_tabs() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut manager = TabManager::new(
+            tx,
+            rx,
+            std::ptr::null_mut(),
+            ContentRect {
+                x: 180,
+                y: 0,
+                width: 1100,
+                height: 800,
+                scale_factor: 1.0,
+            },
+            None,
+            &BrowserPreferences::default(),
+            vec![
+                Workspace {
+                    is_default: false,
+                    ..Workspace::default_workspace()
+                },
+                Workspace {
+                    id: 2,
+                    name: "Studio".to_string(),
+                    icon: WorkspaceIcon::Palette,
+                    color: WorkspaceColor::Purple,
+                    is_default: true,
+                    is_active: false,
+                },
+            ],
+            vec![],
+        );
+
+        manager.restore_session(vec![SessionTabSnapshot {
+            workspace_id: 1,
+            url: "https://personal.example".to_string(),
+            title: "Personal".to_string(),
+            is_active: true,
+            is_hibernated: true,
+            is_pinned: false,
+        }]);
+
+        assert_eq!(manager.active_workspace_id, 2);
+        let active = manager
+            .tabs
+            .iter()
+            .find(|tab| Some(tab.id) == manager.active_tab_id)
+            .expect("fresh tab is created");
+        assert_eq!(active.workspace_id, 2);
+    }
+
+    #[test]
+    fn deleting_the_default_workspace_reassigns_it() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut manager = TabManager::new(
+            tx,
+            rx,
+            std::ptr::null_mut(),
+            ContentRect {
+                x: 180,
+                y: 0,
+                width: 1100,
+                height: 800,
+                scale_factor: 1.0,
+            },
+            None,
+            &BrowserPreferences::default(),
+            vec![
+                Workspace::default_workspace(),
+                Workspace {
+                    id: 2,
+                    name: "Studio".to_string(),
+                    icon: WorkspaceIcon::Palette,
+                    color: WorkspaceColor::Purple,
+                    is_default: false,
+                    is_active: false,
+                },
+            ],
+            vec![],
+        );
+
+        manager.delete_workspace(1);
+
+        assert_eq!(manager.workspaces.len(), 1);
+        assert_eq!(manager.workspaces[0].id, 2);
+        assert!(manager.workspaces[0].is_default);
     }
 
     #[test]

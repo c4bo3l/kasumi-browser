@@ -233,6 +233,10 @@ pub enum UiAction {
     DeleteWorkspace {
         workspace_id: u64,
     },
+    /// Choose the workspace that opens at startup; the current session stays put.
+    SetDefaultWorkspace {
+        workspace_id: u64,
+    },
     /// Save the active tab in a folder named after the active workspace.
     AddBookmark {
         tab_id: u64,

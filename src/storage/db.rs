@@ -148,8 +148,8 @@ impl StorageManager {
         // Existing tabs and bookmarks are assigned to it below.
         conn.execute(
             "INSERT OR IGNORE INTO workspaces
-             (id, name, icon, color, is_active, sort_index)
-             VALUES (?1, ?2, ?3, ?4, 1, 0)",
+             (id, name, icon, color, is_default, is_active, sort_index)
+             VALUES (?1, ?2, ?3, ?4, 1, 1, 0)",
             params![
                 Workspace::DEFAULT_ID as i64,
                 Workspace::DEFAULT_NAME,
@@ -200,6 +200,15 @@ impl StorageManager {
             params![Workspace::DEFAULT_NAME, Workspace::DEFAULT_ID as i64],
         )?;
 
+        // Databases created before default-workspace support gain the column
+        // here. The active workspace becomes the initial default so startup
+        // behaviour is preserved until the user chooses another one.
+        if !table_has_column(&conn, "workspaces", "is_default")? {
+            conn.execute_batch(
+                "ALTER TABLE workspaces ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+
         // Keep exactly one active workspace even if an older session wrote
         // several active flags or none at all.
         let active_count: i64 = conn.query_row(
@@ -212,6 +221,28 @@ impl StorageManager {
             conn.execute(
                 "UPDATE workspaces SET is_active = 1 WHERE id = ?1",
                 params![Workspace::DEFAULT_ID as i64],
+            )?;
+        }
+
+        // Keep exactly one default workspace. Unlike `is_active`, this flag is
+        // only changed when the user picks a startup workspace in Settings.
+        let default_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM workspaces WHERE is_default = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if default_count != 1 {
+            conn.execute_batch("UPDATE workspaces SET is_default = 0;")?;
+            let fallback_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM workspaces WHERE is_active = 1 ORDER BY id LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(Workspace::DEFAULT_ID as i64);
+            conn.execute(
+                "UPDATE workspaces SET is_default = 1 WHERE id = ?1",
+                params![fallback_id],
             )?;
         }
 
@@ -256,7 +287,7 @@ impl StorageManager {
     pub fn load_workspaces(db_path: &Path) -> Result<Vec<Workspace>, rusqlite::Error> {
         let conn = Self::init_db(db_path)?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, icon, color, is_active
+            "SELECT id, name, icon, color, is_default, is_active
              FROM workspaces ORDER BY sort_index ASC, id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -265,7 +296,8 @@ impl StorageManager {
                 name: row.get(1)?,
                 icon: WorkspaceIcon::from_storage_key(&row.get::<_, String>(2)?),
                 color: WorkspaceColor::from_storage_key(&row.get::<_, String>(3)?),
-                is_active: row.get::<_, i32>(4)? != 0,
+                is_default: row.get::<_, i32>(4)? != 0,
+                is_active: row.get::<_, i32>(5)? != 0,
             })
         })?;
 
@@ -459,13 +491,14 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
             for workspace in &workspaces {
                 let _ = tx.execute(
                     "INSERT INTO workspaces
-                     (id, name, icon, color, is_active, sort_index)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (id, name, icon, color, is_default, is_active, sort_index)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         workspace.id as i64,
                         Workspace::normalize_name(&workspace.name),
                         workspace.icon.storage_key(),
                         workspace.color.storage_key(),
+                        if workspace.is_default { 1 } else { 0 },
                         if workspace.is_active { 1 } else { 0 },
                         workspace.id as i64,
                     ],
@@ -712,6 +745,7 @@ mod tests {
         let default = StorageManager::load_workspaces(&path).expect("default workspace");
         assert_eq!(default.len(), 1);
         assert_eq!(default[0].name, Workspace::DEFAULT_NAME);
+        assert!(default[0].is_default);
         assert!(default[0].is_active);
 
         apply_command(
@@ -723,6 +757,7 @@ mod tests {
                         name: "Personal".to_string(),
                         icon: WorkspaceIcon::Work,
                         color: WorkspaceColor::Blue,
+                        is_default: false,
                         is_active: false,
                     },
                     Workspace {
@@ -730,6 +765,7 @@ mod tests {
                         name: "Studio".to_string(),
                         icon: WorkspaceIcon::Palette,
                         color: WorkspaceColor::Purple,
+                        is_default: true,
                         is_active: true,
                     },
                 ],
@@ -741,7 +777,9 @@ mod tests {
         assert_eq!(saved[1].name, "Studio");
         assert_eq!(saved[1].icon, WorkspaceIcon::Palette);
         assert_eq!(saved[1].color, WorkspaceColor::Purple);
+        assert!(saved[1].is_default);
         assert!(saved[1].is_active);
+        assert!(!saved[0].is_default);
         assert!(!saved[0].is_active);
 
         drop(conn);

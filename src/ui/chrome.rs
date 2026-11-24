@@ -353,6 +353,7 @@ pub struct WorkspaceInfo {
     pub name: String,
     pub icon: WorkspaceIcon,
     pub color: WorkspaceColor,
+    pub is_default: bool,
     pub is_active: bool,
 }
 
@@ -430,6 +431,15 @@ pub enum RailMenuOutcome {
     Action(UiAction),
 }
 
+/// Page selected inside the native Settings dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsTab {
+    #[default]
+    General,
+    Workspaces,
+    Bookmarks,
+}
+
 /// One row in the rail tab context menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RailMenuItem {
@@ -487,6 +497,8 @@ pub struct ChromeState {
     pub preferences: BrowserPreferences,
     /// True while the native Settings overlay is visible.
     pub settings_open: bool,
+    /// Page currently shown in the Settings overlay.
+    pub settings_tab: SettingsTab,
     /// Working copy edited by the Settings overlay; committed on every change.
     pub settings_draft: BrowserPreferences,
     /// Draft values for creating or editing the active workspace in Settings.
@@ -525,6 +537,7 @@ impl Default for ChromeState {
             theme: ChromeTheme::default(),
             preferences: BrowserPreferences::default(),
             settings_open: false,
+            settings_tab: SettingsTab::General,
             settings_draft: BrowserPreferences::default(),
             workspace_name_draft: String::new(),
             workspace_icon_draft: WorkspaceIcon::default(),
@@ -589,8 +602,15 @@ impl ChromeState {
         self.menu_selection = 0;
     }
 
-    /// Open the native Settings overlay, seeded from committed preferences.
+    /// Open the native Settings overlay on the General page.
     pub fn open_settings(&mut self) {
+        self.open_settings_tab(SettingsTab::General);
+    }
+
+    /// Open the native Settings overlay on a specific page, seeded from
+    /// committed preferences. Workspace controls get their own page so the
+    /// dialog stays manageable as features are added.
+    pub fn open_settings_tab(&mut self, tab: SettingsTab) {
         self.command_palette_open = false;
         self.command_palette_query.clear();
         self.command_selection = 0;
@@ -598,6 +618,7 @@ impl ChromeState {
         self.command_palette_select_all_requested = false;
         self.close_tab_menu();
         self.tooltip = None;
+        self.settings_tab = tab;
         self.settings_draft = self.preferences.clone();
         self.sync_workspace_draft();
         self.settings_open = true;
@@ -1061,8 +1082,8 @@ impl ChromeRenderer {
             palette,
         );
         if add.clicked() {
-            // Workspace creation values are edited in the native Settings card.
-            state.open_settings();
+            // Workspace creation values live on the dedicated Settings page.
+            state.open_settings_tab(SettingsTab::Workspaces);
         }
     }
 
@@ -1836,8 +1857,10 @@ impl ChromeRenderer {
         let mut workspace_name = state.workspace_name_draft.clone();
         let mut workspace_icon = state.workspace_icon_draft;
         let mut workspace_color = state.workspace_color_draft;
+        let workspaces = state.workspaces.clone();
         let active_workspace = state.active_workspace().cloned();
         let workspace_count = state.workspaces.len();
+        let mut settings_tab = state.settings_tab;
         let active_tab_id = state.active_tab_id;
         let bookmarks = state.bookmarks.clone();
         let mut workspace_actions: Vec<UiAction> = Vec::new();
@@ -1881,13 +1904,34 @@ impl ChromeRenderer {
                         ui.add_space(4.0);
                         ui.separator();
                         ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            for (tab, label) in [
+                                (SettingsTab::General, "General"),
+                                (SettingsTab::Workspaces, "Workspaces"),
+                                (SettingsTab::Bookmarks, "Bookmarks"),
+                            ] {
+                                if ui.selectable_label(settings_tab == tab, label).clicked() {
+                                    settings_tab = tab;
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(6.0);
 
                         let available_height =
                             SETTINGS_MAX_CONTENT_HEIGHT.min((screen.height() - 120.0).max(160.0));
+                        let scroll_id = match settings_tab {
+                            SettingsTab::General => "kasumi_settings_general",
+                            SettingsTab::Workspaces => "kasumi_settings_workspaces",
+                            SettingsTab::Bookmarks => "kasumi_settings_bookmarks",
+                        };
                         egui::ScrollArea::vertical()
-                            .id_salt("kasumi_settings_scroll")
+                            .id_salt(scroll_id)
                             .max_height(available_height)
                             .show(ui, |ui| {
+                                match settings_tab {
+                                    SettingsTab::General => {
                                 ui.label(
                                     RichText::new("APPEARANCE")
                                         .size(10.0)
@@ -1974,6 +2018,12 @@ impl ChromeRenderer {
                                 ui.add_space(10.0);
                                 ui.separator();
                                 ui.add_space(6.0);
+                                ui.checkbox(
+                                    &mut draft.rail_expanded,
+                                    "Expand the workspace rail on startup",
+                                );
+                                }
+                                SettingsTab::Workspaces => {
                                 ui.label(
                                     RichText::new("WORKSPACES")
                                         .size(10.0)
@@ -1981,6 +2031,37 @@ impl ChromeRenderer {
                                         .color(palette.section_label),
                                 );
                                 ui.add_space(3.0);
+                                ui.label(
+                                    RichText::new("DEFAULT WORKSPACE")
+                                        .size(9.0)
+                                        .color(palette.section_label),
+                                );
+                                ui.label(
+                                    RichText::new("Opens at startup; switching here still changes the current session.")
+                                        .size(10.0)
+                                        .color(palette.palette_hint),
+                                );
+                                let current_default = workspaces
+                                    .iter()
+                                    .find(|workspace| workspace.is_default)
+                                    .map(|workspace| workspace.id)
+                                    .unwrap_or(Workspace::DEFAULT_ID);
+                                let mut selected_default = current_default;
+                                for workspace in &workspaces {
+                                    let (r, g, b) = workspace.color.rgb();
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("●").color(Color32::from_rgb(r, g, b)));
+                                        ui.radio_value(&mut selected_default, workspace.id, workspace.name.clone());
+                                    });
+                                }
+                                if selected_default != current_default {
+                                    workspace_actions.push(UiAction::SetDefaultWorkspace {
+                                        workspace_id: selected_default,
+                                    });
+                                }
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.add_space(6.0);
                                 if let Some(workspace) = &active_workspace {
                                     ui.label(
                                         RichText::new(format!("Editing “{}”", workspace.name))
@@ -2051,11 +2132,8 @@ impl ChromeRenderer {
                                         .color(palette.palette_hint),
                                     );
                                 }
-                                ui.checkbox(
-                                    &mut draft.rail_expanded,
-                                    "Expand the workspace rail on startup",
-                                );
-
+                                }
+                                SettingsTab::Bookmarks => {
                                 ui.add_space(10.0);
                                 ui.separator();
                                 ui.add_space(6.0);
@@ -2133,6 +2211,8 @@ impl ChromeRenderer {
                                             }
                                         });
                                 }
+                                    }
+                                }
                             });
 
                         ui.add_space(8.0);
@@ -2155,6 +2235,8 @@ impl ChromeRenderer {
                     .rect
                     .expand(8.0);
             });
+
+        state.settings_tab = settings_tab;
 
         let next = draft.normalized();
         state.settings_draft = next.clone();
@@ -3632,8 +3714,8 @@ mod tests {
         rail_menu_click_outside, rail_menu_items, rail_menu_metrics, rail_menu_ui_action,
         rail_tooltip_enabled, rail_tooltip_metrics, resolve_omnibox, resolve_omnibox_with_search,
         tab_close_center, tab_status_center, truncate_title, ChromePalette, ChromeState,
-        ChromeTheme, CommandAction, RailMenuAction, TabDisplayState, TabInfo, WorkspaceInfo,
-        TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
+        ChromeTheme, CommandAction, RailMenuAction, SettingsTab, TabDisplayState, TabInfo,
+        WorkspaceInfo, TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
     };
     use crate::config::{
         BrowserPreferences, SearchEngine, ThemePreference, WorkspaceColor, WorkspaceIcon,
@@ -3938,6 +4020,7 @@ mod tests {
             name: "Studio".to_string(),
             icon: WorkspaceIcon::Palette,
             color: WorkspaceColor::Green,
+            is_default: true,
             is_active: true,
         }];
         state.active_workspace_id = 7;
@@ -4196,6 +4279,20 @@ mod tests {
 
         state.close_settings();
         assert!(!state.has_overlay());
+    }
+
+    #[test]
+    fn settings_overlay_opens_on_the_requested_page() {
+        let mut state = ChromeState::default();
+        assert_eq!(state.settings_tab, SettingsTab::General);
+
+        state.open_settings_tab(SettingsTab::Workspaces);
+        assert!(state.settings_open);
+        assert_eq!(state.settings_tab, SettingsTab::Workspaces);
+
+        state.close_settings();
+        state.open_settings();
+        assert_eq!(state.settings_tab, SettingsTab::General);
     }
 
     #[test]

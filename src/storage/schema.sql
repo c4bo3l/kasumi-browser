@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     name TEXT NOT NULL UNIQUE,
     icon TEXT NOT NULL DEFAULT 'work',
     color TEXT NOT NULL DEFAULT 'blue',
+    is_default INTEGER NOT NULL DEFAULT 0,
     is_active INTEGER NOT NULL DEFAULT 0,
     sort_index INTEGER NOT NULL DEFAULT 0
 );
