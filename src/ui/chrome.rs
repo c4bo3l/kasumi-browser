@@ -349,6 +349,41 @@ impl DownloadSummary {
     }
 }
 
+/// Badge shown on the rail's Downloads icon. Running transfers get a count;
+/// history with no running transfers gets a quiet dot so the icon still signals
+/// that the bubble has something to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadBadge {
+    Hidden,
+    History,
+    Active(usize),
+}
+
+pub fn download_rail_badge(downloads: &[DownloadInfo]) -> DownloadBadge {
+    let active = downloads
+        .iter()
+        .filter(|download| {
+            matches!(
+                download.state,
+                DownloadState::InProgress | DownloadState::Paused
+            )
+        })
+        .count();
+    if active > 0 {
+        DownloadBadge::Active(active)
+    } else if downloads.is_empty() {
+        DownloadBadge::Hidden
+    } else {
+        DownloadBadge::History
+    }
+}
+
+/// Completed and failed rows are intentionally static: they no longer display
+/// a progress bar, so the row can show only its final state and file actions.
+pub fn download_row_uses_progress_bar(state: DownloadState) -> bool {
+    matches!(state, DownloadState::InProgress | DownloadState::Paused)
+}
+
 /// Translate the two independent workspace forms into actions. The edit form
 /// only emits on an explicit Save click, and Create only reads the create form;
 /// this prevents a half-finished rename from becoming a new workspace name.
@@ -1443,6 +1478,8 @@ impl ChromeRenderer {
         let width = rail_width(state.rail_expanded);
         let palette = state.palette();
         let palette = &palette;
+        // Computed once so both rail modes show the same active-download state.
+        let download_badge = download_rail_badge(&state.downloads);
         let rail = egui::SidePanel::left("workspace_rail")
             .exact_width(width)
             .resizable(false)
@@ -1635,6 +1672,13 @@ impl ChromeRenderer {
                                 if downloads.clicked() {
                                     actions.push(UiAction::OpenDownloads);
                                 }
+                                paint_download_badge(
+                                    ui,
+                                    downloads.rect,
+                                    download_badge,
+                                    palette,
+                                    true,
+                                );
                                 Self::chrome_tooltip(
                                     tooltip_slot,
                                     ui,
@@ -1977,6 +2021,7 @@ impl ChromeRenderer {
                         if downloads.clicked() {
                             actions.push(UiAction::OpenDownloads);
                         }
+                        paint_download_badge(ui, downloads.rect, download_badge, palette, false);
                         Self::chrome_tooltip(
                             tooltip_slot,
                             ui,
@@ -2482,12 +2527,129 @@ impl ChromeRenderer {
                                         );
                                     });
 
-                                    let percent = download.percent_complete.clamp(0, 100) as f32;
-                                    ui.add(
-                                        egui::ProgressBar::new(percent / 100.0)
-                                            .text(format!("{percent:.0}%"))
-                                            .desired_width((size.x - 36.0).max(40.0)),
-                                    );
+                                    // Active and paused transfers keep a progress
+                                    // bar with compact pause/resume and cancel
+                                    // icons on its right edge. Finished rows drop
+                                    // the bar entirely and swap those icons for
+                                    // open/show-in-folder so each row stays short.
+                                    if download_row_uses_progress_bar(download.state) {
+                                        let percent =
+                                            download.percent_complete.clamp(0, 100) as f32;
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::ProgressBar::new(percent / 100.0)
+                                                    .text(format!("{percent:.0}%"))
+                                                    .desired_width((size.x - 84.0).max(40.0)),
+                                            );
+                                            match download.state {
+                                                DownloadState::InProgress => {
+                                                    if compact_icon_button(
+                                                        ui,
+                                                        RailIcon::Pause,
+                                                        "Pause",
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::PauseDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                    if compact_icon_button(
+                                                        ui,
+                                                        RailIcon::Close,
+                                                        "Cancel",
+                                                        palette,
+                                                        false,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::CancelDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                }
+                                                DownloadState::Paused => {
+                                                    if compact_icon_button(
+                                                        ui,
+                                                        RailIcon::Play,
+                                                        "Resume",
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::ResumeDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                    if compact_icon_button(
+                                                        ui,
+                                                        RailIcon::Close,
+                                                        "Cancel",
+                                                        palette,
+                                                        false,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::CancelDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        });
+                                    } else {
+                                        ui.horizontal(|ui| match download.state {
+                                            DownloadState::Completed => {
+                                                if compact_icon_button(
+                                                    ui,
+                                                    RailIcon::OpenInNew,
+                                                    "Open file",
+                                                    palette,
+                                                    true,
+                                                )
+                                                .clicked()
+                                                {
+                                                    actions.push(UiAction::OpenDownloadFile {
+                                                        download_id: download.id,
+                                                    });
+                                                }
+                                                if compact_icon_button(
+                                                    ui,
+                                                    RailIcon::FolderOpen,
+                                                    "Show in folder",
+                                                    palette,
+                                                    false,
+                                                )
+                                                .clicked()
+                                                {
+                                                    actions.push(UiAction::RevealDownload {
+                                                        download_id: download.id,
+                                                    });
+                                                }
+                                            }
+                                            DownloadState::Canceled
+                                            | DownloadState::Interrupted => {
+                                                if compact_icon_button(
+                                                    ui,
+                                                    RailIcon::Retry,
+                                                    "Retry",
+                                                    palette,
+                                                    true,
+                                                )
+                                                .clicked()
+                                                {
+                                                    actions.push(UiAction::RetryDownload {
+                                                        download_id: download.id,
+                                                    });
+                                                }
+                                            }
+                                            _ => {}
+                                        });
+                                    }
                                     ui.horizontal(|ui| {
                                         ui.label(
                                             RichText::new(format!(
@@ -2516,6 +2678,27 @@ impl ChromeRenderer {
                                             .size(10.0)
                                             .color(palette.palette_hint),
                                         );
+                                        // "Remove info" only forgets the SQLite
+                                        // row and UI state; the file on disk is
+                                        // never deleted by this action.
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if compact_icon_button(
+                                                    ui,
+                                                    RailIcon::Delete,
+                                                    "Remove info",
+                                                    palette,
+                                                    false,
+                                                )
+                                                .clicked()
+                                                {
+                                                    actions.push(UiAction::RemoveDownload {
+                                                        download_id: download.id,
+                                                    });
+                                                }
+                                            },
+                                        );
                                     });
                                     if !download.full_path.is_empty() {
                                         ui.label(
@@ -2524,135 +2707,6 @@ impl ChromeRenderer {
                                                 .color(palette.palette_hint),
                                         );
                                     }
-
-                                    ui.horizontal_wrapped(|ui| {
-                                        match download.state {
-                                            DownloadState::InProgress => {
-                                                if material_button(
-                                                    ui,
-                                                    RailIcon::Pause,
-                                                    "Pause",
-                                                    MaterialButtonStyle::Outlined,
-                                                    palette,
-                                                    true,
-                                                )
-                                                .clicked()
-                                                {
-                                                    actions.push(UiAction::PauseDownload {
-                                                        download_id: download.id,
-                                                    });
-                                                }
-                                                if material_button(
-                                                    ui,
-                                                    RailIcon::Close,
-                                                    "Cancel",
-                                                    MaterialButtonStyle::Text,
-                                                    palette,
-                                                    true,
-                                                )
-                                                .clicked()
-                                                {
-                                                    actions.push(UiAction::CancelDownload {
-                                                        download_id: download.id,
-                                                    });
-                                                }
-                                            }
-                                            DownloadState::Paused => {
-                                                if material_button(
-                                                    ui,
-                                                    RailIcon::Play,
-                                                    "Resume",
-                                                    MaterialButtonStyle::Filled,
-                                                    palette,
-                                                    true,
-                                                )
-                                                .clicked()
-                                                {
-                                                    actions.push(UiAction::ResumeDownload {
-                                                        download_id: download.id,
-                                                    });
-                                                }
-                                                if material_button(
-                                                    ui,
-                                                    RailIcon::Close,
-                                                    "Cancel",
-                                                    MaterialButtonStyle::Text,
-                                                    palette,
-                                                    true,
-                                                )
-                                                .clicked()
-                                                {
-                                                    actions.push(UiAction::CancelDownload {
-                                                        download_id: download.id,
-                                                    });
-                                                }
-                                            }
-                                            DownloadState::Completed => {
-                                                if material_button(
-                                                    ui,
-                                                    RailIcon::OpenInNew,
-                                                    "Open",
-                                                    MaterialButtonStyle::Tonal,
-                                                    palette,
-                                                    true,
-                                                )
-                                                .clicked()
-                                                {
-                                                    actions.push(UiAction::OpenDownloadFile {
-                                                        download_id: download.id,
-                                                    });
-                                                }
-                                                if material_button(
-                                                    ui,
-                                                    RailIcon::FolderOpen,
-                                                    "Show in folder",
-                                                    MaterialButtonStyle::Outlined,
-                                                    palette,
-                                                    true,
-                                                )
-                                                .clicked()
-                                                {
-                                                    actions.push(UiAction::RevealDownload {
-                                                        download_id: download.id,
-                                                    });
-                                                }
-                                            }
-                                            DownloadState::Canceled
-                                            | DownloadState::Interrupted => {
-                                                if material_button(
-                                                    ui,
-                                                    RailIcon::Retry,
-                                                    "Retry",
-                                                    MaterialButtonStyle::Tonal,
-                                                    palette,
-                                                    true,
-                                                )
-                                                .clicked()
-                                                {
-                                                    actions.push(UiAction::RetryDownload {
-                                                        download_id: download.id,
-                                                    });
-                                                }
-                                            }
-                                        }
-                                        // "Remove info" only forgets the SQLite
-                                        // row and UI state; the file on disk is
-                                        // never deleted by this action.
-                                        if material_button(
-                                            ui,
-                                            RailIcon::Delete,
-                                            "Remove info",
-                                            MaterialButtonStyle::Text,
-                                            palette,
-                                            true,
-                                        )
-                                        .clicked()
-                                        {
-                                            actions.push(UiAction::RemoveDownload {
-                                                download_id: download.id,
-                                            });
-                                        }
-                                    });
                                 }
                             });
                     })
@@ -4358,6 +4412,70 @@ fn material_button(
     ui.add_enabled(enabled, button)
 }
 
+/// A fixed-size, icon-only button used by dense download rows. The hover label
+/// is supplied through egui's own tooltip so the glyph stays crisp and compact.
+fn compact_icon_button(
+    ui: &mut Ui,
+    icon: RailIcon,
+    label: &'static str,
+    palette: &ChromePalette,
+    prominent: bool,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+    let fill = if prominent {
+        palette.rail_row_active
+    } else if response.hovered() {
+        palette.rail_row_hover
+    } else {
+        palette.rail_surface
+    };
+    let color = if prominent {
+        palette.text_strong
+    } else {
+        palette.text
+    };
+    ui.painter().rect_filled(rect, Rounding::same(6.0), fill);
+    paint_rail_icon(ui, rect, icon, color);
+    response.on_hover_text(label)
+}
+
+/// Paint the active-transfer count (or a quiet history dot) over the rail's
+/// Downloads button. It is drawn directly on the native rail, not in a second
+/// view, so it tracks download snapshots on the same frame as the bubble.
+fn paint_download_badge(
+    ui: &Ui,
+    rect: egui::Rect,
+    badge: DownloadBadge,
+    palette: &ChromePalette,
+    collapsed: bool,
+) {
+    let inset = if collapsed { 4.0 } else { 8.0 };
+    let center = pos2(rect.right() - inset, rect.top() + inset);
+    match badge {
+        DownloadBadge::Hidden => {}
+        DownloadBadge::History => {
+            ui.painter().circle_filled(center, 4.0, palette.shield_ok);
+        }
+        DownloadBadge::Active(count) => {
+            let radius = if collapsed { 7.5 } else { 9.0 };
+            let text = if count > 99 {
+                "99+".to_string()
+            } else {
+                count.to_string()
+            };
+            ui.painter()
+                .circle_filled(center, radius, palette.rail_accent);
+            ui.painter().text(
+                center,
+                Align2::CENTER_CENTER,
+                text,
+                FontId::new(9.0, FontFamily::Proportional),
+                palette.text_strong,
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure chrome helpers (unit-tested)
 // ---------------------------------------------------------------------------
@@ -4925,15 +5043,16 @@ mod tests {
     use super::{
         advance_command_selection, apply_command_item, clamp_command_selection,
         command_palette_click_outside, command_palette_items, download_engine_label,
-        download_state_label, downloads_bubble_anchor, downloads_bubble_size, effective_theme,
+        download_rail_badge, download_row_uses_progress_bar, download_state_label,
+        downloads_bubble_anchor, downloads_bubble_size, effective_theme,
         focus_request_after_render, format_download_bytes, loading_spinner_angle,
         loading_spinner_point, page_tooltip_anchor, palette_row_fill, preferred_surface_format,
         rail_menu_anchor, rail_menu_click_outside, rail_menu_items, rail_menu_metrics,
         rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled, rail_tooltip_metrics,
         resolve_omnibox, resolve_omnibox_with_search, tab_close_center, tab_status_center,
         truncate_title, workspace_form_actions, ChromePalette, ChromeRenderer, ChromeState,
-        ChromeTheme, CommandAction, DownloadSummary, RailMenuAction, SettingsTab, TabDisplayState,
-        TabInfo, WorkspaceInfo, RAIL_STATUS_BADGE_HEIGHT, RAIL_STATUS_HEIGHT,
+        ChromeTheme, CommandAction, DownloadBadge, DownloadSummary, RailMenuAction, SettingsTab,
+        TabDisplayState, TabInfo, WorkspaceInfo, RAIL_STATUS_BADGE_HEIGHT, RAIL_STATUS_HEIGHT,
         RAIL_STATUS_ICON_COLLAPSED, RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED,
         TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
     };
@@ -5324,7 +5443,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_finds_the_downloads_page() {
+    fn palette_finds_the_downloads_bubble() {
         let items = command_palette_items("download", &[], None, &BrowserPreferences::default());
         assert!(items
             .iter()
@@ -5663,6 +5782,30 @@ mod tests {
         let mut unknown = bubble_download(1, DownloadState::InProgress);
         unknown.total_bytes = 0;
         assert_eq!(DownloadSummary::from_downloads(&[unknown]).percent(), 0);
+    }
+
+    #[test]
+    fn finished_download_rows_drop_the_progress_bar() {
+        assert!(download_row_uses_progress_bar(DownloadState::InProgress));
+        assert!(download_row_uses_progress_bar(DownloadState::Paused));
+        assert!(!download_row_uses_progress_bar(DownloadState::Completed));
+        assert!(!download_row_uses_progress_bar(DownloadState::Canceled));
+        assert!(!download_row_uses_progress_bar(DownloadState::Interrupted));
+    }
+
+    #[test]
+    fn download_rail_badge_tracks_active_transfers_and_history() {
+        assert_eq!(download_rail_badge(&[]), DownloadBadge::Hidden);
+
+        let history = vec![bubble_download(1, DownloadState::Completed)];
+        assert_eq!(download_rail_badge(&history), DownloadBadge::History);
+
+        let active = vec![
+            bubble_download(1, DownloadState::InProgress),
+            bubble_download(2, DownloadState::Paused),
+            bubble_download(3, DownloadState::Completed),
+        ];
+        assert_eq!(download_rail_badge(&active), DownloadBadge::Active(2));
     }
 
     #[test]
