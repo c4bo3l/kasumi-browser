@@ -370,6 +370,7 @@ mod native_shortcuts {
             'w' if !shift => Some(BrowserShortcut::CloseTab),
             'l' | 'k' if !shift => Some(BrowserShortcut::OpenCommandPalette),
             ',' | '.' if !shift => Some(BrowserShortcut::OpenSettings),
+            'q' if !shift => Some(BrowserShortcut::Quit),
             'z' if !shift => Some(BrowserShortcut::ReopenClosedTab),
             _ => None,
         }
@@ -418,6 +419,10 @@ fn setup_mac_application() {
         send_menu_shortcut(BrowserShortcut::OpenSettings);
     }
 
+    extern "C" fn menu_quit(_this: *mut c_void, _cmd: *mut c_void) {
+        send_menu_shortcut(BrowserShortcut::Quit);
+    }
+
     unsafe {
         let cls_name = CString::new("NSApplication").unwrap();
         let cls = objc2::ffi::objc_getClass(cls_name.as_ptr());
@@ -450,6 +455,7 @@ fn setup_mac_application() {
             register_action("kasumiNewTab:", menu_new_tab);
             register_action("kasumiCloseTab:", menu_close_tab);
             register_action("kasumiOpenSettings:", menu_open_settings);
+            register_action("kasumiQuitApp:", menu_quit);
 
             let proto_name = CString::new("CrAppControlProtocol").unwrap();
             let proto = objc2::ffi::objc_getProtocol(proto_name.as_ptr());
@@ -481,6 +487,7 @@ fn install_macos_main_menu() {
 
     let main_menu = NSMenu::new(mtm);
     unsafe { main_menu.setTitle(&NSString::from_str("Kasumi Browser")) };
+    let target: &AnyObject = app.as_ref();
 
     let app_item = NSMenuItem::new(mtm);
     unsafe { app_item.setTitle(&NSString::from_str("Kasumi Browser")) };
@@ -491,6 +498,15 @@ fn install_macos_main_menu() {
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    let quit_item = unsafe {
+        app_menu.addItemWithTitle_action_keyEquivalent(
+            &NSString::from_str("Quit Kasumi Browser"),
+            Some(objc2::sel!(kasumiQuitApp:)),
+            &NSString::from_str("q"),
+        )
+    };
+    unsafe { quit_item.setTarget(Some(target)) };
     app_item.setSubmenu(Some(&app_menu));
     main_menu.addItem(&app_item);
 
@@ -500,7 +516,6 @@ fn install_macos_main_menu() {
     file_item.setSubmenu(Some(&file_menu));
     main_menu.addItem(&file_item);
 
-    let target: &AnyObject = app.as_ref();
     let add_item = |title: &str, selector: objc2::runtime::Sel, key: &str| {
         let item = unsafe {
             file_menu.addItemWithTitle_action_keyEquivalent(
@@ -821,6 +836,19 @@ impl KasumiBrowserHandler {
         self.tooltip_size = None;
     }
 
+    /// Begin the same graceful shutdown path used by the window close button.
+    /// The actual CEF teardown runs from `about_to_wait`, never from a key event.
+    fn request_shutdown(&mut self) {
+        if self.shutdown_requested {
+            return;
+        }
+        tracing::info!("Shutdown shortcut requested — deferring CEF shutdown to about_to_wait");
+        self.shutdown_requested = true;
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
     /// Dispatch a browser shortcut once, regardless of whether it came from
     /// winit, CEF, or the macOS native event monitor.
     fn handle_browser_shortcut(&mut self, shortcut: BrowserShortcut) {
@@ -855,6 +883,7 @@ impl KasumiBrowserHandler {
             BrowserShortcut::OpenSettings => {
                 self.chrome_state.open_settings();
             }
+            BrowserShortcut::Quit => self.request_shutdown(),
         }
     }
 
@@ -954,6 +983,15 @@ fn is_reopen_tab_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
         && !modifiers.alt_key()
         && !modifiers.shift_key()
         && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("z"))
+}
+
+/// Cmd/Ctrl+Q quits through the same deferred shutdown path as the window's
+/// close button, so SQLite and CEF are flushed before the process exits.
+fn is_quit_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
+    is_primary_shortcut_modifier(modifiers)
+        && !modifiers.alt_key()
+        && !modifiers.shift_key()
+        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
 }
 
 impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
@@ -1233,7 +1271,9 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                 let alt = self.modifiers.alt_key();
                 let shift = self.modifiers.shift_key();
 
-                if alt {
+                if is_quit_shortcut(self.modifiers, logical_key) {
+                    self.request_shutdown();
+                } else if alt {
                     if let Key::Character(c) = logical_key {
                         if c.eq_ignore_ascii_case("h") {
                             if let Some(tm) = self.tab_manager.as_mut() {
@@ -1278,11 +1318,10 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                 }
             }
             WindowEvent::CloseRequested => {
-                tracing::info!("Window close requested — deferring CEF shutdown to about_to_wait");
                 // Never pump CEF (or call cef::shutdown()) from inside a window
                 // event callback. On macOS, do_message_loop_work() dispatches
                 // NSApp events that can re-enter winit's single-entry handler.
-                self.shutdown_requested = true;
+                self.request_shutdown();
             }
             WindowEvent::Moved(_) => {
                 // Keep helper windows on the same display as the browser when
@@ -1672,8 +1711,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_primary_shortcut_modifier, is_reopen_tab_shortcut, overlay_screen_position,
-        pointer_is_past_rail, BrowserShortcut,
+        is_primary_shortcut_modifier, is_quit_shortcut, is_reopen_tab_shortcut,
+        overlay_screen_position, pointer_is_past_rail, BrowserShortcut,
     };
     use winit::dpi::PhysicalPosition;
     use winit::keyboard::{Key, ModifiersState};
@@ -1718,6 +1757,29 @@ mod tests {
         assert!(!is_reopen_tab_shortcut(
             ModifiersState::CONTROL,
             &Key::Character("t".into())
+        ));
+    }
+
+    #[test]
+    fn quit_shortcut_requires_primary_modifier_without_other_modifiers() {
+        let q: Key = Key::Character("q".into());
+        let upper_q: Key = Key::Character("Q".into());
+
+        assert!(is_quit_shortcut(ModifiersState::CONTROL, &q));
+        assert!(is_quit_shortcut(ModifiersState::SUPER, &upper_q));
+        assert!(!is_quit_shortcut(ModifiersState::empty(), &q));
+        assert!(!is_quit_shortcut(ModifiersState::SHIFT, &q));
+        assert!(!is_quit_shortcut(
+            ModifiersState::SUPER | ModifiersState::SHIFT,
+            &q
+        ));
+        assert!(!is_quit_shortcut(
+            ModifiersState::SUPER | ModifiersState::ALT,
+            &q
+        ));
+        assert!(!is_quit_shortcut(
+            ModifiersState::CONTROL,
+            &Key::Character("w".into())
         ));
     }
 
@@ -1805,6 +1867,15 @@ mod tests {
         assert_eq!(
             shortcut_from_parts('\0', 0x58, cmd),
             Some(BrowserShortcut::OpenDevTools)
+        );
+        assert_eq!(
+            shortcut_from_parts('q', 0x0C, cmd),
+            Some(BrowserShortcut::Quit)
+        );
+        assert_eq!(
+            shortcut_from_parts('q', 0x0C, cmd | shift),
+            None,
+            "Shift+Cmd+Q must not quit"
         );
     }
 }

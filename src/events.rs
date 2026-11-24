@@ -82,6 +82,10 @@ pub enum BrowserShortcut {
     OpenCommandPalette,
     OpenDevTools,
     OpenSettings,
+    /// Gracefully close all CEF browsers and exit. Handled by the shell; CEF
+    /// key forwarding deliberately never emits it because TabManager cannot
+    /// exit the winit event loop.
+    Quit,
 }
 
 impl std::fmt::Debug for BrowserEvent {

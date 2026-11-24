@@ -598,5 +598,9 @@ mod tests {
         assert_eq!(browser_shortcut(true, 0x54, 2), None);
         assert_eq!(browser_shortcut(true, 0x57, 128 | 2), None);
         assert_eq!(browser_shortcut(true, 0x58, 128), None);
+        // Quit belongs to the shell so CEF must leave Cmd/Ctrl+Q alone; the
+        // native event monitor routes it through graceful winit shutdown.
+        assert_eq!(browser_shortcut(true, 0x51, 128), None);
+        assert_eq!(browser_shortcut_from_char(true, 'q' as u16, 128), None);
     }
 }

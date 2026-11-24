@@ -1600,6 +1600,10 @@ impl TabManager {
                 BrowserShortcut::OpenSettings => {
                     self.settings_requested = true;
                 }
+                BrowserShortcut::Quit => {
+                    // The shell exits the event loop from its own shortcut
+                    // path; TabManager must never call process::exit().
+                }
             },
             BrowserEvent::ViewSource { url, .. } => {
                 if url.is_empty() {
