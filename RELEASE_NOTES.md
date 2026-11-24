@@ -8,16 +8,16 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ### Added
 
-- Native bookmark manager improvements in **Settings → Bookmarks**: search by title, URL, or folder; select a row to edit its title and URL; move it between workspace-named folder options; and delete individual bookmarks with icon-only actions. Edits are keyed by the original `(workspace_id, url)` pair and persisted through the SQLite worker, so in-memory bookmarks added with a temporary id can still be saved safely.
-- Bookmark the current page from the expanded rail address field or the command palette. Both actions reuse the existing workspace-aware bookmark flow and show a native **Bookmark saved** confirmation.
+- Native bookmark manager improvements in **Settings → Bookmarks**: search by title, URL, or folder; select a row to edit its title and URL; move it between workspace-named folder options; and delete individual bookmarks with icon-only actions. Open it from the rail **Settings** button, `Cmd/Ctrl+,` then **Bookmarks**, or the command palette's **Open bookmark manager** command. Edits are keyed by the original `(workspace_id, url)` pair and persisted through the SQLite worker, so in-memory bookmarks added with a temporary id can still be saved safely.
+- Toggle the current page's bookmark from the expanded rail address field or the command palette. An outlined star means the page is not bookmarked; clicking saves it and shows **Bookmark saved**. A filled accent star means it is bookmarked; clicking removes it and shows **Bookmark removed**.
 - Transparent click-through native notifications for terminal download outcomes. Completed transfers show **Download complete** with the file name; interrupted transfers show **Download failed**. The notification appears above the CEF child view without stealing focus or blocking page input, and dismisses automatically.
 - A native **Copied** confirmation after copying the URL from the rail address field.
-- Verification coverage for bookmark search/normalization, bookmark manager layout, duplicate bookmark move rejection, command-palette bookmark actions, terminal download notification transitions, and native toast mapping/queueing.
+- Verification coverage for bookmark search/normalization, bookmark manager layout, duplicate bookmark move rejection, command-palette bookmark actions, bookmark toggle/un-bookmark state, outlined-star geometry, terminal download notification transitions, and native toast mapping/queueing.
 
 ### Changed
 
 - Widened the expanded rail from 180 px to 208 px so vertical tabs and the framed address field have more comfortable room.
-- The rail address field now has compact bookmark and copy actions, and long URLs still scroll inside the field instead of stretching the frame.
+- The rail address field now has compact bookmark and copy actions, and long URLs still scroll inside the field instead of stretching the frame. The bookmark action uses a native outlined star when unbookmarked and the filled Material star when saved.
 - Bumped the project, macOS bundle, About-menu version, docs, canonical spec, and lockfile from `0.7.0` to `0.8.0`.
 
 ### Fixed
@@ -31,7 +31,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 - `cargo fmt --all -- --check`
 - `cargo check --bins`
-- `cargo test --bin kasumi-browser` — 165 tests
+- `cargo test --bin kasumi-browser` — 169 tests
 - `cargo build --release`
 - PR CI checks formatting, binaries, and unit tests on macOS 15 Intel, Windows, and Linux; interactive macOS verification is required before merge.
 

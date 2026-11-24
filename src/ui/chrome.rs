@@ -634,6 +634,7 @@ pub enum CommandAction {
     OpenSettings,
     OpenDownloads,
     BookmarkActiveTab,
+    OpenBookmarkManager,
 }
 
 /// One row in the floating command palette.
@@ -1693,23 +1694,12 @@ impl ChromeRenderer {
 
                     let (bookmark_rect, bookmark_response) =
                         ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
-                    // Highlight the star from the committed tab URL, not the
-                    // editable omnibox draft: AddBookmark saves the tab.
-                    let active_tab_url = state
-                        .tabs
-                        .iter()
-                        .find(|tab| Some(tab.id) == state.active_tab_id)
-                        .map(|tab| tab.url.as_str());
-                    let is_bookmarked = active_tab_url.is_some_and(|url| {
-                        state.bookmarks.iter().any(|bookmark| {
-                            bookmark.workspace_id == state.active_workspace_id
-                                && bookmark.url == url
-                        })
-                    });
-                    paint_rail_icon(
+                    let bookmark_key = active_bookmark_key(state);
+                    let is_bookmarked = bookmark_key.is_some();
+                    paint_bookmark_toggle(
                         ui,
                         egui::Rect::from_center_size(bookmark_rect.center(), vec2(12.0, 12.0)),
-                        RailIcon::Star,
+                        is_bookmarked,
                         if is_bookmarked {
                             palette.rail_accent
                         } else {
@@ -1717,7 +1707,14 @@ impl ChromeRenderer {
                         },
                     );
                     if bookmark_response.clicked() {
-                        if let Some(tab_id) = state.active_tab_id {
+                        if let Some((workspace_id, url)) = bookmark_key.clone() {
+                            actions.push(UiAction::DeleteBookmark { workspace_id, url });
+                            state.show_toast(
+                                ToastKind::Success,
+                                "Bookmark removed",
+                                "Removed from this workspace",
+                            );
+                        } else if let Some(tab_id) = state.active_tab_id {
                             actions.push(UiAction::AddBookmark { tab_id });
                             state.show_toast(
                                 ToastKind::Success,
@@ -1726,7 +1723,11 @@ impl ChromeRenderer {
                             );
                         }
                     }
-                    bookmark_response.on_hover_text("Bookmark this page");
+                    bookmark_response.on_hover_text(if is_bookmarked {
+                        "Remove bookmark"
+                    } else {
+                        "Bookmark this page"
+                    });
 
                     let (copy_rect, copy_response) =
                         ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
@@ -2341,12 +2342,21 @@ impl ChromeRenderer {
         actions: &mut Vec<UiAction>,
         focus_command: bool,
     ) {
-        let items = command_palette_items(
+        let mut items = command_palette_items(
             &state.command_palette_query,
             &state.tabs,
             state.active_tab_id,
             &state.preferences,
         );
+        if active_bookmark_key(state).is_some() {
+            for item in &mut items {
+                if item.action == CommandAction::BookmarkActiveTab {
+                    item.icon = "☆";
+                    item.label = "Remove bookmark".to_string();
+                    item.subtitle = "Remove the active page from its workspace folder".to_string();
+                }
+            }
+        }
         state.command_selection = clamp_command_selection(state.command_selection, items.len());
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -5017,6 +5027,37 @@ fn paint_rail_icon(ui: &Ui, rect: egui::Rect, icon: RailIcon, color: Color32) {
     );
 }
 
+/// Closed ten-point star used for the bookmark toggle. The pinned Material
+/// Symbols font only ships a filled star, so the unbookmarked state is drawn as
+/// a native outline instead of relying on a missing glyph.
+fn bookmark_star_points(rect: egui::Rect) -> Vec<egui::Pos2> {
+    let center = rect.center();
+    let outer = rect.width().min(rect.height()) * 0.5;
+    let inner = outer * 0.44;
+    let mut points = Vec::with_capacity(11);
+    for index in 0..10 {
+        let angle = -std::f32::consts::FRAC_PI_2 + (index as f32) * std::f32::consts::PI / 5.0;
+        let radius = if index % 2 == 0 { outer } else { inner };
+        points.push(pos2(
+            center.x + radius * angle.cos(),
+            center.y + radius * angle.sin(),
+        ));
+    }
+    points.push(points[0]);
+    points
+}
+
+fn paint_bookmark_toggle(ui: &Ui, rect: egui::Rect, bookmarked: bool, color: Color32) {
+    if bookmarked {
+        paint_rail_icon(ui, rect, RailIcon::Star, color);
+    } else {
+        ui.painter().add(egui::Shape::line(
+            bookmark_star_points(rect),
+            Stroke::new(1.25_f32, color),
+        ));
+    }
+}
+
 /// A compact Material-style button: a registered Symbols glyph followed by a
 /// text label. Shared by Settings actions so create/save/delete never look like
 /// ambiguous text-only links.
@@ -5473,9 +5514,15 @@ pub fn command_palette_items(
         active_tab_id.map(|_| CommandPaletteItem {
             icon: "★",
             label: "Bookmark this page".to_string(),
-            subtitle: "Save the active page in its workspace folder".to_string(),
+            subtitle: "Save or remove the active page bookmark".to_string(),
             action: CommandAction::BookmarkActiveTab,
         })
+    };
+    let bookmark_manager_item = || CommandPaletteItem {
+        icon: "☆",
+        label: "Open bookmark manager".to_string(),
+        subtitle: "Search, edit, move, and delete saved pages".to_string(),
+        action: CommandAction::OpenBookmarkManager,
     };
 
     if trimmed.is_empty() {
@@ -5516,6 +5563,7 @@ pub fn command_palette_items(
         if let Some(item) = bookmark_item() {
             items.push(item);
         }
+        items.push(bookmark_manager_item());
         return items;
     }
 
@@ -5597,6 +5645,7 @@ pub fn command_palette_items(
         if let Some(item) = bookmark_item() {
             items.push(item);
         }
+        items.push(bookmark_manager_item());
     }
 
     if needle.contains("pin") {
@@ -5632,8 +5681,16 @@ fn apply_command_item(
         }
         CommandAction::OpenSettings => state.open_settings(),
         CommandAction::OpenDownloads => state.open_downloads(),
+        CommandAction::OpenBookmarkManager => state.open_settings_tab(SettingsTab::Bookmarks),
         CommandAction::BookmarkActiveTab => {
-            if let Some(tab_id) = state.active_tab_id {
+            if let Some((workspace_id, url)) = active_bookmark_key(state) {
+                actions.push(UiAction::DeleteBookmark { workspace_id, url });
+                state.show_toast(
+                    ToastKind::Success,
+                    "Bookmark removed",
+                    "Removed from this workspace",
+                );
+            } else if let Some(tab_id) = state.active_tab_id {
                 actions.push(UiAction::AddBookmark { tab_id });
                 state.show_toast(
                     ToastKind::Success,
@@ -5671,6 +5728,20 @@ fn apply_menu_item(
 // ---------------------------------------------------------------------------
 // Bookmark manager helpers
 // ---------------------------------------------------------------------------
+
+/// Key of the bookmark for the active tab, if it has one. Bookmarks are keyed
+/// by workspace and URL so new in-memory rows never need a database id.
+pub fn active_bookmark_key(state: &ChromeState) -> Option<(u64, String)> {
+    let tab = state
+        .tabs
+        .iter()
+        .find(|tab| Some(tab.id) == state.active_tab_id)?;
+    state
+        .bookmarks
+        .iter()
+        .any(|bookmark| bookmark.workspace_id == tab.workspace_id && bookmark.url == tab.url)
+        .then(|| (tab.workspace_id, tab.url.clone()))
+}
 
 /// Filter bookmarks by title, URL, or folder without changing their order.
 pub fn filter_bookmarks(bookmarks: &[BookmarkInfo], query: &str) -> Vec<BookmarkInfo> {
@@ -5751,21 +5822,21 @@ mod tests {
     use egui::{pos2, vec2, Color32};
 
     use super::{
-        advance_command_selection, apply_command_item, clamp_command_selection,
-        command_palette_click_outside, command_palette_items, download_engine_label,
-        download_eta_label, download_rail_badge, download_row_uses_progress_bar,
-        download_state_label, downloads_bubble_anchor, downloads_bubble_size, effective_theme,
-        filter_bookmarks, focus_request_after_render, format_download_bytes, loading_spinner_angle,
-        loading_spinner_point, normalize_bookmark_url, page_tooltip_anchor, palette_row_fill,
-        preferred_surface_format, rail_menu_anchor, rail_menu_click_outside, rail_menu_items,
-        rail_menu_metrics, rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled,
-        rail_tooltip_metrics, resolve_omnibox, resolve_omnibox_with_search, tab_close_center,
-        tab_status_center, truncate_title, workspace_form_actions, BookmarkInfo, ChromePalette,
-        ChromeRenderer, ChromeState, ChromeTheme, CommandAction, DownloadBadge, DownloadSummary,
-        RailMenuAction, SettingsTab, TabDisplayState, TabInfo, ToastKind, WorkspaceInfo,
-        RAIL_STATUS_BADGE_HEIGHT, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED,
-        RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED,
-        TOOLTIP_WIDTH,
+        active_bookmark_key, advance_command_selection, apply_command_item, bookmark_star_points,
+        clamp_command_selection, command_palette_click_outside, command_palette_items,
+        download_engine_label, download_eta_label, download_rail_badge,
+        download_row_uses_progress_bar, download_state_label, downloads_bubble_anchor,
+        downloads_bubble_size, effective_theme, filter_bookmarks, focus_request_after_render,
+        format_download_bytes, loading_spinner_angle, loading_spinner_point,
+        normalize_bookmark_url, page_tooltip_anchor, palette_row_fill, preferred_surface_format,
+        rail_menu_anchor, rail_menu_click_outside, rail_menu_items, rail_menu_metrics,
+        rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled, rail_tooltip_metrics,
+        resolve_omnibox, resolve_omnibox_with_search, tab_close_center, tab_status_center,
+        truncate_title, workspace_form_actions, BookmarkInfo, ChromePalette, ChromeRenderer,
+        ChromeState, ChromeTheme, CommandAction, DownloadBadge, DownloadSummary, RailMenuAction,
+        SettingsTab, TabDisplayState, TabInfo, ToastKind, WorkspaceInfo, RAIL_STATUS_BADGE_HEIGHT,
+        RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED, RAIL_STATUS_ICON_EXPANDED,
+        TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
     };
     use crate::config::{
         BrowserPreferences, SearchEngine, ThemePreference, WorkspaceColor, WorkspaceIcon,
@@ -6299,6 +6370,7 @@ mod tests {
         assert_eq!(items[5].action, CommandAction::OpenDownloads);
         assert_eq!(items[6].action, CommandAction::SelectTab(1));
         assert_eq!(items[7].action, CommandAction::BookmarkActiveTab);
+        assert_eq!(items[8].action, CommandAction::OpenBookmarkManager);
     }
 
     #[test]
@@ -6333,6 +6405,67 @@ mod tests {
         let toast = state.toast.expect("bookmark confirmation toast");
         assert_eq!(toast.kind, ToastKind::Success);
         assert_eq!(toast.title, "Bookmark saved");
+    }
+
+    #[test]
+    fn active_bookmark_key_matches_only_the_active_workspace_url() {
+        let mut state = ChromeState::default();
+        state.tabs = vec![tab(9, "Docs", "https://docs.example")];
+        state.active_tab_id = Some(9);
+        assert_eq!(active_bookmark_key(&state), None);
+
+        state.bookmarks = vec![bookmark(-1, "Docs", "https://docs.example", "Personal")];
+        assert_eq!(
+            active_bookmark_key(&state),
+            Some((1, "https://docs.example".to_string()))
+        );
+
+        state.bookmarks[0].workspace_id = 2;
+        assert_eq!(active_bookmark_key(&state), None);
+    }
+
+    #[test]
+    fn bookmark_star_outline_is_a_closed_ten_point_path() {
+        let rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(12.0, 12.0));
+        let points = bookmark_star_points(rect);
+        assert_eq!(points.len(), 11);
+        assert_eq!(points.first(), points.last());
+        assert!(points.iter().any(|point| point.y < 1.0));
+        assert!(points.iter().any(|point| (1.0..5.0).contains(&point.y)));
+    }
+
+    #[test]
+    fn command_palette_removes_bookmark_and_confirms() {
+        let mut state = ChromeState::default();
+        state.tabs = vec![tab(9, "Docs", "https://docs.example")];
+        state.active_tab_id = Some(9);
+        state.bookmarks = vec![bookmark(-1, "Docs", "https://docs.example", "Personal")];
+        state.command_palette_open = true;
+        let mut actions = Vec::new();
+
+        apply_command_item(&CommandAction::BookmarkActiveTab, &mut state, &mut actions);
+
+        assert_eq!(
+            actions,
+            vec![UiAction::DeleteBookmark {
+                workspace_id: 1,
+                url: "https://docs.example".to_string(),
+            }]
+        );
+        assert!(!state.command_palette_open);
+        assert_eq!(state.pending_toasts.len(), 1);
+        state.promote_pending_toast();
+        let toast = state.toast.expect("bookmark removal toast");
+        assert_eq!(toast.kind, ToastKind::Success);
+        assert_eq!(toast.title, "Bookmark removed");
+    }
+
+    #[test]
+    fn palette_finds_the_bookmark_manager() {
+        let items = command_palette_items("bookmark", &[], None, &BrowserPreferences::default());
+        assert!(items
+            .iter()
+            .any(|item| item.action == CommandAction::OpenBookmarkManager));
     }
 
     #[test]
