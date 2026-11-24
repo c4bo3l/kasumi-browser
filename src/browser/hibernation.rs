@@ -9,22 +9,31 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use cef::{CefString, ImplBrowser, ImplBrowserHost, ImplFrame};
+use cef::{
+    CefString, ImplBrowser, ImplBrowserHost, ImplDownloadItemCallback, ImplFrame, ImplUrlrequest,
+};
 use crossbeam_channel::{Receiver, Sender};
 use sysinfo::{ProcessesToUpdate, System};
 
 use crate::browser::favicon::create_favicon_download_callback;
+use crate::browser::parallel_download::{
+    self, part_path_for, safe_file_name, DownloadWriter, SegmentRange,
+};
 use crate::browser::{adblocker, client};
 use crate::config::{
-    BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, RAM_CHECK_INTERVAL,
-    RAM_CRITICAL_PRESSURE_THRESHOLD, RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_PRESSURE,
-    TAB_WATCHDOG_TICK_INTERVAL,
+    BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
+    PARALLEL_DOWNLOAD_SEGMENTS, RAM_CHECK_INTERVAL, RAM_CRITICAL_PRESSURE_THRESHOLD,
+    RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_PRESSURE, TAB_WATCHDOG_TICK_INTERVAL,
 };
-use crate::events::{BrowserEvent, BrowserShortcut, UiAction};
+use crate::events::{
+    BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadState,
+    ParallelDownloadEvent, UiAction,
+};
 use crate::storage::db::{BookmarkItem, SessionTabSnapshot, StorageHandle};
 use crate::ui::chrome::{
     BookmarkInfo, ChromeState, Favicon, TabDisplayState, TabInfo, WorkspaceInfo,
@@ -295,6 +304,33 @@ impl std::fmt::Debug for Tab {
     }
 }
 
+struct ParallelSegment {
+    range: SegmentRange,
+    received: i64,
+    complete: bool,
+    request: Option<cef::Urlrequest>,
+}
+
+struct ParallelRuntime {
+    tab_id: u64,
+    /// URL shown in history and used by Retry.
+    display_url: String,
+    /// URL used by CEF URLRequests (may be the post-redirect response URL).
+    request_url: String,
+    final_path: PathBuf,
+    part_path: PathBuf,
+    total_bytes: i64,
+    ranged: bool,
+    /// Incremented whenever a new batch of URLRequests starts. Late callbacks
+    /// from a canceled batch carry the old generation and are discarded.
+    generation: u64,
+    segments: Vec<ParallelSegment>,
+    probe: Option<cef::Urlrequest>,
+    last_bytes: i64,
+    last_speed_at: Instant,
+    started_at: u64,
+}
+
 pub struct TabManager {
     pub tabs: Vec<Tab>,
     pub active_tab_id: Option<u64>,
@@ -304,6 +340,23 @@ pub struct TabManager {
     active_tab_by_workspace: HashMap<u64, u64>,
     /// Globally visible bookmarks, grouped by workspace name in `folder`.
     pub bookmarks: Vec<BookmarkItem>,
+    /// Native download snapshots mirrored from CEF into the downloads bubble.
+    downloads: Vec<DownloadInfo>,
+    /// Set when a genuinely new transfer starts so the shell can reveal the
+    /// native downloads bubble without reopening it for restored history.
+    download_bubble_requested: bool,
+    /// CEF item callbacks retained only on the UI thread for native controls.
+    download_callbacks: HashMap<u32, cef::DownloadItemCallback>,
+    /// CEF ids that Kasumi took over with the native segmented engine. Their
+    /// later CEF updates are discarded so they cannot overwrite native progress.
+    superseded_cef_downloads: HashSet<u32>,
+    /// Live native segmented transfers, keyed by the same id shown in the UI.
+    parallel_downloads: HashMap<u32, ParallelRuntime>,
+    /// Background filesystem actor. CEF and winit callbacks only queue writes.
+    download_writer: DownloadWriter,
+    /// Monotonic token for native request batches. Stale CEF URLRequest callbacks
+    /// are ignored after pause, cancel, retry, or shutdown.
+    next_download_generation: u64,
     next_tab_id: u64,
 
     // Lock-free event channels for CEF callbacks -> UI
@@ -327,6 +380,10 @@ pub struct TabManager {
     // browsers or touching CEF from the UI thread.
     adblock_engine: Arc<adblock::Engine>,
     adblock_enabled: Arc<AtomicBool>,
+
+    // Download preferences shared with CEF handlers. The "ask where to save"
+    // flag is an atomic; the directory is only cloned from a short-lived lock.
+    download_preferences: client::SharedDownloadPreferences,
 
     // User-configurable idle timeout for the normal-pressure watchdog.
     idle_timeout: Duration,
@@ -356,6 +413,9 @@ pub struct TabManager {
     // Set when CEF forwards Cmd/Ctrl+,; consumed by the winit handler.
     settings_requested: bool,
 
+    // Set when CEF forwards Cmd/Ctrl+J; consumed by the winit handler.
+    downloads_requested: bool,
+
     // Favicon URLs already requested, and URLs seen before the browser exists.
     requested_favicons: HashSet<(u64, String)>,
     pending_favicon_urls: HashMap<u64, Vec<String>>,
@@ -365,6 +425,37 @@ pub struct TabManager {
     resolved_favicons: HashSet<u64>,
     last_favicon_urls: HashMap<u64, Vec<String>>,
     favicon_preferences: HashMap<u64, String>,
+}
+
+/// Choose the startup workspace from the persisted preference, then normalize
+/// both flags so later snapshots always carry a single active/default space.
+fn normalize_workspace_selection(
+    workspaces: &mut [Workspace],
+    behavior: WorkspaceStartupBehavior,
+) -> u64 {
+    let default_id = workspaces
+        .iter()
+        .find(|workspace| workspace.is_default)
+        .map_or(Workspace::DEFAULT_ID, |workspace| workspace.id);
+    let last_active_id = workspaces
+        .iter()
+        .find(|workspace| workspace.is_active)
+        .map(|workspace| workspace.id);
+    let active_id = match behavior {
+        WorkspaceStartupBehavior::LastActive => last_active_id
+            .or(Some(default_id))
+            .or_else(|| workspaces.first().map(|workspace| workspace.id))
+            .unwrap_or(Workspace::DEFAULT_ID),
+        WorkspaceStartupBehavior::DefaultWorkspace => Some(default_id)
+            .or(last_active_id)
+            .or_else(|| workspaces.first().map(|workspace| workspace.id))
+            .unwrap_or(Workspace::DEFAULT_ID),
+    };
+    for workspace in workspaces {
+        workspace.is_active = workspace.id == active_id;
+        workspace.is_default = workspace.id == default_id;
+    }
+    active_id
 }
 
 impl TabManager {
@@ -384,24 +475,16 @@ impl TabManager {
         let used = sys.used_memory();
         let adblock_engine = adblocker::create_adblock_engine();
         let adblock_enabled = Arc::new(AtomicBool::new(preferences.adblock_enabled));
+        let download_preferences = client::SharedDownloadPreferences::from_preferences(preferences);
 
         let mut workspaces = workspaces;
         if workspaces.is_empty() {
             workspaces.push(Workspace::default_workspace());
         }
-        let startup_workspace_id = workspaces
-            .iter()
-            .find(|workspace| workspace.is_default)
-            .or_else(|| workspaces.iter().find(|workspace| workspace.is_active))
-            .or_else(|| workspaces.first())
-            .map_or(Workspace::DEFAULT_ID, |workspace| workspace.id);
-        // Persist exactly one default, even if a stale database wrote several.
-        for workspace in &mut workspaces {
-            workspace.is_default = workspace.id == startup_workspace_id;
-        }
-        // The user-chosen default wins on startup. `is_active` remains a
-        // fallback for databases written before default selection existed.
-        let active_workspace_id = startup_workspace_id;
+        // Reopen the last active space by default; the configurable default
+        // workspace is used when the user prefers a fixed landing space.
+        let active_workspace_id =
+            normalize_workspace_selection(&mut workspaces, preferences.workspace_startup);
 
         Self {
             tabs: Vec::new(),
@@ -410,6 +493,13 @@ impl TabManager {
             active_workspace_id,
             active_tab_by_workspace: HashMap::new(),
             bookmarks,
+            downloads: Vec::new(),
+            download_bubble_requested: false,
+            download_callbacks: HashMap::new(),
+            superseded_cef_downloads: HashSet::new(),
+            parallel_downloads: HashMap::new(),
+            download_writer: DownloadWriter::new(),
+            next_download_generation: 1,
             next_tab_id: 1,
             event_sender,
             event_receiver,
@@ -423,6 +513,7 @@ impl TabManager {
             ram_process_mb: 0,
             adblock_engine,
             adblock_enabled,
+            download_preferences,
             idle_timeout: preferences.idle_timeout(),
             home_url: preferences.home_url().to_string(),
             storage,
@@ -432,6 +523,7 @@ impl TabManager {
             pending_navigation_checks: HashMap::new(),
             command_palette_requested: false,
             settings_requested: false,
+            downloads_requested: false,
             requested_favicons: HashSet::new(),
             pending_favicon_urls: HashMap::new(),
             resolved_favicons: HashSet::new(),
@@ -446,8 +538,773 @@ impl TabManager {
         let preferences = preferences.clone().normalized();
         self.adblock_enabled
             .store(preferences.adblock_enabled, Ordering::Release);
+        self.download_preferences.apply(&preferences);
         self.idle_timeout = preferences.idle_timeout();
         self.home_url = preferences.home_url().to_string();
+    }
+
+    /// Replace startup metadata from SQLite. Active CEF callbacks never survive
+    /// a restart, so restored entries are history only until retried.
+    pub fn seed_downloads(&mut self, mut downloads: Vec<DownloadInfo>) {
+        for download in &mut downloads {
+            if !download.is_finished() {
+                download.state = DownloadState::Interrupted;
+                download.current_speed = 0;
+            }
+        }
+        downloads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
+        self.downloads = downloads;
+    }
+
+    /// Copy a download snapshot for shell actions that must not borrow
+    /// `TabManager` across a filesystem or navigation call.
+    pub fn download_snapshot(&self, download_id: u32) -> Option<DownloadInfo> {
+        self.downloads
+            .iter()
+            .find(|download| download.id == download_id)
+            .cloned()
+    }
+
+    fn record_download(&mut self, info: DownloadInfo, callback: Option<cef::DownloadItemCallback>) {
+        // After the native engine takes over, CEF may deliver one canceled
+        // update from the copy we just stopped. It must not be persisted.
+        if info.engine == DownloadEngine::Cef && self.superseded_cef_downloads.contains(&info.id) {
+            return;
+        }
+
+        let is_new = !self.downloads.iter().any(|download| download.id == info.id);
+        if let Some(existing) = self
+            .downloads
+            .iter_mut()
+            .find(|download| download.id == info.id)
+        {
+            *existing = info.clone();
+        } else {
+            self.downloads.push(info.clone());
+        }
+        self.downloads
+            .sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
+
+        if is_new
+            && matches!(
+                info.state,
+                DownloadState::InProgress | DownloadState::Paused
+            )
+        {
+            self.download_bubble_requested = true;
+        }
+
+        if let Some(callback) = callback {
+            if info.is_finished() {
+                self.download_callbacks.remove(&info.id);
+            } else {
+                self.download_callbacks.insert(info.id, callback);
+            }
+        } else if info.is_finished() {
+            self.download_callbacks.remove(&info.id);
+        }
+
+        if let Some(ref storage) = self.storage {
+            storage.save_download(info);
+        }
+    }
+
+    fn set_download_state(&mut self, download_id: u32, state: DownloadState) {
+        let Some(info) = self
+            .downloads
+            .iter_mut()
+            .find(|download| download.id == download_id)
+        else {
+            return;
+        };
+        info.state = state;
+        if state != DownloadState::InProgress {
+            info.current_speed = 0;
+        }
+        info.updated_at = Self::now_unix_secs();
+        let info = info.clone();
+        if let Some(ref storage) = self.storage {
+            storage.save_download(info);
+        }
+    }
+
+    fn now_unix_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default()
+    }
+
+    fn request_context_for_tab(&self, tab_id: u64) -> Option<cef::RequestContext> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.browser.as_ref())
+            .and_then(|browser| browser.host())
+            .and_then(|host| host.request_context())
+    }
+
+    fn unique_download_path(directory: &Path, suggested_name: &str) -> PathBuf {
+        let name = safe_file_name(suggested_name);
+        let candidate = directory.join(&name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        let stem = Path::new(&name)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("download");
+        let extension = Path::new(&name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        for suffix in 1..10_000 {
+            let file_name = if extension.is_empty() {
+                format!("{stem}-{suffix}")
+            } else {
+                format!("{stem}-{suffix}.{extension}")
+            };
+            let candidate = directory.join(file_name);
+            if !candidate.exists() {
+                return candidate;
+            }
+        }
+        directory.join(format!("{name}-{}", Self::now_unix_secs()))
+    }
+
+    fn resolve_download_path(&self, info: &DownloadInfo) -> PathBuf {
+        // A path chosen in CEF's native "Save As" dialog must be preserved.
+        // Otherwise always save into the configured/default Downloads folder
+        // rather than CEF's temp location, which can disappear mid-transfer.
+        if self.download_preferences.ask_where_to_save() && !info.full_path.trim().is_empty() {
+            return PathBuf::from(&info.full_path);
+        }
+        let configured = self.download_preferences.download_directory();
+        let directory = if configured.trim().is_empty() {
+            crate::config::default_download_directory()
+        } else {
+            PathBuf::from(&configured)
+        };
+        Self::unique_download_path(&directory, &info.suggested_name)
+    }
+
+    fn cancel_native_requests(&mut self, download_id: u32) {
+        if let Some(runtime) = self.parallel_downloads.get_mut(&download_id) {
+            if let Some(probe) = runtime.probe.take() {
+                probe.cancel();
+            }
+            for segment in &mut runtime.segments {
+                if let Some(request) = segment.request.take() {
+                    request.cancel();
+                }
+            }
+        }
+    }
+
+    /// Start a fresh native transfer. CEF has already resolved the destination
+    /// path; the actual bytes are fetched through parallel CEF URLRequests.
+    fn start_native_download(&mut self, mut info: DownloadInfo) {
+        let final_path = self.resolve_download_path(&info);
+        let part_path = part_path_for(&final_path);
+        self.cancel_native_requests(info.id);
+        self.download_writer.cancel(info.id);
+
+        info.engine = DownloadEngine::Parallel;
+        info.full_path = final_path.to_string_lossy().to_string();
+        info.temp_path = part_path.to_string_lossy().to_string();
+        info.state = DownloadState::InProgress;
+        info.received_bytes = 0;
+        info.total_bytes = 0;
+        info.percent_complete = 0;
+        info.current_speed = 0;
+        info.segments = 0;
+        info.updated_at = Self::now_unix_secs();
+
+        let generation = self.next_download_generation;
+        self.next_download_generation = self.next_download_generation.wrapping_add(1);
+        let display_url = info.url.clone();
+        let runtime = ParallelRuntime {
+            tab_id: info.tab_id,
+            request_url: display_url.clone(),
+            display_url,
+            final_path,
+            part_path,
+            total_bytes: 0,
+            ranged: false,
+            generation,
+            segments: Vec::new(),
+            probe: None,
+            last_bytes: 0,
+            last_speed_at: Instant::now(),
+            started_at: info.started_at,
+        };
+        self.parallel_downloads.insert(info.id, runtime);
+        self.superseded_cef_downloads.insert(info.id);
+
+        let context = self.request_context_for_tab(info.tab_id);
+        let probe = parallel_download::start_probe(
+            &self.event_sender,
+            info.id,
+            generation,
+            &info.url,
+            context,
+        );
+        if let Some(runtime) = self.parallel_downloads.get_mut(&info.id) {
+            runtime.probe = probe.clone();
+        }
+        self.record_download(info.clone(), None);
+        if probe.is_none() {
+            tracing::warn!(
+                "HEAD probe unavailable for download {}; using one GET",
+                info.id
+            );
+            self.begin_single_segment(info.id, 0, false);
+        }
+    }
+
+    fn begin_single_segment(&mut self, download_id: u32, total_bytes: i64, ranged: bool) {
+        let paths = self.parallel_downloads.get(&download_id).map(|runtime| {
+            (
+                runtime.part_path.clone(),
+                runtime.final_path.clone(),
+                runtime.request_url.clone(),
+                runtime.ranged,
+            )
+        });
+        let Some((part_path, final_path, _, _)) = paths else {
+            return;
+        };
+        self.download_writer
+            .start(download_id, part_path, final_path, total_bytes, true);
+        let range = if total_bytes > 0 {
+            SegmentRange {
+                start: 0,
+                end: total_bytes - 1,
+            }
+        } else {
+            SegmentRange { start: 0, end: -1 }
+        };
+        self.start_segment_requests(download_id, vec![range], ranged);
+    }
+
+    /// Some servers advertise `Accept-Ranges: bytes` but answer every range
+    /// request with the full body. Restart that transfer as one plain GET so
+    /// overlapping bytes can never corrupt the output file.
+    fn restart_single_non_ranged(&mut self, download_id: u32) {
+        let total_bytes = self
+            .parallel_downloads
+            .get(&download_id)
+            .map(|runtime| runtime.total_bytes)
+            .unwrap_or(0);
+        self.cancel_native_requests(download_id);
+        self.download_writer.cancel(download_id);
+
+        let generation = self.next_download_generation;
+        self.next_download_generation = self.next_download_generation.wrapping_add(1);
+        if let Some(runtime) = self.parallel_downloads.get_mut(&download_id) {
+            runtime.generation = generation;
+            runtime.ranged = false;
+            runtime.segments.clear();
+        }
+        if let Some(info) = self
+            .downloads
+            .iter_mut()
+            .find(|item| item.id == download_id)
+        {
+            info.segments = 1;
+            info.total_bytes = total_bytes;
+            info.received_bytes = 0;
+            info.percent_complete = 0;
+            info.state = DownloadState::InProgress;
+            info.updated_at = Self::now_unix_secs();
+            let snapshot = info.clone();
+            if let Some(ref storage) = self.storage {
+                storage.save_download(snapshot);
+            }
+        }
+        self.begin_single_segment(download_id, total_bytes, false);
+    }
+
+    fn start_segment_requests(
+        &mut self,
+        download_id: u32,
+        ranges: Vec<SegmentRange>,
+        ranged: bool,
+    ) {
+        let tab_id = self
+            .parallel_downloads
+            .get(&download_id)
+            .map(|runtime| runtime.tab_id);
+        let context = tab_id.and_then(|tab_id| self.request_context_for_tab(tab_id));
+        let Some(runtime) = self.parallel_downloads.get_mut(&download_id) else {
+            return;
+        };
+
+        // The probe and its segments are one batch. Resume creates a new batch
+        // with a fresh generation before calling this again.
+        let generation = runtime.generation;
+        runtime.ranged = ranged;
+        runtime.total_bytes = ranges
+            .last()
+            .map(|range| (range.end + 1).max(0))
+            .unwrap_or(runtime.total_bytes);
+        runtime.segments = ranges
+            .iter()
+            .map(|range| ParallelSegment {
+                range: *range,
+                received: 0,
+                complete: false,
+                request: None,
+            })
+            .collect();
+        let url = runtime.request_url.clone();
+
+        for (index, range) in ranges.iter().enumerate() {
+            let request = parallel_download::start_segment(
+                &self.event_sender,
+                download_id,
+                generation,
+                &url,
+                *range,
+                index as u8,
+                context.clone(),
+                ranged,
+            );
+            runtime.segments[index].request = request;
+        }
+
+        if let Some(info) = self
+            .downloads
+            .iter_mut()
+            .find(|item| item.id == download_id)
+        {
+            info.segments = ranges.len().min(u8::MAX as usize) as u8;
+            info.total_bytes = runtime.total_bytes;
+            info.updated_at = Self::now_unix_secs();
+            let snapshot = info.clone();
+            if let Some(ref storage) = self.storage {
+                storage.save_download(snapshot);
+            }
+        }
+    }
+
+    /// Resume incomplete segments from their last flushed byte. Servers without
+    /// Range support restart the whole file rather than corrupting the output.
+    fn resume_segment_requests(&mut self, download_id: u32) {
+        let (tab_id, url, ranged, ranges, restart_from_scratch) = {
+            let Some(runtime) = self.parallel_downloads.get(&download_id) else {
+                return;
+            };
+            // Pausing before the HEAD probe returned leaves no segments to
+            // resume; restart cleanly instead of stranding the download.
+            let restart_from_scratch = runtime.segments.is_empty()
+                || (!runtime.ranged && runtime.segments.iter().any(|segment| segment.received > 0));
+            let ranges: Vec<(u8, SegmentRange)> = runtime
+                .segments
+                .iter()
+                .enumerate()
+                .filter(|(_, segment)| !segment.complete)
+                .map(|(index, segment)| {
+                    (
+                        index as u8,
+                        SegmentRange {
+                            start: segment.range.start + segment.received,
+                            end: segment.range.end,
+                        },
+                    )
+                })
+                .collect();
+            (
+                runtime.tab_id,
+                runtime.request_url.clone(),
+                runtime.ranged,
+                ranges,
+                restart_from_scratch,
+            )
+        };
+        if restart_from_scratch {
+            if let Some(info) = self.download_snapshot(download_id) {
+                self.start_native_download(info);
+            }
+            return;
+        }
+
+        let context = self.request_context_for_tab(tab_id);
+
+        let generation = self.next_download_generation;
+        self.next_download_generation = self.next_download_generation.wrapping_add(1);
+        let Some(runtime) = self.parallel_downloads.get_mut(&download_id) else {
+            return;
+        };
+        runtime.generation = generation;
+        for (index, range) in ranges {
+            if range.start > range.end && range.end >= 0 {
+                if let Some(segment) = runtime.segments.get_mut(index as usize) {
+                    segment.complete = true;
+                }
+                continue;
+            }
+            let request = parallel_download::start_segment(
+                &self.event_sender,
+                download_id,
+                generation,
+                &url,
+                range,
+                index,
+                context.clone(),
+                ranged,
+            );
+            if let Some(segment) = runtime.segments.get_mut(index as usize) {
+                segment.request = request;
+            }
+        }
+    }
+
+    /// CEF chooses the destination under `callback.cont`. Once the path is
+    /// known, cancel that copy and replace it with native segmented requests.
+    fn takeover_cef_download(
+        &mut self,
+        info: DownloadInfo,
+        callback: Option<cef::DownloadItemCallback>,
+    ) {
+        if !parallel_download::is_segmentable_url(&info.url) {
+            return;
+        }
+        self.superseded_cef_downloads.insert(info.id);
+        if let Some(callback) = callback {
+            callback.cancel();
+        }
+        self.download_callbacks.remove(&info.id);
+        self.start_native_download(info);
+    }
+
+    fn handle_parallel_event(&mut self, event: ParallelDownloadEvent) {
+        let download_id = match &event {
+            ParallelDownloadEvent::ProbeResult { download_id, .. }
+            | ParallelDownloadEvent::SegmentData { download_id, .. }
+            | ParallelDownloadEvent::SegmentComplete { download_id, .. }
+            | ParallelDownloadEvent::SegmentFailed { download_id, .. } => *download_id,
+        };
+        let is_active = self
+            .downloads
+            .iter()
+            .find(|download| download.id == download_id)
+            .map(|download| download.state == DownloadState::InProgress)
+            .unwrap_or(false);
+        if !is_active {
+            return;
+        }
+
+        match event {
+            ParallelDownloadEvent::ProbeResult {
+                download_id,
+                generation,
+                status,
+                supports_ranges,
+                total_bytes,
+                final_url,
+            } => {
+                let plan = {
+                    let Some(runtime) = self.parallel_downloads.get_mut(&download_id) else {
+                        return;
+                    };
+                    if runtime.generation != generation {
+                        return;
+                    }
+                    runtime.probe = None;
+                    if !final_url.is_empty() {
+                        runtime.request_url = final_url;
+                    }
+                    runtime.total_bytes = total_bytes.max(0);
+
+                    if !(200..300).contains(&status) {
+                        // Many servers reject HEAD. Fall back to one plain GET;
+                        // this still goes through the native writer and controls.
+                        tracing::warn!(
+                            "HEAD probe returned {status} for download {download_id}; using one GET"
+                        );
+                        Some((vec![SegmentRange { start: 0, end: -1 }], false))
+                    } else if parallel_download::should_parallelize(
+                        status,
+                        supports_ranges,
+                        total_bytes,
+                    ) {
+                        Some((
+                            parallel_download::plan_segments(
+                                total_bytes,
+                                PARALLEL_DOWNLOAD_SEGMENTS,
+                            ),
+                            true,
+                        ))
+                    } else if total_bytes > 0 {
+                        Some((
+                            vec![SegmentRange {
+                                start: 0,
+                                end: total_bytes - 1,
+                            }],
+                            supports_ranges,
+                        ))
+                    } else {
+                        Some((vec![SegmentRange { start: 0, end: -1 }], false))
+                    }
+                };
+                let Some((ranges, ranged)) = plan else {
+                    tracing::warn!("Download probe failed for {download_id} (status {status})");
+                    self.fail_native_download(download_id);
+                    return;
+                };
+                let paths = self
+                    .parallel_downloads
+                    .get(&download_id)
+                    .map(|runtime| (runtime.part_path.clone(), runtime.final_path.clone()));
+                let Some((part_path, final_path)) = paths else {
+                    return;
+                };
+                self.download_writer.start(
+                    download_id,
+                    part_path,
+                    final_path,
+                    total_bytes.max(0),
+                    true,
+                );
+                self.start_segment_requests(download_id, ranges, ranged);
+            }
+            ParallelDownloadEvent::SegmentData {
+                download_id,
+                generation,
+                segment_index,
+                offset,
+                bytes,
+            } => {
+                let Some(runtime) = self.parallel_downloads.get_mut(&download_id) else {
+                    return;
+                };
+                if runtime.generation != generation {
+                    return;
+                }
+                let Some(segment) = runtime.segments.get_mut(segment_index as usize) else {
+                    return;
+                };
+                let allowed = if segment.range.end >= 0 {
+                    (segment.range.end + 1 - offset)
+                        .max(0)
+                        .min(bytes.len() as i64) as usize
+                } else {
+                    bytes.len()
+                };
+                if allowed == 0 {
+                    return;
+                }
+                segment.received += allowed as i64;
+                let chunk: Arc<[u8]> = bytes[..allowed].to_vec().into();
+                self.download_writer.write(download_id, offset, chunk);
+            }
+            ParallelDownloadEvent::SegmentComplete {
+                download_id,
+                generation,
+                segment_index,
+                received,
+                success,
+            } => {
+                let all_complete = {
+                    let Some(runtime) = self.parallel_downloads.get_mut(&download_id) else {
+                        return;
+                    };
+                    if runtime.generation != generation {
+                        return;
+                    }
+                    let Some(segment) = runtime.segments.get_mut(segment_index as usize) else {
+                        return;
+                    };
+                    segment.received = segment.received.max(received);
+                    segment.complete = success;
+                    segment.request = None;
+                    runtime.segments.iter().all(|segment| segment.complete)
+                };
+                let can_fallback = self
+                    .parallel_downloads
+                    .get(&download_id)
+                    .map(|runtime| runtime.ranged && runtime.segments.len() > 1)
+                    .unwrap_or(false);
+                if !success && can_fallback {
+                    tracing::warn!(
+                        "Server ignored Range for download {download_id}; restarting as one GET"
+                    );
+                    self.restart_single_non_ranged(download_id);
+                } else if !success {
+                    self.fail_native_download(download_id);
+                } else if all_complete {
+                    self.finish_native_download(download_id);
+                } else {
+                    self.sync_native_download_info(download_id, true);
+                }
+            }
+            ParallelDownloadEvent::SegmentFailed {
+                download_id,
+                generation,
+                ..
+            } => {
+                let stale = self
+                    .parallel_downloads
+                    .get(&download_id)
+                    .map(|runtime| runtime.generation != generation)
+                    .unwrap_or(true);
+                if !stale {
+                    self.fail_native_download(download_id);
+                }
+            }
+        }
+    }
+
+    fn sync_native_download_info(&mut self, download_id: u32, persist: bool) {
+        let runtime = self.parallel_downloads.get(&download_id);
+        let Some(info) = self
+            .downloads
+            .iter_mut()
+            .find(|item| item.id == download_id)
+        else {
+            return;
+        };
+        let Some(runtime) = runtime else {
+            return;
+        };
+        let received = runtime
+            .segments
+            .iter()
+            .map(|segment| segment.received)
+            .sum::<i64>();
+        let total = if runtime.total_bytes > 0 {
+            runtime.total_bytes
+        } else {
+            received
+        };
+        info.received_bytes = received;
+        info.total_bytes = total;
+        info.segments = runtime.segments.len().min(u8::MAX as usize) as u8;
+        info.percent_complete = if total > 0 {
+            ((received.saturating_mul(100)) / total).clamp(0, 100) as i32
+        } else {
+            0
+        };
+        info.updated_at = Self::now_unix_secs();
+        let snapshot = info.clone();
+        if persist {
+            if let Some(ref storage) = self.storage {
+                storage.save_download(snapshot);
+            }
+        }
+    }
+
+    fn tick_native_downloads(&mut self, now: Instant) {
+        let ids: Vec<u32> = self.parallel_downloads.keys().copied().collect();
+        for download_id in ids {
+            let received = self.parallel_downloads.get(&download_id).map(|runtime| {
+                runtime
+                    .segments
+                    .iter()
+                    .map(|segment| segment.received)
+                    .sum::<i64>()
+            });
+            let Some(received) = received else {
+                continue;
+            };
+            let (speed, last_bytes, last_speed_at) = {
+                let Some(runtime) = self.parallel_downloads.get_mut(&download_id) else {
+                    continue;
+                };
+                let elapsed = runtime.last_speed_at.elapsed().as_secs_f64();
+                if elapsed <= 0.0 {
+                    continue;
+                }
+                let speed = ((received - runtime.last_bytes).max(0) as f64 / elapsed) as i64;
+                (speed, received, now)
+            };
+            if let Some(runtime) = self.parallel_downloads.get_mut(&download_id) {
+                runtime.last_bytes = last_bytes;
+                runtime.last_speed_at = last_speed_at;
+            }
+            self.sync_native_download_info(download_id, false);
+            if let Some(info) = self
+                .downloads
+                .iter_mut()
+                .find(|item| item.id == download_id)
+            {
+                info.current_speed = speed;
+                let snapshot = info.clone();
+                if let Some(ref storage) = self.storage {
+                    storage.save_download(snapshot);
+                }
+            }
+        }
+    }
+
+    fn pause_native_download(&mut self, download_id: u32) {
+        self.cancel_native_requests(download_id);
+        self.download_writer.flush(download_id);
+        self.sync_native_download_info(download_id, true);
+        self.set_download_state(download_id, DownloadState::Paused);
+    }
+
+    fn resume_native_download(&mut self, download_id: u32) {
+        if self.parallel_downloads.contains_key(&download_id) {
+            self.resume_segment_requests(download_id);
+            self.set_download_state(download_id, DownloadState::InProgress);
+        }
+    }
+
+    fn fail_native_download(&mut self, download_id: u32) {
+        self.cancel_native_requests(download_id);
+        self.download_writer.flush(download_id);
+        self.sync_native_download_info(download_id, true);
+        self.set_download_state(download_id, DownloadState::Interrupted);
+    }
+
+    fn finish_native_download(&mut self, download_id: u32) {
+        let total = self
+            .parallel_downloads
+            .remove(&download_id)
+            .map(|runtime| runtime.total_bytes)
+            .unwrap_or(0);
+        self.cancel_native_requests(download_id);
+        self.download_writer.flush(download_id);
+        self.download_writer.finish(download_id);
+        if let Some(info) = self
+            .downloads
+            .iter_mut()
+            .find(|item| item.id == download_id)
+        {
+            info.state = DownloadState::Completed;
+            info.received_bytes = if total > 0 {
+                total
+            } else {
+                info.received_bytes
+            };
+            info.total_bytes = if total > 0 { total } else { info.total_bytes };
+            info.percent_complete = 100;
+            info.current_speed = 0;
+            info.updated_at = Self::now_unix_secs();
+            let snapshot = info.clone();
+            if let Some(ref storage) = self.storage {
+                storage.save_download(snapshot);
+            }
+        }
+    }
+
+    fn cancel_native_download(&mut self, download_id: u32) {
+        self.cancel_native_requests(download_id);
+        self.download_writer.cancel(download_id);
+        self.parallel_downloads.remove(&download_id);
+        self.set_download_state(download_id, DownloadState::Canceled);
+    }
+
+    /// Cancel live transfers and let the writer flush queued bytes before exit.
+    pub fn shutdown_downloads(&mut self) {
+        let ids: Vec<u32> = self.parallel_downloads.keys().copied().collect();
+        for download_id in ids {
+            self.cancel_native_requests(download_id);
+            self.download_writer.flush(download_id);
+        }
+        self.download_writer.shutdown();
     }
 
     /// Restore previous session tabs (instant startup: only the active tab of
@@ -1295,6 +2152,7 @@ impl TabManager {
             self.event_sender.clone(),
             self.adblock_engine.clone(),
             Arc::clone(&self.adblock_enabled),
+            self.download_preferences.clone(),
         );
         let bounds = cef::Rect {
             x: self.content_rect.x as i32,
@@ -1467,8 +2325,53 @@ impl TabManager {
         std::mem::take(&mut self.settings_requested)
     }
 
+    /// Consume a Cmd/Ctrl+J request forwarded from the CEF web view.
+    pub fn consume_downloads_request(&mut self) -> bool {
+        std::mem::take(&mut self.downloads_requested)
+    }
+
+    /// Consume a request to reveal the downloads bubble after a new transfer.
+    pub fn consume_download_bubble_request(&mut self) -> bool {
+        std::mem::take(&mut self.download_bubble_requested)
+    }
+
     fn handle_browser_event(&mut self, event: BrowserEvent) {
         match event {
+            BrowserEvent::DownloadStarted(info) => self.record_download(info, None),
+            BrowserEvent::DownloadUpdated { mut info, callback } => {
+                // CEF's first update can omit the suggested filename even when
+                // `on_before_download` supplied a good one. Keep that name so
+                // the native segmented writer never falls back to "download".
+                if info.suggested_name.trim().is_empty() {
+                    if let Some(existing) = self
+                        .downloads
+                        .iter()
+                        .find(|download| download.id == info.id)
+                    {
+                        if !existing.suggested_name.trim().is_empty() {
+                            info.suggested_name = existing.suggested_name.clone();
+                        }
+                    }
+                }
+                let should_take_over = info.engine == DownloadEngine::Cef
+                    && !self.superseded_cef_downloads.contains(&info.id)
+                    && !info.full_path.trim().is_empty()
+                    && !info.url.trim().is_empty()
+                    && parallel_download::is_segmentable_url(&info.url)
+                    && matches!(
+                        info.state,
+                        DownloadState::InProgress | DownloadState::Paused
+                    );
+                self.record_download(info.clone(), callback.clone());
+                if should_take_over {
+                    tracing::info!(
+                        "Taking over CEF download {} with native segmented engine",
+                        info.id
+                    );
+                    self.takeover_cef_download(info, callback);
+                }
+            }
+            BrowserEvent::ParallelDownload(event) => self.handle_parallel_event(event),
             BrowserEvent::BrowserCreated { tab_id, browser } => {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.browser = Some(browser);
@@ -1599,6 +2502,11 @@ impl TabManager {
                 }
                 BrowserShortcut::OpenSettings => {
                     self.settings_requested = true;
+                }
+                BrowserShortcut::OpenDownloads => {
+                    // The shell owns the shared overlay and downloads bubble.
+                    // This flag makes all shortcut sources converge on one path.
+                    self.downloads_requested = true;
                 }
                 BrowserShortcut::Quit => {
                     // The shell exits the event loop from its own shortcut
@@ -1839,6 +2747,84 @@ impl TabManager {
             UiAction::OpenDevTools { tab_id } => {
                 self.show_dev_tools(tab_id);
             }
+            UiAction::OpenDownloads => {
+                // The shell opens the native downloads bubble; TabManager only
+                // owns the download runtime state.
+            }
+            UiAction::PauseDownload { download_id } => {
+                if self.parallel_downloads.contains_key(&download_id) {
+                    self.pause_native_download(download_id);
+                } else {
+                    if let Some(callback) = self.download_callbacks.get(&download_id) {
+                        callback.pause();
+                    }
+                    self.set_download_state(download_id, DownloadState::Paused);
+                }
+            }
+            UiAction::ResumeDownload { download_id } => {
+                if self.parallel_downloads.contains_key(&download_id) {
+                    self.resume_native_download(download_id);
+                } else {
+                    if let Some(callback) = self.download_callbacks.get(&download_id) {
+                        callback.resume();
+                    }
+                    self.set_download_state(download_id, DownloadState::InProgress);
+                }
+            }
+            UiAction::CancelDownload { download_id } => {
+                if self.parallel_downloads.contains_key(&download_id) {
+                    self.cancel_native_download(download_id);
+                } else {
+                    if let Some(callback) = self.download_callbacks.get(&download_id) {
+                        callback.cancel();
+                    }
+                    self.download_callbacks.remove(&download_id);
+                    self.set_download_state(download_id, DownloadState::Canceled);
+                }
+            }
+            UiAction::RemoveDownload { download_id } => {
+                self.cancel_native_requests(download_id);
+                self.download_writer.cancel(download_id);
+                self.parallel_downloads.remove(&download_id);
+                self.download_callbacks.remove(&download_id);
+                // Keep the superseded id for the whole session: a late CEF
+                // cancellation callback must not resurrect a removed download.
+                self.downloads.retain(|download| download.id != download_id);
+                if let Some(ref storage) = self.storage {
+                    storage.remove_download(download_id);
+                }
+            }
+            UiAction::ClearCompletedDownloads => {
+                let finished: Vec<u32> = self
+                    .downloads
+                    .iter()
+                    .filter(|download| download.is_finished())
+                    .map(|download| download.id)
+                    .collect();
+                for id in finished {
+                    self.cancel_native_requests(id);
+                    self.download_writer.cancel(id);
+                    self.parallel_downloads.remove(&id);
+                    self.download_callbacks.remove(&id);
+                }
+                self.downloads.retain(|download| !download.is_finished());
+                if let Some(ref storage) = self.storage {
+                    storage.clear_completed_downloads();
+                }
+            }
+            UiAction::RetryDownload { download_id } => {
+                if let Some(info) = self.download_snapshot(download_id) {
+                    if info.engine == DownloadEngine::Parallel {
+                        self.start_native_download(info);
+                    } else {
+                        self.create_tab(Some(info.url), true);
+                    }
+                }
+            }
+            UiAction::OpenDownloadFile { .. } | UiAction::RevealDownload { .. } => {
+                // Handled by the shell, which can launch the OS file manager
+                // without blocking CEF callback threads.
+            }
             UiAction::SwitchWorkspace { workspace_id } => {
                 self.switch_workspace(workspace_id);
             }
@@ -1868,6 +2854,9 @@ impl TabManager {
             UiAction::ApplyPreferences(preferences) => {
                 self.apply_preferences(&preferences);
             }
+            // The winit handler persists the live rail toggle; tab state needs
+            // no change for a chrome width update.
+            UiAction::SetRailExpanded(_) => {}
         }
     }
 
@@ -1878,6 +2867,31 @@ impl TabManager {
         // Create browsers only from `about_to_wait`, never from a window event.
         self.drain_browser_spawns();
         self.retry_blank_initial_navigations(now);
+
+        // A part file can vanish before the writer renames it (for example if
+        // a temp directory is cleaned mid-transfer). Never leave the row marked
+        // Completed in that case.
+        for (download_id, ok) in self.download_writer.take_finalized() {
+            if !ok {
+                tracing::error!(
+                    "Native download {download_id} could not be finalized; marking interrupted"
+                );
+                if let Some(info) = self
+                    .downloads
+                    .iter_mut()
+                    .find(|item| item.id == download_id)
+                {
+                    if info.state == DownloadState::Completed {
+                        info.state = DownloadState::Interrupted;
+                        info.current_speed = 0;
+                        info.updated_at = Self::now_unix_secs();
+                        if let Some(ref storage) = self.storage {
+                            storage.save_download(info.clone());
+                        }
+                    }
+                }
+            }
+        }
 
         // 1. Refresh RAM every RAM_CHECK_INTERVAL (5s)
         if now.duration_since(self.last_ram_check) >= RAM_CHECK_INTERVAL {
@@ -1901,6 +2915,10 @@ impl TabManager {
             return;
         }
         self.last_tick = now;
+
+        // Native transfer speeds are sampled once per watchdog tick and then
+        // mirrored into the downloads bubble by `update_chrome_state`.
+        self.tick_native_downloads(now);
 
         let ram_ratio = ram_pressure(self.ram_used_bytes, self.ram_total_bytes);
 
@@ -1979,6 +2997,7 @@ impl TabManager {
             })
             .collect();
         state.active_workspace_id = self.active_workspace_id;
+        state.downloads = self.downloads.clone();
         state.bookmarks = self
             .bookmarks
             .iter()
@@ -2026,13 +3045,13 @@ mod tests {
     use super::{
         closed_tab_from, fallback_favicon_url, idle_timeout_for_pressure, insertion_index,
         is_blank_navigation_url, is_critical_pressure, needs_initial_navigation,
-        next_navigation_retry_delay, pinned_insert_index, preferred_favicon_url, ram_pressure,
-        restore_insert_index, should_hibernate_tab, should_sync_omnibox, BrowserSpawnMode, Tab,
-        TabManager, TabState,
+        next_navigation_retry_delay, normalize_workspace_selection, pinned_insert_index,
+        preferred_favicon_url, ram_pressure, restore_insert_index, should_hibernate_tab,
+        should_sync_omnibox, BrowserSpawnMode, Tab, TabManager, TabState,
     };
     use crate::config::{
-        BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, TAB_IDLE_TIMEOUT_NORMAL,
-        TAB_IDLE_TIMEOUT_PRESSURE,
+        BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
+        TAB_IDLE_TIMEOUT_NORMAL, TAB_IDLE_TIMEOUT_PRESSURE,
     };
     use crate::storage::db::SessionTabSnapshot;
     use crate::ui::platform_view::ContentRect;
@@ -2538,7 +3557,69 @@ mod tests {
     }
 
     #[test]
-    fn default_workspace_controls_startup_and_can_change() {
+    fn workspace_selection_prefers_last_active_over_default() {
+        let mut workspaces = vec![
+            Workspace {
+                id: 1,
+                name: "Personal".to_string(),
+                icon: WorkspaceIcon::Work,
+                color: WorkspaceColor::Blue,
+                is_default: true,
+                is_active: false,
+            },
+            Workspace {
+                id: 2,
+                name: "Studio".to_string(),
+                icon: WorkspaceIcon::Palette,
+                color: WorkspaceColor::Purple,
+                is_default: false,
+                is_active: true,
+            },
+        ];
+        assert_eq!(
+            normalize_workspace_selection(&mut workspaces, WorkspaceStartupBehavior::LastActive),
+            2
+        );
+        assert!(!workspaces[0].is_active);
+        assert!(workspaces[1].is_active);
+        assert!(workspaces[0].is_default);
+        assert!(!workspaces[1].is_default);
+    }
+
+    #[test]
+    fn workspace_selection_can_prefer_the_default_space() {
+        let mut workspaces = vec![
+            Workspace {
+                id: 1,
+                name: "Personal".to_string(),
+                icon: WorkspaceIcon::Work,
+                color: WorkspaceColor::Blue,
+                is_default: true,
+                is_active: false,
+            },
+            Workspace {
+                id: 2,
+                name: "Studio".to_string(),
+                icon: WorkspaceIcon::Palette,
+                color: WorkspaceColor::Purple,
+                is_default: false,
+                is_active: true,
+            },
+        ];
+        assert_eq!(
+            normalize_workspace_selection(
+                &mut workspaces,
+                WorkspaceStartupBehavior::DefaultWorkspace
+            ),
+            1
+        );
+        assert!(workspaces[0].is_active);
+        assert!(!workspaces[1].is_active);
+        assert!(workspaces[0].is_default);
+    }
+
+    #[test]
+    fn last_active_workspace_restores_and_default_stays_separate() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut manager = TabManager::new(
             tx,
@@ -2554,7 +3635,10 @@ mod tests {
             None,
             &BrowserPreferences::default(),
             vec![
-                Workspace::default_workspace(),
+                Workspace {
+                    is_active: false,
+                    ..Workspace::default_workspace()
+                },
                 Workspace {
                     id: 2,
                     name: "Studio".to_string(),
@@ -2567,17 +3651,21 @@ mod tests {
             vec![],
         );
 
-        // The persisted default, not the last active workspace, opens at startup.
-        assert_eq!(manager.active_workspace_id, 1);
+        // The workspace open at shutdown, not the default, opens at startup.
+        assert_eq!(manager.active_workspace_id, 2);
+        assert!(manager.workspaces[0].is_default);
+        assert!(!manager.workspaces[1].is_default);
 
         manager.set_default_workspace(2);
         assert!(!manager.workspaces[0].is_default);
         assert!(manager.workspaces[1].is_default);
-        assert_eq!(manager.active_workspace_id, 1);
+        assert_eq!(manager.active_workspace_id, 2);
 
         let snapshots = manager.workspace_snapshots();
         assert!(!snapshots[0].is_default);
         assert!(snapshots[1].is_default);
+        assert!(!snapshots[0].is_active);
+        assert!(snapshots[1].is_active);
 
         let (restart_tx, restart_rx) = crossbeam_channel::unbounded();
         let restarted = TabManager::new(
@@ -2618,6 +3706,7 @@ mod tests {
             vec![
                 Workspace {
                     is_default: false,
+                    is_active: false,
                     ..Workspace::default_workspace()
                 },
                 Workspace {

@@ -244,8 +244,9 @@ pub struct Workspace {
     pub name: String,
     pub icon: WorkspaceIcon,
     pub color: WorkspaceColor,
-    /// The workspace selected when the browser starts. This is intentionally
-    /// separate from `is_active`, which follows the workspace open at shutdown.
+    /// Fallback workspace when no last-active workspace is available, and the
+    /// choice offered to new windows. `is_active` follows the workspace open at
+    /// shutdown and wins on startup.
     pub is_default: bool,
     pub is_active: bool,
 }
@@ -288,6 +289,33 @@ impl Workspace {
     }
 }
 
+/// Which workspace Kasumi opens when the browser launches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceStartupBehavior {
+    /// Reopen the space that was active when the last session closed.
+    LastActive,
+    /// Always open the space marked as default in Settings.
+    DefaultWorkspace,
+}
+
+impl Default for WorkspaceStartupBehavior {
+    fn default() -> Self {
+        Self::LastActive
+    }
+}
+
+impl WorkspaceStartupBehavior {
+    pub const ALL: [Self; 2] = [Self::LastActive, Self::DefaultWorkspace];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LastActive => "Last used space",
+            Self::DefaultWorkspace => "Default space",
+        }
+    }
+}
+
 /// User-configurable browser preferences. The whole document is persisted as
 /// JSON by the background SQLite worker so adding a field never requires a
 /// schema migration or writes from a CEF callback.
@@ -299,6 +327,12 @@ pub struct BrowserPreferences {
     pub adblock_enabled: bool,
     pub idle_timeout_minutes: u32,
     pub search_engine: SearchEngine,
+    /// Workspace selected when the browser launches.
+    pub workspace_startup: WorkspaceStartupBehavior,
+    /// Custom download directory. Empty means the OS default Downloads folder.
+    pub download_directory: String,
+    /// Show the native save dialog for each download instead of auto-saving.
+    pub ask_where_to_save: bool,
 }
 
 impl Default for BrowserPreferences {
@@ -309,6 +343,9 @@ impl Default for BrowserPreferences {
             adblock_enabled: true,
             idle_timeout_minutes: 10,
             search_engine: SearchEngine::default(),
+            workspace_startup: WorkspaceStartupBehavior::default(),
+            download_directory: String::new(),
+            ask_where_to_save: false,
         }
     }
 }
@@ -334,6 +371,16 @@ impl BrowserPreferences {
         self.search_engine.home_url()
     }
 
+    /// Resolve the folder downloads should be written into. The explicit
+    /// preference wins; otherwise use the platform's standard Downloads
+    /// location, falling back to a `Downloads` folder under the home directory.
+    pub fn download_directory(&self) -> std::path::PathBuf {
+        if !self.download_directory.trim().is_empty() {
+            return std::path::PathBuf::from(&self.download_directory);
+        }
+        default_download_directory()
+    }
+
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
@@ -341,6 +388,20 @@ impl BrowserPreferences {
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json).map(Self::normalized)
     }
+}
+
+/// Platform default download folder, used when no custom directory is set.
+/// Honors `XDG_DOWNLOAD_DIR` on Linux and falls back to `$HOME/Downloads`.
+pub fn default_download_directory() -> std::path::PathBuf {
+    if let Some(downloads) = std::env::var_os("XDG_DOWNLOAD_DIR") {
+        if !downloads.is_empty() {
+            return std::path::PathBuf::from(downloads);
+        }
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    home.map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Downloads")
 }
 
 pub fn normalize_idle_timeout_minutes(minutes: u32) -> u32 {
@@ -364,6 +425,13 @@ pub const RAM_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How often the tab manager watchdog tick runs
 pub const TAB_WATCHDOG_TICK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Simultaneous HTTP Range requests used by the native download manager.
+pub const PARALLEL_DOWNLOAD_SEGMENTS: u8 = 8;
+
+/// Files below this size are downloaded with one request; segment overhead
+/// costs more than it saves for small payloads.
+pub const PARALLEL_DOWNLOAD_MIN_BYTES: i64 = 1024 * 1024;
 
 /// Upper bound on event-loop iterations spent draining CEF events during
 /// shutdown. On macOS `on_before_close` is delivered by `cef::shutdown()`
@@ -405,6 +473,12 @@ mod tests {
     }
 
     #[test]
+    fn parallel_download_limits_are_sane() {
+        assert_eq!(PARALLEL_DOWNLOAD_SEGMENTS, 8);
+        assert_eq!(PARALLEL_DOWNLOAD_MIN_BYTES, 1024 * 1024);
+    }
+
+    #[test]
     fn default_search_prefix_matches_home_origin() {
         assert!(DEFAULT_SEARCH_URL_PREFIX.starts_with(DEFAULT_HOME_URL));
         assert!(DEFAULT_SEARCH_URL_PREFIX.ends_with("?q="));
@@ -426,6 +500,13 @@ mod tests {
         assert_eq!(prefs.idle_timeout(), TAB_IDLE_TIMEOUT_NORMAL);
         assert_eq!(prefs.search_engine, SearchEngine::DuckDuckGo);
         assert_eq!(prefs.search_url_prefix(), DEFAULT_SEARCH_URL_PREFIX);
+        assert_eq!(
+            prefs.workspace_startup,
+            WorkspaceStartupBehavior::LastActive
+        );
+        assert!(prefs.download_directory.is_empty());
+        assert!(!prefs.ask_where_to_save);
+        assert!(prefs.download_directory().ends_with("Downloads"));
     }
 
     #[test]
@@ -436,8 +517,12 @@ mod tests {
             adblock_enabled: false,
             idle_timeout_minutes: 500,
             search_engine: SearchEngine::Bing,
+            workspace_startup: WorkspaceStartupBehavior::DefaultWorkspace,
+            download_directory: "/tmp/kasumi-downloads".to_string(),
+            ask_where_to_save: true,
         };
         let json = prefs.to_json().unwrap_or_default();
+        assert!(json.contains("\"workspace_startup\":\"default_workspace\""));
         let loaded = BrowserPreferences::from_json(&json).unwrap_or_default();
         assert_eq!(loaded.theme, ThemePreference::Light);
         assert!(!loaded.rail_expanded);
@@ -445,6 +530,16 @@ mod tests {
         assert_eq!(loaded.idle_timeout_minutes, MAX_IDLE_TIMEOUT_MINUTES);
         assert_eq!(loaded.search_engine, SearchEngine::Bing);
         assert_eq!(loaded.idle_timeout(), Duration::from_secs(3600));
+        assert_eq!(
+            loaded.workspace_startup,
+            WorkspaceStartupBehavior::DefaultWorkspace
+        );
+        assert_eq!(loaded.download_directory, "/tmp/kasumi-downloads");
+        assert!(loaded.ask_where_to_save);
+        assert_eq!(
+            loaded.download_directory(),
+            std::path::PathBuf::from("/tmp/kasumi-downloads")
+        );
 
         assert_eq!(normalize_idle_timeout_minutes(0), MIN_IDLE_TIMEOUT_MINUTES);
         assert_eq!(normalize_idle_timeout_minutes(12), 12);

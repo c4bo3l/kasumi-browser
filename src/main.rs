@@ -369,6 +369,7 @@ mod native_shortcuts {
             't' => Some(BrowserShortcut::NewTab),
             'w' if !shift => Some(BrowserShortcut::CloseTab),
             'l' | 'k' if !shift => Some(BrowserShortcut::OpenCommandPalette),
+            'j' if !shift => Some(BrowserShortcut::OpenDownloads),
             ',' | '.' if !shift => Some(BrowserShortcut::OpenSettings),
             'q' if !shift => Some(BrowserShortcut::Quit),
             'z' if !shift => Some(BrowserShortcut::ReopenClosedTab),
@@ -419,6 +420,10 @@ fn setup_mac_application() {
         send_menu_shortcut(BrowserShortcut::OpenSettings);
     }
 
+    extern "C" fn menu_open_downloads(_this: *mut c_void, _cmd: *mut c_void) {
+        send_menu_shortcut(BrowserShortcut::OpenDownloads);
+    }
+
     extern "C" fn menu_quit(_this: *mut c_void, _cmd: *mut c_void) {
         send_menu_shortcut(BrowserShortcut::Quit);
     }
@@ -455,6 +460,7 @@ fn setup_mac_application() {
             register_action("kasumiNewTab:", menu_new_tab);
             register_action("kasumiCloseTab:", menu_close_tab);
             register_action("kasumiOpenSettings:", menu_open_settings);
+            register_action("kasumiOpenDownloads:", menu_open_downloads);
             register_action("kasumiQuitApp:", menu_quit);
 
             let proto_name = CString::new("CrAppControlProtocol").unwrap();
@@ -473,8 +479,8 @@ fn setup_mac_application() {
     }
 }
 
-/// Build the native macOS menu bar. The File menu mirrors the shell shortcuts
-/// so Settings is discoverable without knowing `Cmd+,`.
+/// Build the native macOS menu bar. Shell actions live directly in the app
+/// menu so Settings and Downloads are discoverable without a separate File menu.
 #[cfg(target_os = "macos")]
 fn install_macos_main_menu() {
     use objc2::runtime::AnyObject;
@@ -485,6 +491,12 @@ fn install_macos_main_menu() {
     let mtm = unsafe { MainThreadMarker::new_unchecked() };
     let app = NSApplication::sharedApplication(mtm);
 
+    // An unbundled binary otherwise takes its app-menu title from the
+    // executable name (`kasumi-browser`). Seed the bundle name as well as the
+    // menu title so AppKit does not overwrite "Kasumi Browser" when installing
+    // the main menu.
+    unsafe { set_macos_bundle_name("Kasumi Browser") };
+
     let main_menu = NSMenu::new(mtm);
     unsafe { main_menu.setTitle(&NSString::from_str("Kasumi Browser")) };
     let target: &AnyObject = app.as_ref();
@@ -494,11 +506,30 @@ fn install_macos_main_menu() {
     let app_menu = NSMenu::new(mtm);
     let app_version = NSMenuItem::new(mtm);
     unsafe {
-        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.6.0"));
+        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.7.0"));
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+    let add_item = |title: &str, selector: objc2::runtime::Sel, key: &str| {
+        let item = unsafe {
+            app_menu.addItemWithTitle_action_keyEquivalent(
+                &NSString::from_str(title),
+                Some(selector),
+                &NSString::from_str(key),
+            )
+        };
+        unsafe { item.setTarget(Some(target)) };
+    };
+
+    add_item("New Tab", objc2::sel!(kasumiNewTab:), "t");
+    add_item("Close Tab", objc2::sel!(kasumiCloseTab:), "w");
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+    add_item("Downloads…", objc2::sel!(kasumiOpenDownloads:), "j");
+    add_item("Settings…", objc2::sel!(kasumiOpenSettings:), ",");
+    app_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
     let quit_item = unsafe {
         app_menu.addItemWithTitle_action_keyEquivalent(
             &NSString::from_str("Quit Kasumi Browser"),
@@ -510,29 +541,118 @@ fn install_macos_main_menu() {
     app_item.setSubmenu(Some(&app_menu));
     main_menu.addItem(&app_item);
 
-    let file_item = NSMenuItem::new(mtm);
-    unsafe { file_item.setTitle(&NSString::from_str("File")) };
-    let file_menu = NSMenu::new(mtm);
-    file_item.setSubmenu(Some(&file_menu));
-    main_menu.addItem(&file_item);
-
-    let add_item = |title: &str, selector: objc2::runtime::Sel, key: &str| {
-        let item = unsafe {
-            file_menu.addItemWithTitle_action_keyEquivalent(
-                &NSString::from_str(title),
-                Some(selector),
-                &NSString::from_str(key),
-            )
-        };
-        unsafe { item.setTarget(Some(target)) };
-    };
-
-    add_item("New Tab", objc2::sel!(kasumiNewTab:), "t");
-    add_item("Close Tab", objc2::sel!(kasumiCloseTab:), "w");
-    file_menu.addItem(&NSMenuItem::separatorItem(mtm));
-    add_item("Settings…", objc2::sel!(kasumiOpenSettings:), ",");
-
     app.setMainMenu(Some(&main_menu));
+    // AppKit may rename the application item from the process bundle while the
+    // menu is installed; reassert the visible label afterwards.
+    unsafe {
+        app_item.setTitle(&NSString::from_str("Kasumi Browser"));
+        main_menu.setTitle(&NSString::from_str("Kasumi Browser"));
+    }
+}
+
+/// Seed the macOS application identity for an unbundled development binary.
+///
+/// CEF's framework carries its own `CFBundleName` ("Chromium Embedded
+/// Framework"). When the framework is loaded from an unbundled executable,
+/// AppKit can inherit that name for the process and the app menu. Setting both
+/// the user-defaults bundle keys and the process name keeps the menu showing
+/// "Kasumi Browser" regardless of which source AppKit consults.
+#[cfg(target_os = "macos")]
+unsafe fn set_macos_bundle_name(name: &str) {
+    use std::ffi::{c_void, CString};
+
+    let value = objc2_foundation::NSString::from_str(name);
+
+    // AppKit uses `NSProcessInfo.processName` for the visible app-menu title.
+    // The private setter was renamed from `setName:` to `setProcessName:` in
+    // recent macOS releases; probe both so an unbundled binary never crashes
+    // on an unknown selector.
+    if let (Ok(class_name), Ok(selector_name)) =
+        (CString::new("NSProcessInfo"), CString::new("processInfo"))
+    {
+        let cls = objc2::ffi::objc_getClass(class_name.as_ptr());
+        if !cls.is_null() {
+            let process_info_sel = objc2::ffi::sel_registerName(selector_name.as_ptr());
+            let process_info_msg: unsafe extern "C" fn(*mut c_void, *const c_void) -> *mut c_void =
+                std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
+            let process_info =
+                process_info_msg(cls as *mut c_void, process_info_sel as *const c_void);
+            if !process_info.is_null() {
+                // `respondsToSelector:` returns a BOOL (u8 on Apple platforms).
+                let responds_msg: unsafe extern "C" fn(
+                    *mut c_void,
+                    *const c_void,
+                    *const c_void,
+                ) -> u8 = std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
+                let responds_sel = objc2::ffi::sel_registerName(
+                    CString::new("respondsToSelector:")
+                        .unwrap_or_default()
+                        .as_ptr(),
+                );
+                for setter in ["setProcessName:", "setName:"] {
+                    if let Ok(setter_name) = CString::new(setter) {
+                        let set_sel = objc2::ffi::sel_registerName(setter_name.as_ptr());
+                        if responds_msg(
+                            process_info,
+                            responds_sel as *const c_void,
+                            set_sel as *const c_void,
+                        ) == 0
+                        {
+                            continue;
+                        }
+                        let set_name_msg: unsafe extern "C" fn(
+                            *mut c_void,
+                            *const c_void,
+                            *mut c_void,
+                        ) = std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
+                        set_name_msg(
+                            process_info,
+                            set_sel as *const c_void,
+                            &*value as *const objc2_foundation::NSString as *mut c_void,
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let Ok(class_name) = CString::new("NSUserDefaults") else {
+        return;
+    };
+    let cls = objc2::ffi::objc_getClass(class_name.as_ptr());
+    if cls.is_null() {
+        return;
+    }
+
+    let Ok(selector_name) = CString::new("standardUserDefaults") else {
+        return;
+    };
+    let standard_sel = objc2::ffi::sel_registerName(selector_name.as_ptr());
+    let standard: unsafe extern "C" fn(*mut c_void, *const c_void) -> *mut c_void =
+        std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
+    let defaults = standard(cls as *mut c_void, standard_sel as *const c_void);
+    if defaults.is_null() {
+        return;
+    }
+
+    let Ok(setter_name) = CString::new("setObject:forKey:") else {
+        return;
+    };
+    let setter_sel = objc2::ffi::sel_registerName(setter_name.as_ptr());
+    let setter: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void, *mut c_void) =
+        std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
+    // CEF reads these keys when deriving the process/app name. Seed every
+    // common variant so none can reintroduce "Chromium Embedded Framework".
+    for key_name in ["CFBundleName", "CFBundleDisplayName"] {
+        let key = objc2_foundation::NSString::from_str(key_name);
+        setter(
+            defaults,
+            setter_sel as *const c_void,
+            &*value as *const objc2_foundation::NSString as *mut c_void,
+            &*key as *const objc2_foundation::NSString as *mut c_void,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -649,7 +769,7 @@ impl KasumiBrowserHandler {
                 .with_transparent(true)
                 .with_decorations(false)
                 .with_resizable(false)
-                .with_window_level(WindowLevel::AlwaysOnTop);
+                .with_window_level(WindowLevel::Normal);
             let overlay_window = match event_loop.create_window(attrs) {
                 Ok(window) => Arc::new(window),
                 Err(e) => {
@@ -657,7 +777,7 @@ impl KasumiBrowserHandler {
                     return;
                 }
             };
-            overlay_window.set_window_level(WindowLevel::AlwaysOnTop);
+            overlay_window.set_window_level(WindowLevel::Normal);
             self.overlay_window_id = Some(overlay_window.id());
             self.overlay_window = Some(overlay_window);
         }
@@ -760,7 +880,7 @@ impl KasumiBrowserHandler {
                 .with_transparent(true)
                 .with_decorations(false)
                 .with_resizable(false)
-                .with_window_level(WindowLevel::AlwaysOnTop);
+                .with_window_level(WindowLevel::Normal);
             let window = match event_loop.create_window(attrs) {
                 Ok(window) => Arc::new(window),
                 Err(e) => {
@@ -768,7 +888,7 @@ impl KasumiBrowserHandler {
                     return;
                 }
             };
-            window.set_window_level(WindowLevel::AlwaysOnTop);
+            window.set_window_level(WindowLevel::Normal);
             if let Err(e) = window.set_cursor_hittest(false) {
                 tracing::warn!("Tooltip overlay click-through unavailable: {e}");
             }
@@ -883,6 +1003,9 @@ impl KasumiBrowserHandler {
             BrowserShortcut::OpenSettings => {
                 self.chrome_state.open_settings();
             }
+            BrowserShortcut::OpenDownloads => {
+                self.chrome_state.toggle_downloads();
+            }
             BrowserShortcut::Quit => self.request_shutdown(),
         }
     }
@@ -939,6 +1062,34 @@ impl KasumiBrowserHandler {
             if let UiAction::ApplyPreferences(preferences) = &action {
                 self.apply_preferences(preferences.clone());
             }
+            if let UiAction::SetRailExpanded(expanded) = &action {
+                let mut preferences = self.chrome_state.preferences.clone();
+                preferences.rail_expanded = *expanded;
+                self.apply_preferences(preferences);
+            }
+            if let UiAction::OpenDownloads = &action {
+                self.chrome_state.toggle_downloads();
+            }
+            if let UiAction::OpenDownloadFile { download_id } = &action {
+                let path = self
+                    .tab_manager
+                    .as_ref()
+                    .and_then(|tm| tm.download_snapshot(*download_id))
+                    .map(|download| download.full_path);
+                if let Some(path) = path {
+                    open_download_path(&path, false);
+                }
+            }
+            if let UiAction::RevealDownload { download_id } = &action {
+                let path = self
+                    .tab_manager
+                    .as_ref()
+                    .and_then(|tm| tm.download_snapshot(*download_id))
+                    .map(|download| download.full_path);
+                if let Some(path) = path {
+                    open_download_path(&path, true);
+                }
+            }
             if let Some(tm) = self.tab_manager.as_mut() {
                 tm.handle_ui_action(action);
             }
@@ -992,6 +1143,59 @@ fn is_quit_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
         && !modifiers.alt_key()
         && !modifiers.shift_key()
         && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("q"))
+}
+
+/// Launch the OS handler for a finished download. This runs on the winit
+/// thread only; CEF callbacks merely send the path in a `BrowserEvent`.
+fn open_download_path(path: &str, reveal: bool) {
+    use std::process::Command;
+
+    if path.is_empty() {
+        return;
+    }
+    // Avoid a raw OS "file does not exist" dialog when a transfer failed to
+    // finalize. The downloads row is demoted to Interrupted in that case.
+    if !std::path::Path::new(path).exists() {
+        tracing::warn!("Download file no longer exists: {path}");
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    let result = if reveal {
+        Command::new("open").arg("-R").arg(path).spawn()
+    } else {
+        Command::new("open").arg(path).spawn()
+    };
+
+    #[cfg(windows)]
+    let result = if reveal {
+        Command::new("explorer")
+            .arg(format!("/select,{path}"))
+            .spawn()
+    } else {
+        Command::new("cmd")
+            .arg("/C")
+            .arg("start")
+            .arg("")
+            .arg(path)
+            .spawn()
+    };
+
+    #[cfg(target_os = "linux")]
+    let result = if reveal {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        Command::new("xdg-open").arg(parent).spawn()
+    } else {
+        Command::new("xdg-open").arg(path).spawn()
+    };
+
+    match result {
+        Ok(_) => {}
+        Err(error) => tracing::warn!("Could not open download {path}: {error}"),
+    }
 }
 
 impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
@@ -1095,6 +1299,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
         let restored_tabs = StorageManager::load_session(&db_path).unwrap_or_default();
         let restored_workspaces = StorageManager::load_workspaces(&db_path).unwrap_or_default();
         let restored_bookmarks = StorageManager::load_bookmarks(&db_path).unwrap_or_default();
+        let restored_downloads = StorageManager::load_downloads(&db_path).unwrap_or_default();
 
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut tab_manager = TabManager::new(
@@ -1107,6 +1312,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             restored_workspaces,
             restored_bookmarks,
         );
+        tab_manager.seed_downloads(restored_downloads);
         tab_manager.restore_session(restored_tabs);
 
         self.window = Some(Arc::clone(&window));
@@ -1305,6 +1511,9 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                             "," | "<" | "." | ">" => {
                                 self.handle_browser_shortcut(BrowserShortcut::OpenSettings);
                             }
+                            "j" | "J" => {
+                                self.handle_browser_shortcut(BrowserShortcut::OpenDownloads);
+                            }
                             "t" | "T" => {
                                 self.handle_browser_shortcut(BrowserShortcut::NewTab);
                             }
@@ -1400,6 +1609,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             self.shutdown_browsers_closed = true;
             if let Some(tm) = self.tab_manager.as_mut() {
                 tm.sync_session();
+                tm.shutdown_downloads();
                 tm.close_all_browsers();
             }
             if let Some(storage) = self.storage_handle.as_ref() {
@@ -1415,6 +1625,13 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
 
         if let Some(tm) = self.tab_manager.as_mut() {
             tm.pump_events();
+            let new_download = tm.consume_download_bubble_request();
+            let explicit_downloads_request = tm.consume_downloads_request();
+            if new_download && !self.chrome_state.has_overlay() {
+                self.chrome_state.open_downloads();
+            } else if explicit_downloads_request {
+                self.chrome_state.toggle_downloads();
+            }
             if tm.consume_command_palette_request() {
                 self.chrome_state.open_command_palette();
             }
@@ -1568,7 +1785,13 @@ fn main() {
 
     // ── 4. macOS: configure NSApplication CrAppControlProtocol ──────────────
     #[cfg(target_os = "macos")]
-    setup_mac_application();
+    {
+        setup_mac_application();
+        // CEF's framework carries a "Chromium Embedded Framework" bundle name.
+        // Claim the process identity before loading it so AppKit cannot adopt
+        // that name for the app menu.
+        unsafe { set_macos_bundle_name("Kasumi Browser") };
+    }
 
     // ── 5. Initialize CEF ────────────────────────────────────────────────────
     let mut settings = cef::Settings::default();
@@ -1859,6 +2082,10 @@ mod tests {
         assert_eq!(
             shortcut_from_parts('l', 0x25, cmd),
             Some(BrowserShortcut::OpenCommandPalette)
+        );
+        assert_eq!(
+            shortcut_from_parts('j', 0x26, cmd),
+            Some(BrowserShortcut::OpenDownloads)
         );
         assert_eq!(
             shortcut_from_parts('t', 0x11, cmd | shift),

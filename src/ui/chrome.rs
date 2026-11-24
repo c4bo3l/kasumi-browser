@@ -8,10 +8,10 @@
 //! 2. Calls `render()` → draws the chrome and returns any `UiAction`s the user triggered.
 //!
 //! The CEF content renders in a separate native OS child view that starts at
-//! `x = rail_width` and fills the remaining window height. The command palette
-//! and rail tooltips use transparent native overlay windows so they appear
-//! above that child view; the browser keeps running underneath and the page
-//! stays visible. This file never touches CEF directly.
+//! `x = rail_width` and fills the remaining window height. The command palette,
+//! downloads bubble, and rail tooltips use transparent native overlay windows so
+//! they appear above that child view; the browser keeps running underneath and
+//! the page stays visible. This file never touches CEF directly.
 
 #![allow(dead_code)]
 
@@ -26,10 +26,10 @@ use egui_wgpu::ScreenDescriptor;
 
 use crate::config::{
     rail_width, BrowserPreferences, SearchEngine, ThemePreference, Workspace, WorkspaceColor,
-    WorkspaceIcon, COMMAND_PALETTE_TOP_OFFSET, COMMAND_PALETTE_WIDTH, DEFAULT_SEARCH_URL_PREFIX,
-    MAX_IDLE_TIMEOUT_MINUTES, MIN_IDLE_TIMEOUT_MINUTES,
+    WorkspaceIcon, WorkspaceStartupBehavior, COMMAND_PALETTE_TOP_OFFSET, COMMAND_PALETTE_WIDTH,
+    DEFAULT_SEARCH_URL_PREFIX, MAX_IDLE_TIMEOUT_MINUTES, MIN_IDLE_TIMEOUT_MINUTES,
 };
-use crate::events::UiAction;
+use crate::events::{DownloadEngine, DownloadInfo, DownloadState, UiAction};
 
 /// Light or dark chrome appearance. The OS theme decides the default, and
 /// `ChromeTheme::from_winit` maps live `ThemeChanged` events into this enum.
@@ -102,9 +102,9 @@ impl ChromePalette {
         close_icon: Color32::WHITE,
         tab_border: Color32::from_rgb(86, 128, 192),
         loading: Color32::from_rgb(115, 190, 255),
-        tooltip_bg: Color32::from_rgb(16, 19, 26),
-        tooltip_border: Color32::from_rgb(110, 130, 160),
-        tooltip_text: Color32::from_rgb(250, 251, 255),
+        tooltip_bg: Color32::from_rgba_premultiplied(16, 19, 26, 205),
+        tooltip_border: Color32::from_rgba_premultiplied(110, 130, 160, 190),
+        tooltip_text: Color32::from_rgba_premultiplied(250, 251, 255, 245),
     };
 
     pub const LIGHT: Self = Self {
@@ -133,9 +133,9 @@ impl ChromePalette {
         close_icon: Color32::from_rgb(17, 20, 24),
         tab_border: Color32::from_rgb(113, 155, 209),
         loading: Color32::from_rgb(44, 107, 237),
-        tooltip_bg: Color32::from_rgb(255, 255, 255),
-        tooltip_border: Color32::from_rgb(150, 166, 188),
-        tooltip_text: Color32::from_rgb(25, 28, 33),
+        tooltip_bg: Color32::from_rgba_premultiplied(255, 255, 255, 220),
+        tooltip_border: Color32::from_rgba_premultiplied(150, 166, 188, 200),
+        tooltip_text: Color32::from_rgba_premultiplied(25, 28, 33, 245),
     };
 
     /// Return a copy tinted by the active workspace accent. This keeps global
@@ -167,11 +167,10 @@ impl ChromePalette {
 
 fn mix_color(a: Color32, b: Color32, b_weight: f32) -> Color32 {
     let weight = b_weight.clamp(0.0, 1.0);
-    Color32::from_rgb(
-        (a.r() as f32 * (1.0 - weight) + b.r() as f32 * weight).round() as u8,
-        (a.g() as f32 * (1.0 - weight) + b.g() as f32 * weight).round() as u8,
-        (a.b() as f32 * (1.0 - weight) + b.b() as f32 * weight).round() as u8,
-    )
+    let [ar, ag, ab, aa] = a.to_array();
+    let [br, bg, bb, ba] = b.to_array();
+    let mix = |from: u8, to: u8| (from as f32 * (1.0 - weight) + to as f32 * weight).round() as u8;
+    Color32::from_rgba_premultiplied(mix(ar, br), mix(ag, bg), mix(ab, bb), mix(aa, ba))
 }
 
 impl ChromeTheme {
@@ -239,6 +238,175 @@ pub fn effective_theme(preference: ThemePreference, system: ChromeTheme) -> Chro
     }
 }
 
+/// Human-readable label for a download's native state badge.
+pub fn download_state_label(state: DownloadState) -> &'static str {
+    match state {
+        DownloadState::InProgress => "Downloading",
+        DownloadState::Paused => "Paused",
+        DownloadState::Completed => "Completed",
+        DownloadState::Canceled => "Canceled",
+        DownloadState::Interrupted => "Interrupted",
+    }
+}
+
+/// Native segmented transfers display their connection count; CEF-managed
+/// entries remain readable for non-HTTP downloads.
+pub fn download_engine_label(engine: DownloadEngine, segments: u8) -> String {
+    match engine {
+        DownloadEngine::Cef => "CEF".to_string(),
+        DownloadEngine::Parallel => {
+            if segments > 1 {
+                format!("Parallel · {segments} connections")
+            } else {
+                "Native".to_string()
+            }
+        }
+    }
+}
+
+/// Compact binary sizes for the downloads bubble. Unknown totals stay `0 B`
+/// instead of rendering misleading negative progress.
+pub fn format_download_bytes(bytes: i64) -> String {
+    if bytes <= 0 {
+        return "0 B".to_string();
+    }
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Estimated time remaining for a transfer. Unknown totals, finished transfers,
+/// and paused/zero-speed transfers render nothing rather than a misleading ETA.
+pub fn download_eta_label(received: i64, total: i64, speed: i64) -> String {
+    if speed <= 0 || total <= 0 {
+        return String::new();
+    }
+    let remaining = total.saturating_sub(received.max(0)).max(0);
+    if remaining == 0 {
+        return String::new();
+    }
+    let seconds = ((remaining as f64 / speed as f64).ceil() as u64)
+        .max(1)
+        .min(u64::MAX);
+    let duration = if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60)
+    };
+    format!("ETA {duration}")
+}
+
+/// Aggregate state for the downloads bubble header. Failed/canceled entries are
+/// counted separately so a stale partial transfer cannot drag the overall bar
+/// down forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DownloadSummary {
+    pub active: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub received: i64,
+    pub total: i64,
+    pub speed: i64,
+}
+
+impl DownloadSummary {
+    pub fn from_downloads(downloads: &[DownloadInfo]) -> Self {
+        let mut summary = Self::default();
+        for download in downloads {
+            match download.state {
+                DownloadState::InProgress | DownloadState::Paused => summary.active += 1,
+                DownloadState::Completed => summary.completed += 1,
+                DownloadState::Canceled | DownloadState::Interrupted => summary.failed += 1,
+            }
+            if matches!(
+                download.state,
+                DownloadState::InProgress | DownloadState::Paused | DownloadState::Completed
+            ) {
+                summary.received = summary
+                    .received
+                    .saturating_add(download.received_bytes.max(0));
+                summary.total = summary.total.saturating_add(download.total_bytes.max(0));
+            }
+            if download.state == DownloadState::InProgress {
+                summary.speed = summary.speed.saturating_add(download.current_speed.max(0));
+            }
+        }
+        summary
+    }
+
+    /// Integer percentage clamped to `0..=100`; unknown totals report `0`.
+    pub fn percent(&self) -> u8 {
+        if self.total <= 0 {
+            return 0;
+        }
+        (self.received.saturating_mul(100) / self.total).clamp(0, 100) as u8
+    }
+
+    pub fn status_text(&self) -> String {
+        let mut parts = Vec::new();
+        if self.active > 0 {
+            parts.push(format!("{} active", self.active));
+        }
+        if self.completed > 0 {
+            parts.push(format!("{} done", self.completed));
+        }
+        if self.failed > 0 {
+            parts.push(format!("{} failed", self.failed));
+        }
+        if parts.is_empty() {
+            "No downloads".to_string()
+        } else {
+            parts.join(" · ")
+        }
+    }
+}
+
+/// Badge shown on the rail's Downloads icon. Running transfers get a count;
+/// history with no running transfers gets a quiet dot so the icon still signals
+/// that the bubble has something to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadBadge {
+    Hidden,
+    History,
+    Active(usize),
+}
+
+pub fn download_rail_badge(downloads: &[DownloadInfo]) -> DownloadBadge {
+    let active = downloads
+        .iter()
+        .filter(|download| {
+            matches!(
+                download.state,
+                DownloadState::InProgress | DownloadState::Paused
+            )
+        })
+        .count();
+    if active > 0 {
+        DownloadBadge::Active(active)
+    } else if downloads.is_empty() {
+        DownloadBadge::Hidden
+    } else {
+        DownloadBadge::History
+    }
+}
+
+/// Completed and failed rows are intentionally static: they no longer display
+/// a progress bar, so the row can show only its final state and file actions.
+pub fn download_row_uses_progress_bar(state: DownloadState) -> bool {
+    matches!(state, DownloadState::InProgress | DownloadState::Paused)
+}
+
 /// Translate the two independent workspace forms into actions. The edit form
 /// only emits on an explicit Save click, and Create only reads the create form;
 /// this prevents a half-finished rename from becoming a new workspace name.
@@ -292,18 +460,22 @@ fn workspace_form_actions(
     actions
 }
 
-const TOOLTIP_WIDTH: f32 = 280.0;
-const TOOLTIP_HEIGHT_EXPANDED: f32 = 64.0;
-const TOOLTIP_HEIGHT_COLLAPSED: f32 = 52.0;
+const TOOLTIP_WIDTH: f32 = 190.0;
+const TOOLTIP_HEIGHT_EXPANDED: f32 = 44.0;
+const TOOLTIP_HEIGHT_COLLAPSED: f32 = 38.0;
 const RAIL_MENU_WIDTH: f32 = 224.0;
 const RAIL_MENU_ROW_HEIGHT: f32 = 28.0;
 const RAIL_MENU_PADDING: f32 = 7.0;
-const RAIL_STATUS_HEIGHT: f32 = 124.0;
+const RAIL_STATUS_HEIGHT: f32 = 196.0;
 const RAIL_STATUS_ICON_EXPANDED: f32 = 15.0;
 const RAIL_STATUS_ICON_COLLAPSED: f32 = 20.0;
 const RAIL_STATUS_BADGE_HEIGHT: f32 = 24.0;
 const SETTINGS_WIDTH: f32 = 660.0;
 const SETTINGS_MAX_CONTENT_HEIGHT: f32 = 560.0;
+const DOWNLOADS_WIDTH: f32 = 460.0;
+const DOWNLOADS_MAX_HEIGHT: f32 = 460.0;
+const DOWNLOADS_BOTTOM_MARGIN: f32 = 18.0;
+const DOWNLOADS_RAIL_GAP: f32 = 12.0;
 
 /// Prefer egui's recommended non-sRGB surface formats. Some drivers only list
 /// `Bgra8UnormSrgb` first, which makes `egui_wgpu` warn about linear sRGB
@@ -339,7 +511,14 @@ enum RailIcon {
     Close,
     Pin,
     PinOff,
+    Copy,
+    Sidebar,
     Settings,
+    Download,
+    Pause,
+    Play,
+    Retry,
+    FolderOpen,
     Check,
     Delete,
     Star,
@@ -449,6 +628,7 @@ pub enum CommandAction {
     ToggleRail,
     OpenDevTools,
     OpenSettings,
+    OpenDownloads,
 }
 
 /// One row in the floating command palette.
@@ -526,6 +706,8 @@ pub struct ChromeState {
     pub workspaces: Vec<WorkspaceInfo>,
     pub active_workspace_id: u64,
     pub bookmarks: Vec<BookmarkInfo>,
+    /// WAL-backed download snapshots mirrored from the CEF download handler.
+    pub downloads: Vec<DownloadInfo>,
     /// Text mirrored from the active tab; the command palette edits a copy.
     pub omnibox_text: String,
     /// True while the command palette is editing `omnibox_text`.
@@ -558,6 +740,8 @@ pub struct ChromeState {
     pub menu: Option<RailMenu>,
     /// Currently highlighted context-menu row.
     pub menu_selection: usize,
+    /// True while the native downloads bubble is visible in the overlay.
+    pub downloads_open: bool,
     /// True when at least one closed tab can be restored with Cmd/Ctrl+Z.
     pub can_reopen_tab: bool,
     /// Current OS light/dark appearance. The user preference may override it.
@@ -597,6 +781,7 @@ impl Default for ChromeState {
             workspaces: Vec::new(),
             active_workspace_id: 1,
             bookmarks: Vec::new(),
+            downloads: Vec::new(),
             omnibox_text: String::new(),
             omnibox_focused: false,
             last_synced_tab_id: None,
@@ -614,6 +799,7 @@ impl Default for ChromeState {
             tooltip: None,
             menu: None,
             menu_selection: 0,
+            downloads_open: false,
             can_reopen_tab: false,
             system_theme: ChromeTheme::default(),
             theme: ChromeTheme::default(),
@@ -645,6 +831,7 @@ impl ChromeState {
         self.command_palette_open = true;
         self.close_tab_menu();
         self.settings_open = false;
+        self.downloads_open = false;
     }
 
     pub fn close_command_palette(&mut self) {
@@ -657,9 +844,10 @@ impl ChromeState {
         self.close_tab_menu();
     }
 
-    pub fn toggle_rail(&mut self) {
+    pub fn toggle_rail(&mut self, actions: &mut Vec<UiAction>) {
         self.rail_expanded = !self.rail_expanded;
         self.close_tab_menu();
+        actions.push(UiAction::SetRailExpanded(self.rail_expanded));
     }
 
     pub fn open_tab_menu(&mut self, tab_id: u64, anchor: egui::Pos2) {
@@ -682,6 +870,7 @@ impl ChromeState {
         self.menu_selection = 0;
         self.tooltip = None;
         self.settings_open = false;
+        self.downloads_open = false;
     }
 
     pub fn close_tab_menu(&mut self) {
@@ -692,6 +881,32 @@ impl ChromeState {
     /// Open the native Settings overlay on the General page.
     pub fn open_settings(&mut self) {
         self.open_settings_tab(SettingsTab::General);
+    }
+
+    /// Open the Arc/Edge-style downloads bubble in the shared overlay.
+    pub fn open_downloads(&mut self) {
+        self.command_palette_open = false;
+        self.command_palette_query.clear();
+        self.command_selection = 0;
+        self.command_palette_focus_requested = false;
+        self.command_palette_select_all_requested = false;
+        self.close_tab_menu();
+        self.tooltip = None;
+        self.settings_open = false;
+        self.downloads_open = true;
+    }
+
+    pub fn toggle_downloads(&mut self) {
+        if self.downloads_open {
+            self.close_downloads();
+        } else {
+            self.open_downloads();
+        }
+    }
+
+    pub fn close_downloads(&mut self) {
+        self.downloads_open = false;
+        self.tooltip = None;
     }
 
     /// Open the native Settings overlay on a specific page, seeded from
@@ -705,6 +920,7 @@ impl ChromeState {
         self.command_palette_select_all_requested = false;
         self.close_tab_menu();
         self.tooltip = None;
+        self.downloads_open = false;
         self.settings_tab = tab;
         self.settings_draft = self.preferences.clone();
         self.workspace_create_mode = false;
@@ -758,11 +974,16 @@ impl ChromeState {
             self.close_tab_menu();
         } else if self.command_palette_open {
             self.close_command_palette();
+        } else if self.downloads_open {
+            self.close_downloads();
         }
     }
 
     pub fn has_overlay(&self) -> bool {
-        self.command_palette_open || self.menu.is_some() || self.settings_open
+        self.command_palette_open
+            || self.menu.is_some()
+            || self.settings_open
+            || self.downloads_open
     }
 
     /// Update the OS appearance and recompute the effective chrome theme.
@@ -1136,8 +1357,11 @@ impl ChromeRenderer {
             // The collapsed rail is the primary workspace switcher, so each
             // space gets a large, high-contrast target with an explicit accent
             // border and a name tooltip instead of a tiny colour dot.
-            ui.vertical(|ui| {
-                for workspace in &workspaces {
+            ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                for (index, workspace) in workspaces.iter().enumerate() {
+                    if index > 0 {
+                        ui.add_space(6.0);
+                    }
                     let active = workspace.id == state.active_workspace_id;
                     let (rect, response) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
                     let (r, g, b) = workspace.color.rgb();
@@ -1247,6 +1471,7 @@ impl ChromeRenderer {
                     workspace_id: workspace.id,
                 });
             }
+            ui.add_space(3.0);
         }
 
         let add = Self::rail_action_button(
@@ -1262,6 +1487,90 @@ impl ChromeRenderer {
             // the list of existing workspaces.
             state.open_workspace_creator();
         }
+    }
+
+    /// Draw the framed URL field in the expanded rail.
+    ///
+    /// `TextEdit` allocates hidden space for long single-line text, so it is
+    /// wrapped in a width-clamped scroll area. Explicit spacing and a zero text
+    /// margin keep the surrounding frame inside the rail with even side gaps.
+    fn build_rail_address_field(
+        ui: &mut Ui,
+        ctx: &egui::Context,
+        state: &mut ChromeState,
+        actions: &mut Vec<UiAction>,
+        palette: &ChromePalette,
+    ) -> Response {
+        Frame::none()
+            .fill(palette.rail_surface)
+            .stroke(Stroke::new(1.0_f32, palette.palette_border))
+            .rounding(Rounding::same(9.0))
+            .outer_margin(egui::Margin::symmetric(6.0, 0.0))
+            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Explicit spaces below define the gaps; egui's implicit
+                    // item spacing would otherwise add 8 px between each glyph.
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let (icon_rect, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                    paint_rail_icon(ui, icon_rect, RailIcon::Globe, palette.rail_accent);
+                    ui.add_space(4.0);
+
+                    // The 22 px copy slot includes its 4 px leading gap. The
+                    // scroll area keeps TextEdit's hidden-text allocation from
+                    // expanding the frame, even for very long URLs.
+                    let copy_slot_width = 22.0;
+                    let input_width = (ui.available_width() - copy_slot_width).max(24.0);
+                    let url_input = egui::ScrollArea::horizontal()
+                        .id_salt("kasumi_rail_url_scroll")
+                        .max_width(input_width)
+                        .scroll_bar_visibility(
+                            egui::containers::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                        )
+                        .show(ui, |ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut state.omnibox_text)
+                                    .id(egui::Id::new("kasumi_rail_url"))
+                                    .hint_text("Address or search")
+                                    .text_color(palette.text_strong)
+                                    .font(egui::TextStyle::Body)
+                                    .desired_width(input_width)
+                                    .clip_text(true)
+                                    .margin(egui::Margin::ZERO)
+                                    .frame(false),
+                            )
+                        })
+                        .inner;
+                    if url_input.has_focus() {
+                        state.omnibox_focused = true;
+                    } else if state.omnibox_focused && !state.command_palette_open {
+                        state.omnibox_focused = false;
+                    }
+                    if url_input.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        if let Some(tab_id) = state.active_tab_id {
+                            let url = resolve_omnibox_with_search(
+                                &state.omnibox_text,
+                                state.preferences.search_url_prefix(),
+                            );
+                            actions.push(UiAction::Navigate { tab_id, url });
+                        }
+                    }
+
+                    let (copy_rect, copy_response) =
+                        ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
+                    paint_rail_icon(
+                        ui,
+                        egui::Rect::from_center_size(copy_rect.center(), vec2(12.0, 12.0)),
+                        RailIcon::Copy,
+                        palette.text,
+                    );
+                    if copy_response.clicked() {
+                        ctx.copy_text(state.omnibox_text.clone());
+                    }
+                    copy_response.on_hover_text("Copy URL");
+                });
+            })
+            .response
     }
 
     /// Draw the collapsible left workspace rail.
@@ -1281,6 +1590,8 @@ impl ChromeRenderer {
         let width = rail_width(state.rail_expanded);
         let palette = state.palette();
         let palette = &palette;
+        // Computed once so both rail modes show the same active-download state.
+        let download_badge = download_rail_badge(&state.downloads);
         let rail = egui::SidePanel::left("workspace_rail")
             .exact_width(width)
             .resizable(false)
@@ -1293,24 +1604,6 @@ impl ChromeRenderer {
                         let rail_rect = ui.clip_rect();
                         ui.add_space(5.0);
 
-                        let expand = Self::rail_icon_button(
-                            ui,
-                            vec2(34.0, 30.0),
-                            RailIcon::ChevronRight,
-                            palette,
-                        );
-                        if expand.clicked() {
-                            state.toggle_rail();
-                        }
-                        Self::chrome_tooltip(
-                            tooltip_slot,
-                            ui,
-                            &expand,
-                            "Expand workspace rail",
-                            state.rail_expanded,
-                        );
-
-                        ui.add_space(4.0);
                         Self::build_workspace_switcher(
                             ui,
                             state,
@@ -1362,7 +1655,7 @@ impl ChromeRenderer {
                             tooltip_slot,
                             ui,
                             &devtools,
-                            "DevTools (F12, new window)",
+                            "DevTools (F12)",
                             state.rail_expanded,
                         );
 
@@ -1428,6 +1721,24 @@ impl ChromeRenderer {
                         ui.allocate_new_ui(UiBuilder::new().max_rect(status_rect), |ui| {
                             ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
                                 ui.add_space(5.0);
+                                let expand = Self::rail_icon_button(
+                                    ui,
+                                    vec2(34.0, 30.0),
+                                    RailIcon::Sidebar,
+                                    palette,
+                                );
+                                if expand.clicked() {
+                                    state.toggle_rail(actions);
+                                }
+                                Self::chrome_tooltip(
+                                    tooltip_slot,
+                                    ui,
+                                    &expand,
+                                    "Expand workspace rail",
+                                    state.rail_expanded,
+                                );
+
+                                ui.add_space(4.0);
                                 let hibernate = Self::rail_icon_button(
                                     ui,
                                     vec2(34.0, 30.0),
@@ -1441,7 +1752,7 @@ impl ChromeRenderer {
                                     tooltip_slot,
                                     ui,
                                     &hibernate,
-                                    "Hibernate all background tabs (Alt+H)",
+                                    "Hibernate tabs (Alt+H)",
                                     state.rail_expanded,
                                 );
 
@@ -1460,6 +1771,31 @@ impl ChromeRenderer {
                                     ui,
                                     &settings,
                                     "Settings (Cmd/Ctrl+,)",
+                                    state.rail_expanded,
+                                );
+
+                                ui.add_space(4.0);
+                                let downloads = Self::rail_icon_button(
+                                    ui,
+                                    vec2(34.0, 30.0),
+                                    RailIcon::Download,
+                                    palette,
+                                );
+                                if downloads.clicked() {
+                                    actions.push(UiAction::OpenDownloads);
+                                }
+                                paint_download_badge(
+                                    ui,
+                                    downloads.rect,
+                                    download_badge,
+                                    palette,
+                                    true,
+                                );
+                                Self::chrome_tooltip(
+                                    tooltip_slot,
+                                    ui,
+                                    &downloads,
+                                    "Downloads (Cmd/Ctrl+J)",
                                     state.rail_expanded,
                                 );
 
@@ -1496,7 +1832,7 @@ impl ChromeRenderer {
                                     tooltip_slot,
                                     ui,
                                     &blocked_response,
-                                    format!("{blocked_requests} ad/tracker requests blocked"),
+                                    format!("{blocked_requests} ads blocked"),
                                     false,
                                 );
 
@@ -1536,22 +1872,6 @@ impl ChromeRenderer {
                     let rail_rect = ui.clip_rect();
                     ui.add_space(7.0);
                     ui.add_space(3.0);
-                    let collapse = Self::rail_action_button(
-                        ui,
-                        width - 12.0,
-                        30.0,
-                        RailIcon::ChevronLeft,
-                        "Collapse rail",
-                        palette,
-                    );
-                    if collapse.clicked() {
-                        state.toggle_rail();
-                    }
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-
-                    ui.add_space(2.0);
                     let command = Self::rail_action_button(
                         ui,
                         width - 12.0,
@@ -1567,7 +1887,7 @@ impl ChromeRenderer {
                         tooltip_slot,
                         ui,
                         &command,
-                        "Open command palette (Cmd/Ctrl+K)",
+                        "Command palette (Cmd/Ctrl+K)",
                         state.rail_expanded,
                     );
 
@@ -1609,11 +1929,23 @@ impl ChromeRenderer {
                         tooltip_slot,
                         ui,
                         &devtools,
-                        "DevTools (F12, new window)",
+                        "DevTools (F12)",
                         state.rail_expanded,
                     );
 
                     ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    // Framed omnibox: the helper reserves the fixed glyph slots
+                    // and uses a zero-margin TextEdit so the frame stays inside
+                    // the rail with even side margins.
+                    Self::build_rail_address_field(ui, ctx, state, actions, &palette);
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+
+                    ui.add_space(4.0);
                     Self::build_workspace_switcher(
                         ui,
                         state,
@@ -1697,6 +2029,26 @@ impl ChromeRenderer {
                 ui.allocate_new_ui(UiBuilder::new().max_rect(status_rect), |ui| {
                     ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                         ui.add_space(6.0);
+                        let collapse = Self::rail_action_button(
+                            ui,
+                            width - 12.0,
+                            30.0,
+                            RailIcon::Sidebar,
+                            "Collapse rail",
+                            palette,
+                        );
+                        if collapse.clicked() {
+                            state.toggle_rail(actions);
+                        }
+                        Self::chrome_tooltip(
+                            tooltip_slot,
+                            ui,
+                            &collapse,
+                            "Collapse workspace rail",
+                            state.rail_expanded,
+                        );
+
+                        ui.add_space(4.0);
                         let hibernate = Self::rail_action_button(
                             ui,
                             width - 12.0,
@@ -1712,7 +2064,7 @@ impl ChromeRenderer {
                             tooltip_slot,
                             ui,
                             &hibernate,
-                            "Hibernate all background tabs (Alt+H)",
+                            "Hibernate tabs (Alt+H)",
                             state.rail_expanded,
                         );
 
@@ -1733,6 +2085,27 @@ impl ChromeRenderer {
                             ui,
                             &settings,
                             "Settings (Cmd/Ctrl+,)",
+                            state.rail_expanded,
+                        );
+
+                        ui.add_space(4.0);
+                        let downloads = Self::rail_action_button(
+                            ui,
+                            width - 12.0,
+                            30.0,
+                            RailIcon::Download,
+                            "Downloads",
+                            palette,
+                        );
+                        if downloads.clicked() {
+                            actions.push(UiAction::OpenDownloads);
+                        }
+                        paint_download_badge(ui, downloads.rect, download_badge, palette, false);
+                        Self::chrome_tooltip(
+                            tooltip_slot,
+                            ui,
+                            &downloads,
+                            "Downloads (Cmd/Ctrl+J)",
                             state.rail_expanded,
                         );
 
@@ -2068,6 +2441,398 @@ impl ChromeRenderer {
         }
     }
 
+    /// Draw the Arc/Edge-style downloads bubble in the shared overlay.
+    ///
+    /// The bubble is anchored beside the rail near its Downloads button. It is
+    /// intentionally not dimmed: the page stays visible behind it, and a click
+    /// outside the card dismisses it. Every row reports individual progress and
+    /// exposes the same native download actions as the former Settings page.
+    pub fn build_downloads_bubble(
+        ctx: &egui::Context,
+        state: &mut ChromeState,
+        actions: &mut Vec<UiAction>,
+    ) {
+        if !state.downloads_open {
+            return;
+        }
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            state.close_downloads();
+            return;
+        }
+
+        let downloads = state.downloads.clone();
+        let summary = DownloadSummary::from_downloads(&downloads);
+        let has_finished = downloads
+            .iter()
+            .any(|download| download.is_finished() || download.state == DownloadState::Canceled);
+        let palette = state.palette();
+        let palette = &palette;
+        let screen = ctx.screen_rect();
+        let size = downloads_bubble_size(screen);
+        let anchor = downloads_bubble_anchor(screen, rail_width(state.rail_expanded));
+        let mut card_rect = egui::Rect::from_min_size(anchor, size);
+
+        egui::Area::new(egui::Id::new("kasumi_downloads_bubble"))
+            .order(Order::Foreground)
+            .fixed_pos(anchor)
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_width(size.x);
+                card_rect = Frame::none()
+                    .fill(palette.menu_bg)
+                    .stroke(Stroke::new(1.0_f32, palette.menu_border))
+                    .rounding(Rounding::same(10.0))
+                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Downloads")
+                                    .size(14.0)
+                                    .strong()
+                                    .color(palette.text_strong),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if material_button(
+                                    ui,
+                                    RailIcon::Close,
+                                    "",
+                                    MaterialButtonStyle::Text,
+                                    palette,
+                                    true,
+                                )
+                                .clicked()
+                                {
+                                    state.close_downloads();
+                                }
+                                if material_button(
+                                    ui,
+                                    RailIcon::Delete,
+                                    "Clear finished",
+                                    MaterialButtonStyle::Text,
+                                    palette,
+                                    has_finished,
+                                )
+                                .clicked()
+                                {
+                                    actions.push(UiAction::ClearCompletedDownloads);
+                                }
+                            });
+                        });
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(summary.status_text()).size(11.0).color(
+                                if summary.failed > 0 {
+                                    palette.close_icon
+                                } else {
+                                    palette.rail_accent
+                                },
+                            ));
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                let mut parts = vec![format!("{}%", summary.percent())];
+                                if summary.speed > 0 {
+                                    parts.push(format!(
+                                        "{} /s",
+                                        format_download_bytes(summary.speed)
+                                    ));
+                                }
+                                let eta = download_eta_label(
+                                    summary.received,
+                                    summary.total,
+                                    summary.speed,
+                                );
+                                if !eta.is_empty() {
+                                    parts.push(eta);
+                                }
+                                ui.label(
+                                    RichText::new(parts.join("  ·  "))
+                                        .size(10.0)
+                                        .color(palette.palette_hint),
+                                );
+                            });
+                        });
+                        // Use a finite width: an infinite desired width would be
+                        // cached as the Area size and poison the next frame with
+                        // a NaN centering rect.
+                        ui.add(
+                            egui::ProgressBar::new(summary.percent() as f32 / 100.0)
+                                .text(format!("{}%", summary.percent()))
+                                .desired_width((size.x - 20.0).max(40.0)),
+                        );
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(5.0);
+
+                        let rows_height = (size.y - 118.0).max(70.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("kasumi_downloads_bubble_rows")
+                            .max_height(rows_height)
+                            .show(ui, |ui| {
+                                if downloads.is_empty() {
+                                    ui.add_space(18.0);
+                                    ui.label(
+                                        RichText::new("No downloads yet")
+                                            .size(12.0)
+                                            .color(palette.text_dim),
+                                    );
+                                    return;
+                                }
+
+                                for download in &downloads {
+                                    ui.add_space(5.0);
+                                    ui.separator();
+                                    ui.add_space(5.0);
+                                    let name = if download.suggested_name.is_empty() {
+                                        download.url.as_str()
+                                    } else {
+                                        download.suggested_name.as_str()
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(truncate_title(name, 34))
+                                                .size(11.0)
+                                                .strong(),
+                                        );
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(download_state_label(
+                                                        download.state,
+                                                    ))
+                                                    .size(10.0)
+                                                    .color(match download.state {
+                                                        DownloadState::Completed => {
+                                                            palette.shield_ok
+                                                        }
+                                                        DownloadState::Canceled
+                                                        | DownloadState::Interrupted => {
+                                                            palette.close_icon
+                                                        }
+                                                        _ => palette.rail_accent,
+                                                    }),
+                                                );
+                                            },
+                                        );
+                                    });
+
+                                    // Active and paused transfers keep a progress
+                                    // bar with compact pause/resume and cancel
+                                    // icons on its right edge. Finished rows drop
+                                    // the bar entirely and swap those icons for
+                                    // open/show-in-folder so each row stays short.
+                                    if download_row_uses_progress_bar(download.state) {
+                                        let percent =
+                                            download.percent_complete.clamp(0, 100) as f32;
+                                        ui.horizontal(|ui| {
+                                            ui.add(
+                                                egui::ProgressBar::new(percent / 100.0)
+                                                    .text(format!("{percent:.0}%"))
+                                                    .desired_width((size.x - 68.0).max(40.0)),
+                                            );
+                                            match download.state {
+                                                DownloadState::InProgress => {
+                                                    if compact_icon_button(
+                                                        ui,
+                                                        RailIcon::Pause,
+                                                        "Pause",
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::PauseDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                    if compact_icon_button(
+                                                        ui,
+                                                        RailIcon::Close,
+                                                        "Cancel",
+                                                        palette,
+                                                        false,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::CancelDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                }
+                                                DownloadState::Paused => {
+                                                    if compact_icon_button(
+                                                        ui,
+                                                        RailIcon::Play,
+                                                        "Resume",
+                                                        palette,
+                                                        true,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::ResumeDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                    if compact_icon_button(
+                                                        ui,
+                                                        RailIcon::Close,
+                                                        "Cancel",
+                                                        palette,
+                                                        false,
+                                                    )
+                                                    .clicked()
+                                                    {
+                                                        actions.push(UiAction::CancelDownload {
+                                                            download_id: download.id,
+                                                        });
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        });
+                                    } else {
+                                        ui.horizontal(|ui| match download.state {
+                                            DownloadState::Completed => {
+                                                if compact_icon_button(
+                                                    ui,
+                                                    RailIcon::OpenInNew,
+                                                    "Open file",
+                                                    palette,
+                                                    true,
+                                                )
+                                                .clicked()
+                                                {
+                                                    actions.push(UiAction::OpenDownloadFile {
+                                                        download_id: download.id,
+                                                    });
+                                                }
+                                                if compact_icon_button(
+                                                    ui,
+                                                    RailIcon::FolderOpen,
+                                                    "Show in folder",
+                                                    palette,
+                                                    false,
+                                                )
+                                                .clicked()
+                                                {
+                                                    actions.push(UiAction::RevealDownload {
+                                                        download_id: download.id,
+                                                    });
+                                                }
+                                            }
+                                            DownloadState::Canceled
+                                            | DownloadState::Interrupted => {
+                                                if compact_icon_button(
+                                                    ui,
+                                                    RailIcon::Retry,
+                                                    "Retry",
+                                                    palette,
+                                                    true,
+                                                )
+                                                .clicked()
+                                                {
+                                                    actions.push(UiAction::RetryDownload {
+                                                        download_id: download.id,
+                                                    });
+                                                }
+                                            }
+                                            _ => {}
+                                        });
+                                    }
+                                    let eta = if download.state == DownloadState::InProgress {
+                                        download_eta_label(
+                                            download.received_bytes,
+                                            download.total_bytes,
+                                            download.current_speed,
+                                        )
+                                    } else {
+                                        String::new()
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{} / {}",
+                                                format_download_bytes(download.received_bytes),
+                                                format_download_bytes(download.total_bytes)
+                                            ))
+                                            .size(11.0)
+                                            .strong()
+                                            .color(palette.text_strong),
+                                        );
+                                        if download.current_speed > 0 {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} /s",
+                                                    format_download_bytes(download.current_speed)
+                                                ))
+                                                .size(11.0)
+                                                .color(palette.text),
+                                            );
+                                        }
+                                        if !eta.is_empty() {
+                                            ui.label(
+                                                RichText::new(eta)
+                                                    .size(11.0)
+                                                    .color(palette.palette_hint),
+                                            );
+                                        }
+                                        ui.label(
+                                            RichText::new(download_engine_label(
+                                                download.engine,
+                                                download.segments,
+                                            ))
+                                            .size(11.0)
+                                            .color(palette.text),
+                                        );
+                                        // "Remove info" only forgets the SQLite
+                                        // row and UI state; the file on disk is
+                                        // never deleted by this action.
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                if compact_icon_button(
+                                                    ui,
+                                                    RailIcon::Delete,
+                                                    "Remove info",
+                                                    palette,
+                                                    false,
+                                                )
+                                                .clicked()
+                                                {
+                                                    actions.push(UiAction::RemoveDownload {
+                                                        download_id: download.id,
+                                                    });
+                                                }
+                                            },
+                                        );
+                                    });
+                                    if !download.full_path.is_empty() {
+                                        ui.label(
+                                            RichText::new(truncate_title(&download.full_path, 48))
+                                                .size(10.0)
+                                                .color(palette.text),
+                                        );
+                                    }
+                                }
+                            });
+                    })
+                    .response
+                    .rect
+                    .expand(8.0);
+            });
+
+        let outside_click = ctx.input(|i| {
+            command_palette_click_outside(
+                card_rect,
+                i.pointer.latest_pos(),
+                i.pointer.primary_clicked(),
+            )
+        });
+        if outside_click {
+            state.close_downloads();
+        }
+    }
+
     /// Draw the native Settings card in the shared transparent overlay.
     ///
     /// Controls commit immediately to `ChromeState` and emit one
@@ -2281,9 +3046,69 @@ impl ChromeRenderer {
                                 ui.add_space(10.0);
                                 ui.separator();
                                 ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("STARTUP")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(palette.section_label),
+                                );
+                                ui.add_space(3.0);
+                                ui.label("Open on launch:");
+                                ui.horizontal(|ui| {
+                                    for behavior in WorkspaceStartupBehavior::ALL {
+                                        ui.radio_value(
+                                            &mut draft.workspace_startup,
+                                            behavior,
+                                            behavior.label(),
+                                        );
+                                    }
+                                });
+                                ui.label(
+                                    RichText::new(
+                                        "Last used space restores where you left off; Default space always opens the space selected in Workspaces.",
+                                    )
+                                    .size(10.0)
+                                    .color(palette.palette_hint),
+                                );
+                                ui.add_space(4.0);
                                 ui.checkbox(
                                     &mut draft.rail_expanded,
                                     "Expand the workspace rail on startup",
+                                );
+
+                                ui.add_space(10.0);
+                                ui.separator();
+                                ui.add_space(6.0);
+                                ui.label(
+                                    RichText::new("DOWNLOADS")
+                                        .size(10.0)
+                                        .strong()
+                                        .color(palette.section_label),
+                                );
+                                ui.add_space(3.0);
+                                ui.checkbox(
+                                    &mut draft.ask_where_to_save,
+                                    "Ask where to save each file",
+                                );
+                                ui.add_space(3.0);
+                                ui.add_enabled(
+                                    !draft.ask_where_to_save,
+                                    egui::Label::new("Download folder (leave empty for the default Downloads folder):"),
+                                );
+                                ui.add_enabled(
+                                    !draft.ask_where_to_save,
+                                    egui::TextEdit::singleline(&mut draft.download_directory)
+                                        .desired_width(320.0)
+                                        .hint_text("~/Downloads"),
+                                );
+                                ui.label(
+                                    RichText::new(if draft.ask_where_to_save {
+                                        "The save dialog chooses the destination while this is enabled."
+                                    } else {
+                                        "Files are saved automatically to the folder above."
+                                    })
+                                    .size(10.0)
+                                    .color(palette.palette_hint),
                                 );
                                 }
                                 SettingsTab::Workspaces => {
@@ -3295,10 +4120,13 @@ impl ChromeOverlayRenderer {
         let mut actions = Vec::new();
         let mut raw_input = self.egui_state.take_egui_input(window);
         // Only one surface may own the shared overlay. Settings has priority,
-        // then the context menu, then the command palette.
+        // then the context menu, then the command palette, then the downloads
+        // bubble. `ChromeState` openers are mutually exclusive, so this is only
+        // a defensive ordering for state restored between frames.
         let settings_open = state.settings_open;
         let menu_open = state.menu.is_some() && !settings_open;
         let palette_open = state.command_palette_open && !menu_open && !settings_open;
+        let downloads_open = state.downloads_open && !palette_open && !menu_open && !settings_open;
         let focus_before = state.command_palette_focus_requested && palette_open;
         let select_all_before = state.command_palette_select_all_requested && palette_open;
         state.apply_visuals(&self.egui_ctx);
@@ -3326,6 +4154,8 @@ impl ChromeOverlayRenderer {
                 ChromeRenderer::build_tab_menu(ctx, state, &mut actions);
             } else if palette_open {
                 ChromeRenderer::build_command_palette(ctx, state, &mut actions, focus_command);
+            } else if downloads_open {
+                ChromeRenderer::build_downloads_bubble(ctx, state, &mut actions);
             }
         });
         // The rail button raises this flag during the main window's render,
@@ -3537,20 +4367,20 @@ impl TooltipRenderer {
                     Frame::none()
                         .fill(palette.tooltip_bg)
                         .stroke(Stroke::new(1.0_f32, palette.tooltip_border))
-                        .rounding(Rounding::same(8.0))
-                        .inner_margin(egui::Margin::symmetric(10.0, 9.0))
+                        .rounding(Rounding::same(6.0))
+                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
                         .show(ui, |ui| {
                             // Fill the whole overlay window so the visible card is
                             // vertically centered on the hovered tab row. A plain
                             // label sizes the frame to its text and leaves the card
                             // pinned near the top of the taller transparent window.
                             let inner_size = vec2(
-                                (card.width - 20.0).max(80.0),
-                                (card.height - 18.0).max(12.0),
+                                (card.width - 16.0).max(80.0),
+                                (card.height - 12.0).max(10.0),
                             );
                             let (rect, _) = ui.allocate_exact_size(inner_size, Sense::hover());
                             let lines: Vec<&str> = card.text.lines().collect();
-                            let line_height = 17.0_f32;
+                            let line_height = 15.0_f32;
                             let total_height = lines.len() as f32 * line_height;
                             let first_line_y =
                                 rect.center().y - total_height * 0.5 + line_height * 0.5;
@@ -3562,7 +4392,7 @@ impl TooltipRenderer {
                                     ),
                                     Align2::CENTER_CENTER,
                                     *line,
-                                    FontId::proportional(12.0),
+                                    FontId::proportional(11.0),
                                     palette.tooltip_text,
                                 );
                             }
@@ -3647,9 +4477,11 @@ impl TooltipRenderer {
 fn rail_icon_glyph(icon: RailIcon) -> &'static str {
     use egui_material_icons::icons::{
         ICON_ADD, ICON_BEDTIME, ICON_BOOK, ICON_BOOKMARK_ADD, ICON_CHECK, ICON_CHEVRON_LEFT,
-        ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_CODE, ICON_DELETE, ICON_EDIT, ICON_MEMORY,
-        ICON_MUSIC_NOTE, ICON_OPEN_IN_NEW, ICON_PALETTE, ICON_PIN, ICON_PUBLIC, ICON_PUSH_PIN,
-        ICON_ROCKET, ICON_SCHOOL, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD, ICON_STAR, ICON_WORK,
+        ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_CODE, ICON_CONTENT_COPY, ICON_DELETE, ICON_DOWNLOAD,
+        ICON_EDIT, ICON_FOLDER_OPEN, ICON_MEMORY, ICON_MUSIC_NOTE, ICON_OPEN_IN_NEW, ICON_PALETTE,
+        ICON_PAUSE, ICON_PIN, ICON_PLAY_ARROW, ICON_PUBLIC, ICON_PUSH_PIN, ICON_REFRESH,
+        ICON_ROCKET, ICON_SCHOOL, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD, ICON_STAR,
+        ICON_VIEW_SIDEBAR, ICON_WORK,
     };
 
     match icon {
@@ -3665,7 +4497,14 @@ fn rail_icon_glyph(icon: RailIcon) -> &'static str {
         RailIcon::Close => ICON_CLOSE,
         RailIcon::Pin => ICON_PUSH_PIN,
         RailIcon::PinOff => ICON_PIN,
+        RailIcon::Copy => ICON_CONTENT_COPY,
+        RailIcon::Sidebar => ICON_VIEW_SIDEBAR,
         RailIcon::Settings => ICON_SETTINGS,
+        RailIcon::Download => ICON_DOWNLOAD,
+        RailIcon::Pause => ICON_PAUSE,
+        RailIcon::Play => ICON_PLAY_ARROW,
+        RailIcon::Retry => ICON_REFRESH,
+        RailIcon::FolderOpen => ICON_FOLDER_OPEN,
         RailIcon::Check => ICON_CHECK,
         RailIcon::Delete => ICON_DELETE,
         RailIcon::Star => ICON_STAR,
@@ -3739,6 +4578,64 @@ fn material_button(
     ui.add_enabled(enabled, button)
 }
 
+/// A small, transparent icon-only button used by dense download rows. Hover
+/// feedback comes from the glyph colour and egui's own tooltip, so no filled
+/// background competes with the transfer progress text.
+fn compact_icon_button(
+    ui: &mut Ui,
+    icon: RailIcon,
+    label: &'static str,
+    palette: &ChromePalette,
+    prominent: bool,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::click());
+    let color = if prominent || response.hovered() {
+        palette.text_strong
+    } else {
+        palette.text
+    };
+    let icon_rect = egui::Rect::from_center_size(rect.center(), vec2(14.0, 14.0));
+    paint_rail_icon(ui, icon_rect, icon, color);
+    response.on_hover_text(label)
+}
+
+/// Paint the active-transfer count (or a quiet history dot) over the rail's
+/// Downloads button. It is drawn directly on the native rail, not in a second
+/// view, so it tracks download snapshots on the same frame as the bubble.
+fn paint_download_badge(
+    ui: &Ui,
+    rect: egui::Rect,
+    badge: DownloadBadge,
+    palette: &ChromePalette,
+    collapsed: bool,
+) {
+    let inset = if collapsed { 4.0 } else { 8.0 };
+    let center = pos2(rect.right() - inset, rect.top() + inset);
+    match badge {
+        DownloadBadge::Hidden => {}
+        DownloadBadge::History => {
+            ui.painter().circle_filled(center, 4.0, palette.shield_ok);
+        }
+        DownloadBadge::Active(count) => {
+            let radius = if collapsed { 7.5 } else { 9.0 };
+            let text = if count > 99 {
+                "99+".to_string()
+            } else {
+                count.to_string()
+            };
+            ui.painter()
+                .circle_filled(center, radius, palette.rail_accent);
+            ui.painter().text(
+                center,
+                Align2::CENTER_CENTER,
+                text,
+                FontId::new(9.0, FontFamily::Proportional),
+                palette.text_strong,
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure chrome helpers (unit-tested)
 // ---------------------------------------------------------------------------
@@ -3794,6 +4691,28 @@ pub fn rail_menu_anchor(
     let x = pointer.x.clamp(min_x, max_x);
     let max_y = (screen.bottom() - menu_height - 6.0).max(screen.top() + 6.0);
     let y = (pointer.y - 8.0).clamp(screen.top() + 6.0, max_y);
+    pos2(x, y)
+}
+
+/// Fixed card size for the downloads bubble. Both dimensions stay finite so
+/// egui can cache the `Area` size without poisoning later frames.
+pub fn downloads_bubble_size(screen: egui::Rect) -> egui::Vec2 {
+    vec2(
+        DOWNLOADS_WIDTH.min((screen.width() - 24.0).max(180.0)),
+        DOWNLOADS_MAX_HEIGHT.min((screen.height() - 24.0).max(140.0)),
+    )
+}
+
+/// Anchor the downloads bubble beside the rail near the bottom of the window,
+/// where its rail button lives in both rail modes. The position is clamped to
+/// the visible screen so small windows never push the card off-screen.
+pub fn downloads_bubble_anchor(screen: egui::Rect, rail_right: f32) -> egui::Pos2 {
+    let size = downloads_bubble_size(screen);
+    let min_x = screen.left() + 4.0;
+    let max_x = (screen.right() - size.x - 4.0).max(min_x);
+    let x = (rail_right + DOWNLOADS_RAIL_GAP).clamp(min_x, max_x);
+    let max_y = (screen.bottom() - size.y - 4.0).max(screen.top() + 4.0);
+    let y = (screen.bottom() - DOWNLOADS_BOTTOM_MARGIN - size.y).clamp(screen.top() + 4.0, max_y);
     pos2(x, y)
 }
 
@@ -4095,6 +5014,12 @@ pub fn command_palette_items(
             subtitle: "Theme, search, privacy, and performance".to_string(),
             action: CommandAction::OpenSettings,
         });
+        items.push(CommandPaletteItem {
+            icon: "⇩",
+            label: "Open Downloads".to_string(),
+            subtitle: "Native parallel downloads and history".to_string(),
+            action: CommandAction::OpenDownloads,
+        });
         items.extend(tabs.iter().take(12).map(tab_item));
         return items;
     }
@@ -4164,6 +5089,15 @@ pub fn command_palette_items(
         });
     }
 
+    if needle.contains("download") {
+        items.push(CommandPaletteItem {
+            icon: "⇩",
+            label: "Open Downloads".to_string(),
+            subtitle: "Native parallel downloads and history".to_string(),
+            action: CommandAction::OpenDownloads,
+        });
+    }
+
     if needle.contains("pin") {
         if let Some(item) = pin_item() {
             items.push(item);
@@ -4189,13 +5123,14 @@ fn apply_command_item(
             actions.push(UiAction::TogglePinTab { tab_id: *tab_id })
         }
         CommandAction::HibernateAll => actions.push(UiAction::HibernateAllBackground),
-        CommandAction::ToggleRail => state.toggle_rail(),
+        CommandAction::ToggleRail => state.toggle_rail(actions),
         CommandAction::OpenDevTools => {
             if let Some(tab_id) = state.active_tab_id {
                 actions.push(UiAction::OpenDevTools { tab_id });
             }
         }
         CommandAction::OpenSettings => state.open_settings(),
+        CommandAction::OpenDownloads => state.open_downloads(),
     }
     state.close_command_palette();
 }
@@ -4267,23 +5202,25 @@ mod tests {
 
     use super::{
         advance_command_selection, apply_command_item, clamp_command_selection,
-        command_palette_click_outside, command_palette_items, effective_theme,
-        focus_request_after_render, loading_spinner_angle, loading_spinner_point,
-        page_tooltip_anchor, palette_row_fill, preferred_surface_format, rail_menu_anchor,
-        rail_menu_click_outside, rail_menu_items, rail_menu_metrics, rail_menu_ui_action,
-        rail_status_icon_size, rail_tooltip_enabled, rail_tooltip_metrics, resolve_omnibox,
-        resolve_omnibox_with_search, tab_close_center, tab_status_center, truncate_title,
-        workspace_form_actions, ChromePalette, ChromeState, ChromeTheme, CommandAction,
-        RailMenuAction, SettingsTab, TabDisplayState, TabInfo, WorkspaceInfo,
-        RAIL_STATUS_BADGE_HEIGHT, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED,
-        RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED,
-        TOOLTIP_WIDTH,
+        command_palette_click_outside, command_palette_items, download_engine_label,
+        download_eta_label, download_rail_badge, download_row_uses_progress_bar,
+        download_state_label, downloads_bubble_anchor, downloads_bubble_size, effective_theme,
+        focus_request_after_render, format_download_bytes, loading_spinner_angle,
+        loading_spinner_point, page_tooltip_anchor, palette_row_fill, preferred_surface_format,
+        rail_menu_anchor, rail_menu_click_outside, rail_menu_items, rail_menu_metrics,
+        rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled, rail_tooltip_metrics,
+        resolve_omnibox, resolve_omnibox_with_search, tab_close_center, tab_status_center,
+        truncate_title, workspace_form_actions, ChromePalette, ChromeRenderer, ChromeState,
+        ChromeTheme, CommandAction, DownloadBadge, DownloadSummary, RailMenuAction, SettingsTab,
+        TabDisplayState, TabInfo, WorkspaceInfo, RAIL_STATUS_BADGE_HEIGHT, RAIL_STATUS_HEIGHT,
+        RAIL_STATUS_ICON_COLLAPSED, RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED,
+        TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
     };
     use crate::config::{
         BrowserPreferences, SearchEngine, ThemePreference, WorkspaceColor, WorkspaceIcon,
-        DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX, RAIL_WIDTH_COLLAPSED,
+        DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX, RAIL_WIDTH_COLLAPSED, RAIL_WIDTH_EXPANDED,
     };
-    use crate::events::UiAction;
+    use crate::events::{DownloadEngine, DownloadInfo, DownloadState, UiAction};
 
     fn tab(id: u64, title: &str, url: &str) -> TabInfo {
         TabInfo {
@@ -4411,12 +5348,17 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_tooltips_are_readable_and_render_over_the_page() {
+    fn collapsed_tooltips_are_compact_translucent_and_render_over_the_page() {
         let (width, height) = rail_tooltip_metrics(false);
         assert_eq!(width, TOOLTIP_WIDTH);
         assert_eq!(height, TOOLTIP_HEIGHT_COLLAPSED);
-        assert!(width >= 260.0);
-        assert!(height >= 48.0);
+        assert!((150.0..=220.0).contains(&width));
+        assert!((30.0..=48.0).contains(&height));
+
+        for palette in [ChromePalette::DARK, ChromePalette::LIGHT] {
+            let [_, _, _, alpha] = palette.tooltip_bg.to_array();
+            assert!(alpha < 255, "tooltip background must be translucent");
+        }
 
         let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(44.0, 800.0));
         let row = egui::Rect::from_min_size(pos2(3.0, 120.0), vec2(38.0, 44.0));
@@ -4446,6 +5388,56 @@ mod tests {
     }
 
     #[test]
+    fn rail_address_field_stays_inside_expanded_rail() {
+        let ctx = egui::Context::default();
+        let palette = ChromePalette::DARK;
+        let mut state = ChromeState::default();
+        state.omnibox_text =
+            "https://example.com/a/very/long/path/that/must/not/push/the/frame/outside".to_string();
+        let mut actions = Vec::new();
+        let mut field_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(0.0, 0.0));
+        let mut rail_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(0.0, 0.0));
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    pos2(0.0, 0.0),
+                    vec2(1280.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::SidePanel::left("rail_address_field_test")
+                    .exact_width(RAIL_WIDTH_EXPANDED)
+                    .resizable(false)
+                    .frame(egui::Frame::none())
+                    .show(ctx, |ui| {
+                        let response = ChromeRenderer::build_rail_address_field(
+                            ui,
+                            ctx,
+                            &mut state,
+                            &mut actions,
+                            &palette,
+                        );
+                        field_rect = response.rect;
+                        rail_rect = ui.clip_rect();
+                    });
+            },
+        );
+
+        assert!(
+            field_rect.max.x <= rail_rect.max.x + 0.5,
+            "URL frame overflows the rail: {field_rect:?} vs {rail_rect:?}"
+        );
+        assert!(
+            field_rect.width() <= RAIL_WIDTH_EXPANDED + 0.5,
+            "URL frame is wider than the rail: {:?}",
+            field_rect.width()
+        );
+        assert!(actions.is_empty());
+    }
+
+    #[test]
     fn collapsed_status_icons_scale_up_for_the_narrow_rail() {
         assert_eq!(rail_status_icon_size(true), RAIL_STATUS_ICON_EXPANDED);
         assert_eq!(rail_status_icon_size(false), RAIL_STATUS_ICON_COLLAPSED);
@@ -4455,11 +5447,16 @@ mod tests {
 
     #[test]
     fn collapsed_status_badges_fit_inside_the_reserved_block() {
+        // Collapse/expand, hibernate, Settings, Downloads, shield and RAM rows.
         let used_height = 5.0
             + 30.0
             + 4.0
             + 30.0
             + 4.0
+            + 30.0
+            + 4.0
+            + 30.0
+            + 5.0
             + RAIL_STATUS_BADGE_HEIGHT
             + 3.0
             + RAIL_STATUS_BADGE_HEIGHT;
@@ -4651,7 +5648,50 @@ mod tests {
         assert_eq!(items[2].action, CommandAction::HibernateAll);
         assert_eq!(items[3].action, CommandAction::ToggleRail);
         assert_eq!(items[4].action, CommandAction::OpenSettings);
-        assert_eq!(items[5].action, CommandAction::SelectTab(1));
+        assert_eq!(items[5].action, CommandAction::OpenDownloads);
+        assert_eq!(items[6].action, CommandAction::SelectTab(1));
+    }
+
+    #[test]
+    fn palette_finds_the_downloads_bubble() {
+        let items = command_palette_items("download", &[], None, &BrowserPreferences::default());
+        assert!(items
+            .iter()
+            .any(|item| item.action == CommandAction::OpenDownloads));
+    }
+
+    #[test]
+    fn download_labels_and_sizes_are_native_readable() {
+        assert_eq!(
+            download_state_label(DownloadState::InProgress),
+            "Downloading"
+        );
+        assert_eq!(download_state_label(DownloadState::Completed), "Completed");
+        assert_eq!(format_download_bytes(0), "0 B");
+        assert_eq!(format_download_bytes(-5), "0 B");
+        assert_eq!(format_download_bytes(512), "512 B");
+        assert_eq!(format_download_bytes(2048), "2.0 KB");
+        assert_eq!(format_download_bytes(3 * 1024 * 1024), "3.0 MB");
+        assert_eq!(
+            download_engine_label(DownloadEngine::Parallel, 8),
+            "Parallel · 8 connections"
+        );
+        assert_eq!(download_engine_label(DownloadEngine::Parallel, 1), "Native");
+        assert_eq!(download_engine_label(DownloadEngine::Cef, 1), "CEF");
+    }
+
+    #[test]
+    fn download_eta_formats_remaining_time() {
+        assert_eq!(download_eta_label(0, 1_000, 100), "ETA 10s");
+        assert_eq!(download_eta_label(0, 120_000, 1_000), "ETA 2m 0s");
+        assert_eq!(download_eta_label(0, 7_200_000, 1_000), "ETA 2h 0m");
+    }
+
+    #[test]
+    fn download_eta_is_hidden_without_usable_speed_or_remaining_bytes() {
+        assert_eq!(download_eta_label(0, 1_000, 0), "");
+        assert_eq!(download_eta_label(0, 0, 100), "");
+        assert_eq!(download_eta_label(1_000, 1_000, 100), "");
     }
 
     #[test]
@@ -4846,6 +5886,19 @@ mod tests {
     }
 
     #[test]
+    fn rail_toggle_emits_a_persistable_action() {
+        let mut state = ChromeState::default();
+        let initial = state.rail_expanded;
+        let mut actions = Vec::new();
+        state.toggle_rail(&mut actions);
+
+        assert_eq!(state.rail_expanded, !initial);
+        assert!(
+            matches!(actions.as_slice(), [UiAction::SetRailExpanded(expanded)] if *expanded == state.rail_expanded)
+        );
+    }
+
+    #[test]
     fn settings_overlay_is_exclusive_and_dismissable() {
         let mut state = ChromeState::default();
         state.omnibox_text = "https://example.com".to_string();
@@ -4876,6 +5929,179 @@ mod tests {
         state.close_settings();
         state.open_settings();
         assert_eq!(state.settings_tab, SettingsTab::General);
+    }
+
+    fn bubble_download(id: u32, state: DownloadState) -> DownloadInfo {
+        DownloadInfo {
+            id,
+            tab_id: 1,
+            url: format!("https://example.com/file-{id}.zip"),
+            suggested_name: format!("file-{id}.zip"),
+            full_path: format!("/Users/test/Downloads/file-{id}.zip"),
+            received_bytes: 25 * i64::from(id),
+            total_bytes: 100,
+            percent_complete: (25 * id) as i32,
+            current_speed: 4096,
+            state,
+            engine: DownloadEngine::Parallel,
+            segments: 8,
+            temp_path: format!("/Users/test/Downloads/file-{id}.zip.kasumi.part"),
+            started_at: 100,
+            updated_at: 100,
+        }
+    }
+
+    #[test]
+    fn downloads_bubble_renders_multiple_downloads_without_invalid_layout() {
+        let ctx = egui::Context::default();
+        let mut state = ChromeState::default();
+        state.open_downloads();
+        state
+            .downloads
+            .push(bubble_download(1, DownloadState::InProgress));
+        state
+            .downloads
+            .push(bubble_download(2, DownloadState::Paused));
+        state
+            .downloads
+            .push(bubble_download(3, DownloadState::Completed));
+        let mut actions = Vec::new();
+
+        // egui caches an Area's measured size. Render several frames so a widget
+        // that reports an infinite width cannot poison the next frame's centering
+        // math with a NaN max rect.
+        for _ in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        pos2(0.0, 0.0),
+                        vec2(1280.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| ChromeRenderer::build_downloads_bubble(ctx, &mut state, &mut actions),
+            );
+            if let Some(area) =
+                egui::AreaState::load(&ctx, egui::Id::new("kasumi_downloads_bubble"))
+            {
+                let size = area.size.unwrap_or_default();
+                assert!(
+                    size.x.is_finite() && size.y.is_finite(),
+                    "Downloads bubble area size must stay finite: {size:?}"
+                );
+            }
+        }
+
+        assert!(actions.is_empty());
+        assert!(state.downloads_open);
+    }
+
+    #[test]
+    fn download_summary_aggregates_multiple_downloads() {
+        let downloads = vec![
+            bubble_download(1, DownloadState::InProgress),
+            bubble_download(2, DownloadState::Paused),
+            bubble_download(3, DownloadState::Completed),
+            bubble_download(4, DownloadState::Canceled),
+        ];
+        let summary = DownloadSummary::from_downloads(&downloads);
+
+        assert_eq!(summary.active, 2);
+        assert_eq!(summary.completed, 1);
+        assert_eq!(summary.failed, 1);
+        // Canceled rows are excluded from the aggregate byte totals.
+        assert_eq!(summary.received, 25 + 50 + 75);
+        assert_eq!(summary.total, 300);
+        // Only the in-progress row contributes speed.
+        assert_eq!(summary.speed, 4096);
+        assert_eq!(summary.status_text(), "2 active · 1 done · 1 failed");
+
+        let mut unknown = bubble_download(1, DownloadState::InProgress);
+        unknown.total_bytes = 0;
+        assert_eq!(DownloadSummary::from_downloads(&[unknown]).percent(), 0);
+    }
+
+    #[test]
+    fn finished_download_rows_drop_the_progress_bar() {
+        assert!(download_row_uses_progress_bar(DownloadState::InProgress));
+        assert!(download_row_uses_progress_bar(DownloadState::Paused));
+        assert!(!download_row_uses_progress_bar(DownloadState::Completed));
+        assert!(!download_row_uses_progress_bar(DownloadState::Canceled));
+        assert!(!download_row_uses_progress_bar(DownloadState::Interrupted));
+    }
+
+    #[test]
+    fn download_rail_badge_tracks_active_transfers_and_history() {
+        assert_eq!(download_rail_badge(&[]), DownloadBadge::Hidden);
+
+        let history = vec![bubble_download(1, DownloadState::Completed)];
+        assert_eq!(download_rail_badge(&history), DownloadBadge::History);
+
+        let active = vec![
+            bubble_download(1, DownloadState::InProgress),
+            bubble_download(2, DownloadState::Paused),
+            bubble_download(3, DownloadState::Completed),
+        ];
+        assert_eq!(download_rail_badge(&active), DownloadBadge::Active(2));
+    }
+
+    #[test]
+    fn downloads_bubble_state_is_exclusive_and_dismissable() {
+        let mut state = ChromeState::default();
+
+        state.open_downloads();
+        assert!(state.downloads_open);
+        assert!(state.has_overlay());
+        assert!(!state.settings_open);
+        assert!(!state.command_palette_open);
+
+        state.open_command_palette();
+        assert!(!state.downloads_open);
+        assert!(state.command_palette_open);
+
+        state.open_downloads();
+        state.open_settings();
+        assert!(!state.downloads_open);
+        assert!(state.settings_open);
+
+        state.open_downloads();
+        state.open_tab_menu(1, pos2(80.0, 120.0));
+        assert!(!state.downloads_open);
+        assert!(state.menu.is_some());
+
+        state.open_downloads();
+        state.close_active_overlay();
+        assert!(!state.downloads_open);
+        assert!(!state.has_overlay());
+
+        state.toggle_downloads();
+        assert!(state.downloads_open);
+        state.toggle_downloads();
+        assert!(!state.downloads_open);
+    }
+
+    #[test]
+    fn downloads_bubble_anchor_stays_beside_rail_and_inside_the_window() {
+        let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
+        let size = downloads_bubble_size(screen);
+        assert!(size.x.is_finite() && size.y.is_finite());
+
+        let expanded = downloads_bubble_anchor(screen, 180.0);
+        assert!(expanded.x >= 180.0);
+        assert!(expanded.y >= screen.top());
+        assert!(expanded.y + size.y <= screen.bottom());
+
+        let collapsed = downloads_bubble_anchor(screen, 44.0);
+        assert!(collapsed.x < expanded.x);
+        assert!(collapsed.x >= 44.0);
+
+        let small = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(220.0, 180.0));
+        let small_size = downloads_bubble_size(small);
+        let anchor = downloads_bubble_anchor(small, 180.0);
+        assert!(anchor.x >= small.left());
+        assert!(anchor.y >= small.top());
+        assert!(anchor.x + small_size.x <= small.right());
+        assert!(anchor.y + small_size.y <= small.bottom());
     }
 
     #[test]

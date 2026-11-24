@@ -18,6 +18,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::config::{
     BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, PREFERENCES_DB_KEY,
 };
+use crate::events::{DownloadEngine, DownloadInfo, DownloadState};
 
 #[derive(Debug, Clone)]
 pub struct SessionTabSnapshot {
@@ -74,6 +75,13 @@ pub enum DbCommand {
     SavePreferences {
         preferences: BrowserPreferences,
     },
+    SaveDownload {
+        item: DownloadInfo,
+    },
+    RemoveDownload {
+        download_id: u32,
+    },
+    ClearCompletedDownloads,
     FlushWal,
 }
 
@@ -120,6 +128,18 @@ impl StorageHandle {
         self.send(DbCommand::SavePreferences { preferences });
     }
 
+    pub fn save_download(&self, item: DownloadInfo) {
+        self.send(DbCommand::SaveDownload { item });
+    }
+
+    pub fn remove_download(&self, download_id: u32) {
+        self.send(DbCommand::RemoveDownload { download_id });
+    }
+
+    pub fn clear_completed_downloads(&self) {
+        self.send(DbCommand::ClearCompletedDownloads);
+    }
+
     pub fn flush_wal(&self) {
         self.send(DbCommand::FlushWal);
     }
@@ -143,6 +163,25 @@ impl StorageManager {
 
         let conn = Connection::open(db_path)?;
         conn.execute_batch(include_str!("schema.sql"))?;
+
+        // The native segmented engine was added in the same 0.7 release as the
+        // downloads table. Existing development databases still get an in-place
+        // migration so `SaveDownload` never references a missing column.
+        if !table_has_column(&conn, "downloads", "engine")? {
+            conn.execute_batch(
+                "ALTER TABLE downloads ADD COLUMN engine TEXT NOT NULL DEFAULT 'cef';",
+            )?;
+        }
+        if !table_has_column(&conn, "downloads", "segments")? {
+            conn.execute_batch(
+                "ALTER TABLE downloads ADD COLUMN segments INTEGER NOT NULL DEFAULT 1;",
+            )?;
+        }
+        if !table_has_column(&conn, "downloads", "temp_path")? {
+            conn.execute_batch(
+                "ALTER TABLE downloads ADD COLUMN temp_path TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
 
         // Databases created by the first Workspaces build predate the default
         // workspace flag. Add it before any statement references the column;
@@ -338,6 +377,52 @@ impl StorageManager {
             }
         }
         Ok(bookmarks)
+    }
+
+    /// Load persisted downloads, newest first, for the native downloads bubble.
+    pub fn load_downloads(db_path: &Path) -> Result<Vec<DownloadInfo>, rusqlite::Error> {
+        let conn = Self::init_db(db_path)?;
+        // CEF download callbacks never survive a restart. Normalize stale
+        // active rows so the bubble offers Retry instead of dead controls.
+        conn.execute(
+            "UPDATE downloads
+             SET state = 'interrupted', current_speed = 0
+             WHERE state IN ('in_progress', 'paused')",
+            [],
+        )?;
+        let mut stmt = conn.prepare(
+            "SELECT download_id, tab_id, url, suggested_name, full_path, state,
+                    received_bytes, total_bytes, percent_complete, current_speed,
+                    engine, segments, temp_path, started_at, updated_at
+             FROM downloads ORDER BY updated_at DESC, download_id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DownloadInfo {
+                id: row.get::<_, i64>(0)? as u32,
+                tab_id: row.get::<_, i64>(1)? as u64,
+                url: row.get(2)?,
+                suggested_name: row.get(3)?,
+                full_path: row.get(4)?,
+                state: DownloadState::from_str(&row.get::<_, String>(5)?),
+                received_bytes: row.get(6)?,
+                total_bytes: row.get(7)?,
+                percent_complete: row.get::<_, i64>(8)? as i32,
+                current_speed: row.get(9)?,
+                engine: DownloadEngine::from_str(&row.get::<_, String>(10)?),
+                segments: row.get::<_, i64>(11)? as u8,
+                temp_path: row.get(12)?,
+                started_at: row.get::<_, i64>(13)? as u64,
+                updated_at: row.get::<_, i64>(14)? as u64,
+            })
+        })?;
+
+        let mut downloads = Vec::new();
+        for row in rows {
+            if let Ok(item) = row {
+                downloads.push(item);
+            }
+        }
+        Ok(downloads)
     }
 
     /// Load persisted preferences. Corrupt or legacy data falls back to the
@@ -557,6 +642,68 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
                 tracing::warn!("Failed to save preferences: {e}");
             }
         }
+        DbCommand::SaveDownload { item } => {
+            let res = conn.execute(
+                "INSERT INTO downloads
+                 (download_id, tab_id, url, suggested_name, full_path, state,
+                  received_bytes, total_bytes, percent_complete, current_speed,
+                  engine, segments, temp_path, started_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                 ON CONFLICT(download_id) DO UPDATE SET
+                     tab_id = excluded.tab_id,
+                     url = excluded.url,
+                     suggested_name = excluded.suggested_name,
+                     full_path = excluded.full_path,
+                     state = excluded.state,
+                     received_bytes = excluded.received_bytes,
+                     total_bytes = excluded.total_bytes,
+                     percent_complete = excluded.percent_complete,
+                     current_speed = excluded.current_speed,
+                     engine = excluded.engine,
+                     segments = excluded.segments,
+                     temp_path = excluded.temp_path,
+                     started_at = excluded.started_at,
+                     updated_at = excluded.updated_at",
+                params![
+                    item.id as i64,
+                    item.tab_id as i64,
+                    item.url,
+                    item.suggested_name,
+                    item.full_path,
+                    item.state.as_str(),
+                    item.received_bytes,
+                    item.total_bytes,
+                    item.percent_complete as i64,
+                    item.current_speed,
+                    item.engine.as_str(),
+                    item.segments as i64,
+                    item.temp_path,
+                    item.started_at as i64,
+                    item.updated_at as i64,
+                ],
+            );
+            if let Err(e) = res {
+                tracing::warn!("Failed to save download: {}", e);
+            }
+        }
+        DbCommand::RemoveDownload { download_id } => {
+            let res = conn.execute(
+                "DELETE FROM downloads WHERE download_id = ?1",
+                params![download_id as i64],
+            );
+            if let Err(e) = res {
+                tracing::warn!("Failed to remove download: {}", e);
+            }
+        }
+        DbCommand::ClearCompletedDownloads => {
+            let res = conn.execute(
+                "DELETE FROM downloads WHERE state IN ('completed', 'canceled', 'interrupted')",
+                [],
+            );
+            if let Err(e) = res {
+                tracing::warn!("Failed to clear completed downloads: {}", e);
+            }
+        }
         DbCommand::FlushWal => {
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         }
@@ -586,6 +733,7 @@ fn run_worker_loop(db_path: PathBuf, mut rx: UnboundedReceiver<DbCommand>) {
 mod tests {
     use super::{apply_command, DbCommand, SessionTabSnapshot, StorageManager};
     use crate::config::{BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon};
+    use crate::events::{DownloadEngine, DownloadInfo, DownloadState};
     use rusqlite::params;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -638,6 +786,7 @@ mod tests {
             tables,
             vec![
                 "bookmarks",
+                "downloads",
                 "history",
                 "preferences",
                 "session_tabs",
@@ -891,6 +1040,9 @@ mod tests {
             adblock_enabled: false,
             idle_timeout_minutes: 15,
             search_engine: crate::config::SearchEngine::Google,
+            workspace_startup: crate::config::WorkspaceStartupBehavior::DefaultWorkspace,
+            download_directory: "/tmp/downloads".to_string(),
+            ask_where_to_save: true,
         };
         apply_command(
             &mut conn,
@@ -997,6 +1149,178 @@ mod tests {
             .expect("bookmark row");
         assert_eq!(title, "Updated");
         assert_eq!(folder, "Reading");
+
+        apply_command(&mut conn, DbCommand::FlushWal);
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    fn download(state: DownloadState, id: u32, updated_at: u64) -> DownloadInfo {
+        DownloadInfo {
+            id,
+            tab_id: 4,
+            url: "https://example.com/file.zip".to_string(),
+            suggested_name: "file.zip".to_string(),
+            full_path: "/Downloads/file.zip".to_string(),
+            received_bytes: 50,
+            total_bytes: 100,
+            percent_complete: 50,
+            current_speed: 2048,
+            state,
+            engine: DownloadEngine::Parallel,
+            segments: 4,
+            temp_path: "/Downloads/file.zip.kasumi.part".to_string(),
+            started_at: 100,
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn downloads_upsert_and_load_in_update_order() {
+        let (path, mut conn) = fresh_db("downloads-upsert");
+        apply_command(
+            &mut conn,
+            DbCommand::SaveDownload {
+                item: download(DownloadState::InProgress, 1, 10),
+            },
+        );
+        apply_command(
+            &mut conn,
+            DbCommand::SaveDownload {
+                item: download(DownloadState::Paused, 2, 30),
+            },
+        );
+        apply_command(
+            &mut conn,
+            DbCommand::SaveDownload {
+                item: download(DownloadState::Completed, 1, 40),
+            },
+        );
+
+        let loaded = StorageManager::load_downloads(&path).expect("load downloads");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].id, 1);
+        assert_eq!(loaded[0].state, DownloadState::Completed);
+        assert_eq!(loaded[0].updated_at, 40);
+        assert_eq!(loaded[0].engine, DownloadEngine::Parallel);
+        assert_eq!(loaded[0].segments, 4);
+        assert_eq!(loaded[0].temp_path, "/Downloads/file.zip.kasumi.part");
+        assert_eq!(loaded[1].id, 2);
+
+        apply_command(&mut conn, DbCommand::FlushWal);
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn init_db_migrates_legacy_downloads_with_parallel_columns() {
+        let path = test_db_path("downloads-migration");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("legacy database");
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE downloads (
+                     download_id INTEGER PRIMARY KEY,
+                     tab_id INTEGER NOT NULL DEFAULT 0,
+                     url TEXT NOT NULL,
+                     suggested_name TEXT NOT NULL DEFAULT '',
+                     full_path TEXT NOT NULL DEFAULT '',
+                     state TEXT NOT NULL DEFAULT 'in_progress',
+                     received_bytes INTEGER NOT NULL DEFAULT 0,
+                     total_bytes INTEGER NOT NULL DEFAULT 0,
+                     percent_complete INTEGER NOT NULL DEFAULT 0,
+                     current_speed INTEGER NOT NULL DEFAULT 0,
+                     started_at INTEGER NOT NULL DEFAULT 0,
+                     updated_at INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO downloads
+                     (download_id, url, suggested_name, full_path, state, updated_at)
+                 VALUES (7, 'https://legacy.example/file.zip', 'file.zip',
+                         '/Downloads/file.zip', 'completed', 9);",
+            )
+            .expect("legacy downloads schema");
+        }
+
+        let loaded = StorageManager::load_downloads(&path).expect("migrated downloads load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, 7);
+        assert_eq!(loaded[0].engine, DownloadEngine::Cef);
+        assert_eq!(loaded[0].segments, 1);
+        assert_eq!(loaded[0].temp_path, "");
+
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn stale_downloads_are_marked_interrupted_on_restart() {
+        let (path, mut conn) = fresh_db("downloads-restart");
+        apply_command(
+            &mut conn,
+            DbCommand::SaveDownload {
+                item: download(DownloadState::InProgress, 1, 10),
+            },
+        );
+        apply_command(
+            &mut conn,
+            DbCommand::SaveDownload {
+                item: download(DownloadState::Paused, 2, 20),
+            },
+        );
+        apply_command(
+            &mut conn,
+            DbCommand::SaveDownload {
+                item: download(DownloadState::Completed, 3, 30),
+            },
+        );
+
+        let loaded = StorageManager::load_downloads(&path).expect("load downloads");
+        assert_eq!(loaded.len(), 3);
+        assert!(loaded
+            .iter()
+            .all(|item| item.state != DownloadState::InProgress
+                && item.state != DownloadState::Paused));
+        assert_eq!(loaded[0].id, 3);
+        assert_eq!(loaded[0].state, DownloadState::Completed);
+        assert!(loaded[1..]
+            .iter()
+            .all(|item| item.state == DownloadState::Interrupted && item.current_speed == 0));
+
+        apply_command(&mut conn, DbCommand::FlushWal);
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn completed_downloads_can_be_removed_or_cleared() {
+        let (path, mut conn) = fresh_db("downloads-cleanup");
+        apply_command(
+            &mut conn,
+            DbCommand::SaveDownload {
+                item: download(DownloadState::InProgress, 1, 10),
+            },
+        );
+        apply_command(
+            &mut conn,
+            DbCommand::SaveDownload {
+                item: download(DownloadState::Completed, 2, 20),
+            },
+        );
+
+        apply_command(&mut conn, DbCommand::ClearCompletedDownloads);
+        let loaded = StorageManager::load_downloads(&path).expect("load downloads");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, 1);
+
+        apply_command(
+            &mut conn,
+            DbCommand::SaveDownload {
+                item: download(DownloadState::Canceled, 3, 30),
+            },
+        );
+        apply_command(&mut conn, DbCommand::RemoveDownload { download_id: 3 });
+        let loaded = StorageManager::load_downloads(&path).expect("load downloads");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, 1);
 
         apply_command(&mut conn, DbCommand::FlushWal);
         drop(conn);
