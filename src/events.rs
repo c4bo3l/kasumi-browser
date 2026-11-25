@@ -310,6 +310,9 @@ pub enum BrowserShortcut {
     OpenSettings,
     OpenDownloads,
     OpenBookmarkManager,
+    /// Copy the active page URL to the system clipboard. The clipboard is owned
+    /// by egui, so the shell defers the write to the next chrome frame.
+    CopyUrl,
     /// Gracefully close all CEF browsers and exit. Handled by the shell; CEF
     /// key forwarding deliberately never emits it because TabManager cannot
     /// exit the winit event loop.

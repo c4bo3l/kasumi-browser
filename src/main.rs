@@ -1,3 +1,4 @@
+#![allow(unused_unsafe)]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -29,14 +30,14 @@ use ui::chrome::{
 };
 use ui::platform_view::ContentRect;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{DeviceId, ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId, WindowLevel};
 
 /// Custom winit events used only by the macOS run-loop bridge. Other
 /// platforms keep the empty event type so the winit handler shape is shared.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum KasumiEvent {
     /// Sent after macOS CEF shutdown has run outside winit's single-entry
     /// event handler so the loop can exit safely.
@@ -47,6 +48,10 @@ enum KasumiEvent {
     /// loop so all UI mutations stay on the main thread.
     #[cfg(target_os = "macos")]
     NativeShortcut(BrowserShortcut),
+    /// Pointer movement captured while the CEF child view owns first-responder
+    /// focus. Coordinates are logical points in winit's flipped content view.
+    #[cfg(target_os = "macos")]
+    NativeMouseMoved { x: f64, y: f64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +303,8 @@ mod native_shortcuts {
     use block2::RcBlock;
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
-    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSKeyDownMask};
+    use objc2_app_kit::{NSEvent, NSEventMask, NSEventModifierFlags, NSView};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use std::ptr::NonNull;
 
     use super::{KasumiEvent, SHORTCUT_PROXY};
@@ -334,7 +340,62 @@ mod native_shortcuts {
 
         // SAFETY: the block's signature matches NSEvent's declared API, and the
         // returned monitor is retained by the caller for the app's lifetime.
-        unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSKeyDownMask, &handler) }
+        unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &handler)
+        }
+    }
+
+    /// Forward pointer movement from the main window while another view (the
+    /// CEF child view) is first responder. AppKit sends `mouseMoved:` to the
+    /// first responder, so winit's own view stops seeing moves after a page
+    /// click. A local event monitor receives them regardless.
+    pub(crate) fn install_mouse_monitor(
+        window: &winit::window::Window,
+    ) -> Option<Retained<AnyObject>> {
+        let Some(proxy) = SHORTCUT_PROXY.get().cloned() else {
+            tracing::warn!("Native mouse monitor skipped: event loop proxy unavailable");
+            return None;
+        };
+        let handle = window.window_handle().ok()?;
+        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+            return None;
+        };
+        let view_ptr = appkit.ns_view.as_ptr().cast::<NSView>();
+        if view_ptr.is_null() {
+            return None;
+        }
+        let view: &NSView = unsafe { &*view_ptr };
+        let mtm = objc2_foundation::MainThreadMarker::new()?;
+        let main_window = view.window()?;
+        let main_window_ptr = Retained::as_ptr(&main_window) as *const AnyObject;
+        tracing::info!(
+            "Native mouse monitor installed (window {:?})",
+            main_window_ptr
+        );
+
+        let handler: RcBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent> =
+            RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+                let event_ref = unsafe { event.as_ref() };
+                let Some(event_window) = (unsafe { event_ref.window(mtm) }) else {
+                    return event.as_ptr();
+                };
+                if Retained::as_ptr(&event_window) as *const AnyObject != main_window_ptr {
+                    return event.as_ptr();
+                }
+                let window_point = unsafe { event_ref.locationInWindow() };
+                let view_point = view.convertPoint_fromView(window_point, None);
+                let _ = proxy.send_event(KasumiEvent::NativeMouseMoved {
+                    x: view_point.x,
+                    y: view_point.y,
+                });
+                event.as_ptr()
+            });
+
+        // SAFETY: the block's signature matches NSEvent's declared API, and the
+        // returned monitor is retained by the caller for the app's lifetime.
+        unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::MouseMoved, &handler)
+        }
     }
 
     fn shortcut_from_event(event: &NSEvent) -> Option<BrowserShortcut> {
@@ -359,16 +420,17 @@ mod native_shortcuts {
             return Some(BrowserShortcut::OpenDevTools);
         }
 
-        let primary = flags.contains(NSEventModifierFlags::NSEventModifierFlagCommand)
-            || flags.contains(NSEventModifierFlags::NSEventModifierFlagControl);
-        let shift = flags.contains(NSEventModifierFlags::NSEventModifierFlagShift);
-        let option = flags.contains(NSEventModifierFlags::NSEventModifierFlagOption);
+        let primary = flags.contains(NSEventModifierFlags::Command)
+            || flags.contains(NSEventModifierFlags::Control);
+        let shift = flags.contains(NSEventModifierFlags::Shift);
+        let option = flags.contains(NSEventModifierFlags::Option);
         if !primary || option {
             return None;
         }
 
         match key {
             'b' if shift => Some(BrowserShortcut::OpenBookmarkManager),
+            'c' if shift => Some(BrowserShortcut::CopyUrl),
             't' if shift => Some(BrowserShortcut::ReopenClosedTab),
             't' => Some(BrowserShortcut::NewTab),
             'w' if !shift => Some(BrowserShortcut::CloseTab),
@@ -385,6 +447,11 @@ mod native_shortcuts {
 // ---------------------------------------------------------------------------
 // macOS CrAppControlProtocol – required before CEF initialization
 // ---------------------------------------------------------------------------
+#[cfg(target_os = "macos")]
+unsafe fn sel_to_ptr(sel: objc2::runtime::Sel) -> *const std::ffi::c_void {
+    std::mem::transmute::<objc2::runtime::Sel, *const std::ffi::c_void>(sel)
+}
+
 #[cfg(target_os = "macos")]
 fn setup_mac_application() {
     use std::ffi::{c_void, CString};
@@ -437,28 +504,30 @@ fn setup_mac_application() {
         let cls = objc2::ffi::objc_getClass(cls_name.as_ptr());
         if !cls.is_null() {
             let cls_mut = cls as *mut _;
-            let is_sel =
-                objc2::ffi::sel_registerName(CString::new("isHandlingSendEvent").unwrap().as_ptr());
+            let is_sel = objc2::runtime::Sel::register(
+                CString::new("isHandlingSendEvent").unwrap().as_c_str(),
+            );
             let types_is = CString::new("c@:").unwrap();
-            let imp_is: objc2::ffi::IMP =
-                Some(std::mem::transmute(is_handling_send_event as *const ()));
+            let imp_is: unsafe extern "C-unwind" fn() =
+                std::mem::transmute(is_handling_send_event as *const ());
             objc2::ffi::class_addMethod(cls_mut, is_sel, imp_is, types_is.as_ptr());
 
-            let set_sel = objc2::ffi::sel_registerName(
-                CString::new("setHandlingSendEvent:").unwrap().as_ptr(),
+            let set_sel = objc2::runtime::Sel::register(
+                CString::new("setHandlingSendEvent:").unwrap().as_c_str(),
             );
             let types_set = CString::new("v@:c").unwrap();
-            let imp_set: objc2::ffi::IMP =
-                Some(std::mem::transmute(set_handling_send_event as *const ()));
+            let imp_set: unsafe extern "C-unwind" fn() =
+                std::mem::transmute(set_handling_send_event as *const ());
             objc2::ffi::class_addMethod(cls_mut, set_sel, imp_set, types_set.as_ptr());
 
             // Target/action selectors for the native macOS File menu. The menu
             // is installed later, once the winit event loop proxy is ready.
             let register_action = |name: &str, imp: extern "C" fn(*mut c_void, *mut c_void)| {
-                let sel =
-                    objc2::ffi::sel_registerName(CString::new(name).unwrap_or_default().as_ptr());
+                let sel = objc2::runtime::Sel::register(
+                    CString::new(name).unwrap_or_default().as_c_str(),
+                );
                 let types = CString::new("v@:").unwrap_or_default();
-                let imp: objc2::ffi::IMP = Some(std::mem::transmute(imp as *const ()));
+                let imp: unsafe extern "C-unwind" fn() = std::mem::transmute(imp as *const ());
                 objc2::ffi::class_addMethod(cls_mut, sel, imp, types.as_ptr());
             };
             register_action("kasumiNewTab:", menu_new_tab);
@@ -474,11 +543,12 @@ fn setup_mac_application() {
             }
 
             // Trigger sharedApplication so the class is instantiated.
-            let shared_sel =
-                objc2::ffi::sel_registerName(CString::new("sharedApplication").unwrap().as_ptr());
+            let shared_sel = objc2::runtime::Sel::register(
+                CString::new("sharedApplication").unwrap().as_c_str(),
+            );
             let msg_send: unsafe extern "C" fn(*mut c_void, *const c_void) -> *mut c_void =
                 std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
-            let _ = msg_send(cls as *mut c_void, shared_sel as *const c_void);
+            let _ = msg_send(cls as *mut c_void, sel_to_ptr(shared_sel));
         }
     }
 }
@@ -510,7 +580,7 @@ fn install_macos_main_menu() {
     let app_menu = NSMenu::new(mtm);
     let app_version = NSMenuItem::new(mtm);
     unsafe {
-        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.8.0"));
+        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.8.1"));
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
@@ -576,11 +646,10 @@ unsafe fn set_macos_bundle_name(name: &str) {
     {
         let cls = objc2::ffi::objc_getClass(class_name.as_ptr());
         if !cls.is_null() {
-            let process_info_sel = objc2::ffi::sel_registerName(selector_name.as_ptr());
+            let process_info_sel = objc2::runtime::Sel::register(selector_name.as_c_str());
             let process_info_msg: unsafe extern "C" fn(*mut c_void, *const c_void) -> *mut c_void =
                 std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
-            let process_info =
-                process_info_msg(cls as *mut c_void, process_info_sel as *const c_void);
+            let process_info = process_info_msg(cls as *mut c_void, sel_to_ptr(process_info_sel));
             if !process_info.is_null() {
                 // `respondsToSelector:` returns a BOOL (u8 on Apple platforms).
                 let responds_msg: unsafe extern "C" fn(
@@ -588,19 +657,16 @@ unsafe fn set_macos_bundle_name(name: &str) {
                     *const c_void,
                     *const c_void,
                 ) -> u8 = std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
-                let responds_sel = objc2::ffi::sel_registerName(
+                let responds_sel = objc2::runtime::Sel::register(
                     CString::new("respondsToSelector:")
                         .unwrap_or_default()
-                        .as_ptr(),
+                        .as_c_str(),
                 );
                 for setter in ["setProcessName:", "setName:"] {
                     if let Ok(setter_name) = CString::new(setter) {
-                        let set_sel = objc2::ffi::sel_registerName(setter_name.as_ptr());
-                        if responds_msg(
-                            process_info,
-                            responds_sel as *const c_void,
-                            set_sel as *const c_void,
-                        ) == 0
+                        let set_sel = objc2::runtime::Sel::register(setter_name.as_c_str());
+                        if responds_msg(process_info, sel_to_ptr(responds_sel), sel_to_ptr(set_sel))
+                            == 0
                         {
                             continue;
                         }
@@ -611,7 +677,7 @@ unsafe fn set_macos_bundle_name(name: &str) {
                         ) = std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
                         set_name_msg(
                             process_info,
-                            set_sel as *const c_void,
+                            sel_to_ptr(set_sel),
                             &*value as *const objc2_foundation::NSString as *mut c_void,
                         );
                         break;
@@ -632,10 +698,10 @@ unsafe fn set_macos_bundle_name(name: &str) {
     let Ok(selector_name) = CString::new("standardUserDefaults") else {
         return;
     };
-    let standard_sel = objc2::ffi::sel_registerName(selector_name.as_ptr());
+    let standard_sel = objc2::runtime::Sel::register(selector_name.as_c_str());
     let standard: unsafe extern "C" fn(*mut c_void, *const c_void) -> *mut c_void =
         std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
-    let defaults = standard(cls as *mut c_void, standard_sel as *const c_void);
+    let defaults = standard(cls as *mut c_void, sel_to_ptr(standard_sel));
     if defaults.is_null() {
         return;
     }
@@ -643,7 +709,7 @@ unsafe fn set_macos_bundle_name(name: &str) {
     let Ok(setter_name) = CString::new("setObject:forKey:") else {
         return;
     };
-    let setter_sel = objc2::ffi::sel_registerName(setter_name.as_ptr());
+    let setter_sel = objc2::runtime::Sel::register(setter_name.as_c_str());
     let setter: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void, *mut c_void) =
         std::mem::transmute(objc2::ffi::objc_msgSend as *const ());
     // CEF reads these keys when deriving the process/app name. Seed every
@@ -652,7 +718,7 @@ unsafe fn set_macos_bundle_name(name: &str) {
         let key = objc2_foundation::NSString::from_str(key_name);
         setter(
             defaults,
-            setter_sel as *const c_void,
+            sel_to_ptr(setter_sel),
             &*value as *const objc2_foundation::NSString as *mut c_void,
             &*key as *const objc2_foundation::NSString as *mut c_void,
         );
@@ -721,6 +787,14 @@ struct KasumiBrowserHandler {
     // CEF child view owns keyboard focus.
     #[cfg(target_os = "macos")]
     shortcut_monitor: Option<objc2::rc::Retained<objc2::runtime::AnyObject>>,
+    /// Kept alive so pointer movement still reaches the chrome while CEF owns
+    /// first-responder focus.
+    #[cfg(target_os = "macos")]
+    mouse_monitor: Option<objc2::rc::Retained<objc2::runtime::AnyObject>>,
+    #[cfg(target_os = "macos")]
+    last_native_mouse_poll: std::time::Instant,
+    #[cfg(target_os = "macos")]
+    last_native_pointer: Option<(f64, f64)>,
 }
 
 impl KasumiBrowserHandler {
@@ -762,6 +836,12 @@ impl KasumiBrowserHandler {
             shutdown_finalization_requested: false,
             #[cfg(target_os = "macos")]
             shortcut_monitor: None,
+            #[cfg(target_os = "macos")]
+            mouse_monitor: None,
+            #[cfg(target_os = "macos")]
+            last_native_mouse_poll: std::time::Instant::now(),
+            #[cfg(target_os = "macos")]
+            last_native_pointer: None,
         }
     }
 
@@ -962,6 +1042,65 @@ impl KasumiBrowserHandler {
         }
     }
 
+    /// Poll the pointer at a modest rate as a fallback for macOS deliveries
+    /// that stop after CEF takes first-responder focus.
+    #[cfg(target_os = "macos")]
+    fn poll_native_mouse(&mut self, event_loop: &ActiveEventLoop) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_native_mouse_poll) < std::time::Duration::from_millis(16) {
+            return;
+        }
+        self.last_native_mouse_poll = now;
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let position = native_pointer_position(&window);
+        if position == self.last_native_pointer {
+            return;
+        }
+        self.last_native_pointer = position;
+        let scale = window.scale_factor();
+        if !scale.is_finite() || scale <= 0.0 {
+            return;
+        }
+        let event = match position {
+            Some((x, y)) => WindowEvent::CursorMoved {
+                device_id: DeviceId::dummy(),
+                position: winit::dpi::PhysicalPosition::new(x * scale, y * scale),
+            },
+            None => WindowEvent::CursorLeft {
+                device_id: DeviceId::dummy(),
+            },
+        };
+        if let Some(chrome) = self.chrome.as_mut() {
+            let _ = chrome.on_window_event(&window, &event);
+        }
+        window.request_redraw();
+        self.sync_tooltip_overlay(event_loop);
+    }
+
+    /// Inject a CEF-focus pointer move into the chrome input state.
+    #[cfg(target_os = "macos")]
+    fn forward_native_mouse_move(&mut self, event_loop: &ActiveEventLoop, x: f64, y: f64) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let scale = window.scale_factor();
+        if !scale.is_finite() || scale <= 0.0 {
+            return;
+        }
+        let position = winit::dpi::PhysicalPosition::new(x * scale, y * scale);
+        let cursor_event = WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position,
+        };
+        if let Some(chrome) = self.chrome.as_mut() {
+            let _ = chrome.on_window_event(&window, &cursor_event);
+        }
+        window.request_redraw();
+        self.sync_tooltip_overlay(event_loop);
+    }
+
     fn sync_tooltip_overlay(&mut self, event_loop: &ActiveEventLoop) {
         if self.shutdown_requested || self.chrome_state.has_overlay() {
             self.hide_tooltip_overlay();
@@ -1039,14 +1178,14 @@ impl KasumiBrowserHandler {
             ));
         }
         if !self.tooltip_visible {
-            // Focus the browser before ordering the inactive overlay front.
-            // Doing this after `set_visible` raised the main window above the
-            // tooltip on macOS, so the CEF child view hid it.
-            main.focus_window();
             overlay.set_visible(true);
             if let Err(e) = overlay.set_cursor_hittest(false) {
                 tracing::warn!("Tooltip overlay click-through unavailable: {e}");
             }
+            // `winit::Window::set_visible(true)` maps to
+            // `makeKeyAndOrderFront:` on macOS. Re-focus the browser so the
+            // page keeps keyboard input while the tooltip floats above it.
+            main.focus_window();
             self.tooltip_visible = true;
             tracing::debug!(
                 "Showing tooltip overlay at ({:.0}, {:.0}) size {:?}",
@@ -1120,6 +1259,11 @@ impl KasumiBrowserHandler {
             }
             BrowserShortcut::OpenBookmarkManager => {
                 self.chrome_state.open_bookmark_manager();
+            }
+            BrowserShortcut::CopyUrl => {
+                // The clipboard write itself happens in the next chrome frame,
+                // where egui owns the platform clipboard.
+                self.chrome_state.request_copy_url();
             }
             BrowserShortcut::Quit => self.request_shutdown(),
         }
@@ -1222,44 +1366,39 @@ fn pointer_is_past_rail(physical_x: f64, scale_factor: f64, rail_expanded: bool)
     scale_factor > 0.0 && physical_x / scale_factor >= rail_width(rail_expanded) as f64
 }
 
-/// Install a tracking area that reports pointer movement to winit's view even
-/// when the CEF child view owns first-responder (keyboard) focus.
+/// Read the current pointer position in winit's flipped content-view points.
 #[cfg(target_os = "macos")]
-fn install_mouse_moved_tracking(window: &Window) {
-    use objc2::runtime::AnyObject;
-    use objc2::ClassType;
-    use objc2_app_kit::{NSTrackingArea, NSTrackingAreaOptions, NSView};
-    use objc2_foundation::NSRect;
+fn native_pointer_position(window: &Window) -> Option<(f64, f64)> {
+    use objc2_app_kit::{NSEvent, NSView};
+    use objc2_foundation::NSPoint;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    let Ok(handle) = window.window_handle() else {
-        tracing::warn!("Mouse tracking skipped: window handle unavailable");
-        return;
-    };
+    let handle = window.window_handle().ok()?;
     let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
-        return;
+        return None;
     };
-    let view_ptr = appkit.ns_view.as_ptr().cast::<AnyObject>();
+    let view_ptr = appkit.ns_view.as_ptr().cast::<NSView>();
     if view_ptr.is_null() {
-        tracing::warn!("Mouse tracking skipped: macOS view handle is null");
-        return;
+        return None;
     }
-
-    // SAFETY: the handle comes from the live winit window and the tracking
-    // area is retained by the view for its lifetime.
+    // SAFETY: the view belongs to the live winit window and this runs on the
+    // main thread.
     unsafe {
-        let view: &NSView = &*view_ptr.cast::<NSView>();
-        let options = NSTrackingAreaOptions::NSTrackingMouseMoved
-            | NSTrackingAreaOptions::NSTrackingActiveInKeyWindow
-            | NSTrackingAreaOptions::NSTrackingInVisibleRect;
-        let area = NSTrackingArea::initWithRect_options_owner_userInfo(
-            NSTrackingArea::alloc(),
-            NSRect::ZERO,
-            options,
-            Some(view),
-            None,
-        );
-        view.addTrackingArea(&area);
+        let view: &NSView = &*view_ptr;
+        let ns_window = view.window()?;
+        let mouse = NSEvent::mouseLocation();
+        let frame = ns_window.frame();
+        let window_point = NSPoint::new(mouse.x - frame.origin.x, mouse.y - frame.origin.y);
+        let view_point = view.convertPoint_fromView(window_point, None);
+        let bounds = view.bounds();
+        if view_point.x < 0.0
+            || view_point.y < 0.0
+            || view_point.x > bounds.size.width
+            || view_point.y > bounds.size.height
+        {
+            return None;
+        }
+        Some((view_point.x, view_point.y))
     }
 }
 
@@ -1327,6 +1466,15 @@ fn is_bookmark_manager_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
         && !modifiers.alt_key()
         && modifiers.shift_key()
         && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("b"))
+}
+
+/// `Cmd/Ctrl+Shift+C` copies the active page URL. Shift keeps plain
+/// `Cmd/Ctrl+C` available to the page so text selection still copies normally.
+fn is_copy_url_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
+    is_primary_shortcut_modifier(modifiers)
+        && !modifiers.alt_key()
+        && modifiers.shift_key()
+        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("c"))
 }
 
 /// Cmd/Ctrl+Q quits through the same deferred shutdown path as the window's
@@ -1404,6 +1552,9 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                 self.sync_chrome_overlay(event_loop);
                 self.sync_tooltip_overlay(event_loop);
             }
+            KasumiEvent::NativeMouseMoved { x, y } => {
+                self.forward_native_mouse_move(event_loop, x, y);
+            }
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -1433,13 +1584,6 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                 return;
             }
         };
-
-        // AppKit sends `mouseMoved:` to the first responder. Once the CEF
-        // child view takes keyboard focus, winit's view stops receiving hover
-        // updates, which freezes rail/HUD tooltips. A tracking area delivers
-        // moves to the winit view regardless of the first responder.
-        #[cfg(target_os = "macos")]
-        install_mouse_moved_tracking(&window);
 
         let Some(chrome) = ChromeRenderer::new(
             Arc::clone(&window),
@@ -1533,6 +1677,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
         {
             install_macos_main_menu();
             self.shortcut_monitor = native_shortcuts::install();
+            self.mouse_monitor = native_shortcuts::install_mouse_monitor(&window);
         }
 
         tracing::info!("Window, chrome renderer, storage, and TabManager initialized successfully");
@@ -1648,7 +1793,11 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             };
 
             match event {
-                WindowEvent::CloseRequested | WindowEvent::CursorLeft { .. } => {
+                // The tooltip surface is click-through and never owns the
+                // pointer. Winit emits CursorLeft when the new window is
+                // ordered front with the cursor outside it; clearing on that
+                // event made the tooltip hide and re-show every frame.
+                WindowEvent::CloseRequested => {
                     self.chrome_state.tooltip = None;
                     self.hide_tooltip_overlay();
                 }
@@ -1766,6 +1915,8 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                     self.request_shutdown();
                 } else if is_bookmark_manager_shortcut(self.modifiers, logical_key) {
                     self.handle_browser_shortcut(BrowserShortcut::OpenBookmarkManager);
+                } else if is_copy_url_shortcut(self.modifiers, logical_key) {
+                    self.handle_browser_shortcut(BrowserShortcut::CopyUrl);
                 } else if alt {
                     if let Key::Character(c) = logical_key {
                         if c.eq_ignore_ascii_case("h") {
@@ -1888,6 +2039,8 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        self.poll_native_mouse(event_loop);
         // CEF's NSApp pump can invoke winit's run-loop observer, which calls
         // this method again while `cef::do_message_loop_work()` is still on the
         // stack. Never start teardown from that nested tick.
@@ -1939,6 +2092,9 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             }
             if tm.consume_bookmark_manager_request() {
                 self.chrome_state.open_bookmark_manager();
+            }
+            if tm.consume_copy_url_request() {
+                self.chrome_state.request_copy_url();
             }
             if !self.shutdown_requested {
                 tm.tick();
@@ -2155,7 +2311,7 @@ fn main() {
     // ── 6. Initialize wgpu (blocking — before winit event loop) ─────────────
     let wgpu_instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
-        ..Default::default()
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
     // We need an adapter. Because we don't have a surface yet (window not created)
@@ -2165,34 +2321,35 @@ fn main() {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            ..Default::default()
         })) {
-            Some(a) => Arc::new(a),
-            None => {
-                tracing::error!("No suitable wgpu adapter found");
+            Ok(a) => Arc::new(a),
+            Err(e) => {
+                tracing::error!("No suitable wgpu adapter found: {e}");
                 cef::shutdown();
                 std::process::exit(1);
             }
         };
 
-    let (device, queue) = match pollster::block_on(adapter.request_device(
-        &wgpu::DeviceDescriptor {
+    let (device, queue) =
+        match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("kasumi_browser"),
             required_features: wgpu::Features::empty(),
             // Use the adapter's actual limits so the surface can match the
             // physical window size on Retina/HiDPI displays (downlevel_defaults
             // caps max_texture_dimension_2d at 2048, too small for 2560×1600).
             required_limits: adapter.limits(),
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: Default::default(),
-        },
-        None,
-    )) {
-        Ok(dq) => (Arc::new(dq.0), Arc::new(dq.1)),
-        Err(e) => {
-            tracing::error!("wgpu device request failed: {}", e);
-            cef::shutdown();
-            std::process::exit(1);
-        }
-    };
+            trace: wgpu::Trace::Off,
+        })) {
+            Ok(dq) => (Arc::new(dq.0), Arc::new(dq.1)),
+            Err(e) => {
+                tracing::error!("wgpu device request failed: {}", e);
+                cef::shutdown();
+                std::process::exit(1);
+            }
+        };
 
     tracing::info!("wgpu adapter: {:?}", adapter.get_info().name);
 
@@ -2237,8 +2394,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_primary_shortcut_modifier, is_quit_shortcut, is_reopen_tab_shortcut,
-        overlay_screen_position, pointer_is_past_rail, BrowserShortcut,
+        is_copy_url_shortcut, is_primary_shortcut_modifier, is_quit_shortcut,
+        is_reopen_tab_shortcut, overlay_screen_position, pointer_is_past_rail, BrowserShortcut,
     };
     use crate::config::rail_width;
     use winit::dpi::PhysicalPosition;
@@ -2284,6 +2441,32 @@ mod tests {
         assert!(!is_reopen_tab_shortcut(
             ModifiersState::CONTROL,
             &Key::Character("t".into())
+        ));
+    }
+
+    #[test]
+    fn copy_url_shortcut_requires_shift_so_plain_copy_stays_with_the_page() {
+        let c: Key = Key::Character("c".into());
+        let upper_c: Key = Key::Character("C".into());
+
+        assert!(is_copy_url_shortcut(
+            ModifiersState::CONTROL | ModifiersState::SHIFT,
+            &c
+        ));
+        assert!(is_copy_url_shortcut(
+            ModifiersState::SUPER | ModifiersState::SHIFT,
+            &upper_c
+        ));
+        assert!(!is_copy_url_shortcut(ModifiersState::CONTROL, &c));
+        assert!(!is_copy_url_shortcut(ModifiersState::SUPER, &upper_c));
+        assert!(!is_copy_url_shortcut(ModifiersState::SHIFT, &c));
+        assert!(!is_copy_url_shortcut(
+            ModifiersState::SUPER | ModifiersState::SHIFT | ModifiersState::ALT,
+            &c
+        ));
+        assert!(!is_copy_url_shortcut(
+            ModifiersState::SUPER | ModifiersState::SHIFT,
+            &Key::Character("v".into())
         ));
     }
 
@@ -2350,7 +2533,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn native_monitor_captures_settings_shortcuts_while_page_has_focus() {
-        let cmd = Flags::NSEventModifierFlagCommand;
+        let cmd = Flags::Command;
         assert_eq!(
             shortcut_from_parts(',', 0x2B, cmd),
             Some(BrowserShortcut::OpenSettings)
@@ -2360,7 +2543,7 @@ mod tests {
             Some(BrowserShortcut::OpenSettings)
         );
         assert_eq!(
-            shortcut_from_parts('<', 0x2B, cmd | Flags::NSEventModifierFlagShift),
+            shortcut_from_parts('<', 0x2B, cmd | Flags::Shift),
             None,
             "Shift+Cmd+, is not a shell shortcut"
         );
@@ -2374,8 +2557,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn native_monitor_maps_all_shell_shortcuts() {
-        let cmd = Flags::NSEventModifierFlagCommand;
-        let shift = Flags::NSEventModifierFlagShift;
+        let cmd = Flags::Command;
+        let shift = Flags::Shift;
         assert_eq!(
             shortcut_from_parts('t', 0x11, cmd),
             Some(BrowserShortcut::NewTab)
@@ -2408,6 +2591,15 @@ mod tests {
             shortcut_from_parts('q', 0x0C, cmd | shift),
             None,
             "Shift+Cmd+Q must not quit"
+        );
+        assert_eq!(
+            shortcut_from_parts('c', 0x08, cmd | shift),
+            Some(BrowserShortcut::CopyUrl)
+        );
+        assert_eq!(
+            shortcut_from_parts('c', 0x08, cmd),
+            None,
+            "plain Cmd+C must keep copying the page selection"
         );
     }
 }
