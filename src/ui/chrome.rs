@@ -6070,6 +6070,9 @@ pub fn rail_menu_items(state: &ChromeState, tab_id: u64) -> Vec<RailMenuItem> {
         .iter()
         .find(|tab| tab.id == tab_id)
         .is_some_and(|tab| tab.is_pinned);
+    let has_closable_other_tabs = workspace_tabs
+        .iter()
+        .any(|tab| tab.id != tab_id && !tab.is_pinned);
     let pin_label = if is_pinned { "Unpin tab" } else { "Pin tab" };
     let item = |label: &str, action, enabled| RailMenuItem {
         label: label.to_string(),
@@ -6086,7 +6089,7 @@ pub fn rail_menu_items(state: &ChromeState, tab_id: u64) -> Vec<RailMenuItem> {
         item(
             "Close other tabs",
             RailMenuAction::CloseOtherTabs,
-            tab_count > 1,
+            has_closable_other_tabs,
         ),
         item(
             "Close tabs below this tab",
@@ -8405,6 +8408,26 @@ mod tests {
         assert!(!last_items
             .iter()
             .any(|item| item.action == RailMenuAction::CloseTabsToRight && item.enabled));
+    }
+
+    #[test]
+    fn close_other_tabs_is_disabled_when_only_other_tabs_are_pinned() {
+        let mut state = ChromeState::default();
+        let mut pinned = tab(2, "Pinned", "https://pinned.example");
+        pinned.is_pinned = true;
+        state.tabs = vec![tab(1, "Current", "https://current.example"), pinned];
+
+        let items = rail_menu_items(&state, 1);
+        assert!(!items
+            .iter()
+            .any(|item| item.action == RailMenuAction::CloseOtherTabs && item.enabled));
+
+        // Pinned tabs are never in the close set, but a pinned source tab can
+        // still close other unpinned tabs.
+        let items = rail_menu_items(&state, 2);
+        assert!(items
+            .iter()
+            .any(|item| item.action == RailMenuAction::CloseOtherTabs && item.enabled));
     }
 
     #[test]

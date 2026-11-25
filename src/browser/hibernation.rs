@@ -3356,7 +3356,9 @@ impl TabManager {
                     .tabs
                     .iter()
                     .rev()
-                    .filter(|tab| tab.workspace_id == workspace_id && tab.id != tab_id)
+                    .filter(|tab| {
+                        tab.workspace_id == workspace_id && tab.id != tab_id && !tab.pinned
+                    })
                     .map(|tab| tab.id)
                     .collect();
                 for id in ids {
@@ -4317,6 +4319,29 @@ mod tests {
         assert_eq!(insertion_index(&tabs, 1, Some(99), true), 2);
         assert_eq!(insertion_index(&tabs, 1, None, false), 3);
         assert_eq!(insertion_index(&tabs, 1, Some(0), false), 2);
+    }
+
+    #[test]
+    fn close_other_tabs_never_closes_pinned_tabs() {
+        let (mut manager, mut db_rx, active_id) = test_manager_with_storage();
+        let pinned_id = manager.create_tab(Some("https://pinned.example".to_string()), false);
+        manager.toggle_pin_tab(pinned_id);
+        let other_id = manager.create_tab(Some("https://other.example".to_string()), false);
+        let _ = drain_db_commands(&mut db_rx);
+
+        manager.handle_ui_action(UiAction::CloseOtherTabs { tab_id: active_id });
+
+        let mut remaining: Vec<u64> = manager.tabs.iter().map(|tab| tab.id).collect();
+        remaining.sort_unstable();
+        let mut expected = vec![active_id, pinned_id];
+        expected.sort_unstable();
+        assert_eq!(remaining, expected, "pinned tab must survive close-other");
+        assert!(!remaining.contains(&other_id));
+
+        // A pinned source tab may still close the other unpinned tabs.
+        manager.handle_ui_action(UiAction::CloseOtherTabs { tab_id: pinned_id });
+        let remaining: Vec<u64> = manager.tabs.iter().map(|tab| tab.id).collect();
+        assert_eq!(remaining, vec![pinned_id]);
     }
 
     #[test]

@@ -16,6 +16,10 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 - Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.9.0` to `0.10.0`.
 - Condensed `README.md` into a concise overview while keeping build, signing, verification, roadmap, and filter-list instructions.
 
+### Fixed
+
+- “Close other tabs” now preserves pinned tabs and disables itself when there are no unpinned tabs to close.
+
 ---
 
 ## v0.9.0 — 2026-11-25
