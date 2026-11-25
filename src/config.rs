@@ -11,7 +11,7 @@ pub const DEFAULT_HOME_URL: &str = "https://duckduckgo.com";
 pub const DEFAULT_SEARCH_URL_PREFIX: &str = "https://duckduckgo.com/?q=";
 
 /// Expanded width of the collapsible vertical workspace rail, in logical points.
-pub const RAIL_WIDTH_EXPANDED: f32 = 180.0;
+pub const RAIL_WIDTH_EXPANDED: f32 = 208.0;
 
 /// Width of the favicon-only strip left visible when the rail is collapsed.
 pub const RAIL_WIDTH_COLLAPSED: f32 = 44.0;
@@ -21,6 +21,16 @@ pub const COMMAND_PALETTE_WIDTH: f32 = 560.0;
 
 /// Vertical offset of the command palette from the top of the window.
 pub const COMMAND_PALETTE_TOP_OFFSET: f32 = 72.0;
+
+/// Height of the transparent native HUD strips painted above the CEF page.
+pub const PAGE_HUD_HEIGHT: f32 = 36.0;
+
+/// Gap between the CEF content edge and a bottom page HUD strip.
+pub const PAGE_HUD_MARGIN: f32 = 10.0;
+
+/// Widths of the bottom-left and bottom-right page HUD strips.
+pub const PAGE_HUD_LEFT_WIDTH: f32 = 220.0;
+pub const PAGE_HUD_RIGHT_WIDTH: f32 = 188.0;
 
 /// SQLite key under which the full preferences JSON document is stored.
 pub const PREFERENCES_DB_KEY: &str = "browser_preferences";
@@ -453,7 +463,7 @@ mod tests {
 
     #[test]
     fn rail_widths_match_spec() {
-        assert_eq!(RAIL_WIDTH_EXPANDED, 180.0);
+        assert_eq!(RAIL_WIDTH_EXPANDED, 208.0);
         assert_eq!(RAIL_WIDTH_COLLAPSED, 44.0);
         assert_eq!(rail_width(true), RAIL_WIDTH_EXPANDED);
         assert_eq!(rail_width(false), RAIL_WIDTH_COLLAPSED);

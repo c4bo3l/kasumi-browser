@@ -438,7 +438,11 @@ mod tests {
         assert_eq!(rect.width, 1280 - RAIL_WIDTH_EXPANDED as u32);
         assert_eq!(rect.height, 800);
         assert_eq!(rect.scale_factor, 2.0);
-        assert_eq!(rect.to_physical(), (360, 0, 2200, 1600));
+        let physical_rail = (RAIL_WIDTH_EXPANDED * 2.0) as u32;
+        assert_eq!(
+            rect.to_physical(),
+            (physical_rail, 0, 2560 - physical_rail, 1600)
+        );
     }
 
     #[test]

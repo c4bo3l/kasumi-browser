@@ -235,6 +235,7 @@ const ALT_MODIFIER_FLAG: u32 = 8;
 const REPEAT_EVENT_FLAG: u32 = 8_192;
 
 /// Virtual key codes, using CEF's platform-independent Windows key codes.
+const VK_B: i32 = 0x42;
 const VK_J: i32 = 0x4A;
 const VK_K: i32 = 0x4B;
 const VK_L: i32 = 0x4C;
@@ -299,6 +300,7 @@ pub(crate) fn browser_shortcut(
         VK_T => Some(BrowserShortcut::NewTab),
         VK_W if !shift => Some(BrowserShortcut::CloseTab),
         VK_L | VK_K if !shift => Some(BrowserShortcut::OpenCommandPalette),
+        VK_B if shift => Some(BrowserShortcut::OpenBookmarkManager),
         VK_J if !shift => Some(BrowserShortcut::OpenDownloads),
         VK_OEM_COMMA | VK_OEM_PERIOD if !shift => Some(BrowserShortcut::OpenSettings),
         VK_Z if !shift => Some(BrowserShortcut::ReopenClosedTab),
@@ -342,6 +344,13 @@ fn browser_shortcut_from_char(
         c if c == 'W' as u16 || c == 'w' as u16 => Some(BrowserShortcut::CloseTab),
         c if c == 'L' as u16 || c == 'l' as u16 || c == 'K' as u16 || c == 'k' as u16 => {
             Some(BrowserShortcut::OpenCommandPalette)
+        }
+        c if c == 'B' as u16 || c == 'b' as u16 => {
+            if shift {
+                Some(BrowserShortcut::OpenBookmarkManager)
+            } else {
+                None
+            }
         }
         c if c == 'J' as u16 || c == 'j' as u16 => Some(BrowserShortcut::OpenDownloads),
         c if c == 'Z' as u16 || c == 'z' as u16 => Some(BrowserShortcut::ReopenClosedTab),
