@@ -22,6 +22,16 @@ pub const COMMAND_PALETTE_WIDTH: f32 = 560.0;
 /// Vertical offset of the command palette from the top of the window.
 pub const COMMAND_PALETTE_TOP_OFFSET: f32 = 72.0;
 
+/// Height of the transparent native HUD strips painted above the CEF page.
+pub const PAGE_HUD_HEIGHT: f32 = 36.0;
+
+/// Gap between the CEF content edge and a bottom page HUD strip.
+pub const PAGE_HUD_MARGIN: f32 = 10.0;
+
+/// Widths of the bottom-left and bottom-right page HUD strips.
+pub const PAGE_HUD_LEFT_WIDTH: f32 = 220.0;
+pub const PAGE_HUD_RIGHT_WIDTH: f32 = 188.0;
+
 /// SQLite key under which the full preferences JSON document is stored.
 pub const PREFERENCES_DB_KEY: &str = "browser_preferences";
 

@@ -18,11 +18,14 @@ use std::sync::OnceLock;
 use app::KasumiBrowserApp;
 use browser::hibernation::TabManager;
 use cef::CefString;
-use config::{rail_width, BrowserPreferences, SHUTDOWN_MAX_WAIT_TICKS};
+use config::{
+    rail_width, BrowserPreferences, PAGE_HUD_HEIGHT, PAGE_HUD_MARGIN, SHUTDOWN_MAX_WAIT_TICKS,
+};
 use events::{BrowserShortcut, UiAction};
 use storage::db::{StorageHandle, StorageManager};
 use ui::chrome::{
-    ChromeOverlayRenderer, ChromeRenderer, ChromeState, ChromeTheme, TooltipRenderer,
+    ChromeOverlayRenderer, ChromeRenderer, ChromeState, ChromeTheme, PageHudRenderer,
+    TooltipRenderer,
 };
 use ui::platform_view::ContentRect;
 use winit::application::ApplicationHandler;
@@ -365,6 +368,7 @@ mod native_shortcuts {
         }
 
         match key {
+            'b' if shift => Some(BrowserShortcut::OpenBookmarkManager),
             't' if shift => Some(BrowserShortcut::ReopenClosedTab),
             't' => Some(BrowserShortcut::NewTab),
             'w' if !shift => Some(BrowserShortcut::CloseTab),
@@ -689,6 +693,15 @@ struct KasumiBrowserHandler {
     tooltip_visible: bool,
     tooltip_size: Option<(u32, u32)>,
 
+    // Always-visible transparent HUD bar above the CEF page. A separate native
+    // window is required because the native child view covers the main wgpu
+    // surface; the bar spans the content area and stays only as tall as its
+    // icon controls so the rest of the page keeps receiving pointer input.
+    page_hud_window: Option<Arc<Window>>,
+    page_hud_window_id: Option<WindowId>,
+    page_hud: Option<PageHudRenderer>,
+    page_hud_visible: bool,
+
     // Current UI state (populated from CEF events in Phase 3+)
     chrome_state: ChromeState,
 
@@ -737,6 +750,10 @@ impl KasumiBrowserHandler {
             tooltip: None,
             tooltip_visible: false,
             tooltip_size: None,
+            page_hud_window: None,
+            page_hud_window_id: None,
+            page_hud: None,
+            page_hud_visible: false,
             chrome_state: ChromeState::default(),
             modifiers: ModifiersState::default(),
             shutdown_requested: false,
@@ -752,6 +769,7 @@ impl KasumiBrowserHandler {
         self.chrome_state.promote_pending_toast();
         if self.shutdown_requested {
             self.hide_chrome_overlay();
+            self.hide_page_huds();
             return;
         }
         if self.chrome_state.has_overlay() {
@@ -889,6 +907,61 @@ impl KasumiBrowserHandler {
         }
     }
 
+    /// Create the two small, always-visible native windows that paint the page
+    /// HUD above the CEF child view.
+    fn position_page_huds(&self) {
+        let (Some(main), Some(hud)) = (self.window.as_ref(), self.page_hud_window.as_ref()) else {
+            return;
+        };
+        let scale = main.scale_factor();
+        let size = main.inner_size();
+        let logical_width = size.width as f64 / scale;
+        let logical_height = size.height as f64 / scale;
+        let content_left = rail_width(self.chrome_state.rail_expanded) as f64;
+        let margin = PAGE_HUD_MARGIN as f64;
+        let height = PAGE_HUD_HEIGHT as f64;
+        let width = (logical_width - content_left - margin * 2.0).max(120.0);
+        let x = content_left + margin;
+        let y = (logical_height - height - margin).max(0.0);
+
+        let content_origin = match main.inner_position().or_else(|_| main.outer_position()) {
+            Ok(origin) => origin,
+            Err(_) => return,
+        };
+        hud.set_outer_position(overlay_screen_position(
+            content_origin,
+            (x as f32, y as f32),
+            scale,
+        ));
+
+        let physical_size = |width: f32| {
+            winit::dpi::PhysicalSize::new(
+                (width as f64 * scale).round().max(1.0) as u32,
+                (height * scale).round().max(1.0) as u32,
+            )
+        };
+        let _ = hud.request_inner_size(physical_size(width as f32));
+    }
+
+    fn hide_page_huds(&mut self) {
+        if !self.page_hud_visible {
+            return;
+        }
+        if let Some(window) = self.page_hud_window.as_ref() {
+            let _ = window.set_visible(false);
+        }
+        self.page_hud_visible = false;
+    }
+
+    fn request_page_hud_redraw(&self) {
+        if !self.page_hud_visible {
+            return;
+        }
+        if let Some(window) = self.page_hud_window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
     fn sync_tooltip_overlay(&mut self, event_loop: &ActiveEventLoop) {
         if self.shutdown_requested || self.chrome_state.has_overlay() {
             self.hide_tooltip_overlay();
@@ -906,7 +979,12 @@ impl KasumiBrowserHandler {
                 .with_transparent(true)
                 .with_decorations(false)
                 .with_resizable(false)
-                .with_window_level(WindowLevel::Normal);
+                // Tooltips must sit above the CEF child view, which is a
+                // native subview of the browser window. Creating the overlay
+                // inactive avoids stealing key focus from the browser.
+                .with_active(false)
+                .with_visible(false)
+                .with_window_level(WindowLevel::AlwaysOnTop);
             let window = match event_loop.create_window(attrs) {
                 Ok(window) => Arc::new(window),
                 Err(e) => {
@@ -914,7 +992,7 @@ impl KasumiBrowserHandler {
                     return;
                 }
             };
-            window.set_window_level(WindowLevel::Normal);
+            window.set_window_level(WindowLevel::AlwaysOnTop);
             if let Err(e) = window.set_cursor_hittest(false) {
                 tracing::warn!("Tooltip overlay click-through unavailable: {e}");
             }
@@ -961,13 +1039,21 @@ impl KasumiBrowserHandler {
             ));
         }
         if !self.tooltip_visible {
+            // Focus the browser before ordering the inactive overlay front.
+            // Doing this after `set_visible` raised the main window above the
+            // tooltip on macOS, so the CEF child view hid it.
+            main.focus_window();
             overlay.set_visible(true);
             if let Err(e) = overlay.set_cursor_hittest(false) {
                 tracing::warn!("Tooltip overlay click-through unavailable: {e}");
             }
-            // Keep keyboard focus in the browser chrome, not the helper window.
-            main.focus_window();
             self.tooltip_visible = true;
+            tracing::debug!(
+                "Showing tooltip overlay at ({:.0}, {:.0}) size {:?}",
+                tooltip.anchor.x,
+                tooltip.anchor.y,
+                (tooltip.width, tooltip.height)
+            );
         }
         overlay.request_redraw();
     }
@@ -1032,6 +1118,9 @@ impl KasumiBrowserHandler {
             BrowserShortcut::OpenDownloads => {
                 self.chrome_state.toggle_downloads();
             }
+            BrowserShortcut::OpenBookmarkManager => {
+                self.chrome_state.open_bookmark_manager();
+            }
             BrowserShortcut::Quit => self.request_shutdown(),
         }
     }
@@ -1071,12 +1160,15 @@ impl KasumiBrowserHandler {
         };
         let size = window.inner_size();
         let scale = window.scale_factor();
-        let rect = ContentRect::from_window(
+        let mut rect = ContentRect::from_window(
             size.width,
             size.height,
             scale,
             rail_width(self.chrome_state.rail_expanded),
         );
+        rect.height = rect
+            .height
+            .saturating_sub((PAGE_HUD_HEIGHT + PAGE_HUD_MARGIN * 2.0) as u32);
         tracing::info!("Workspace rail width changed; CEF content rect: {:?}", rect);
         tm.resize(rect);
     }
@@ -1130,6 +1222,72 @@ fn pointer_is_past_rail(physical_x: f64, scale_factor: f64, rail_expanded: bool)
     scale_factor > 0.0 && physical_x / scale_factor >= rail_width(rail_expanded) as f64
 }
 
+/// Install a tracking area that reports pointer movement to winit's view even
+/// when the CEF child view owns first-responder (keyboard) focus.
+#[cfg(target_os = "macos")]
+fn install_mouse_moved_tracking(window: &Window) {
+    use objc2::runtime::AnyObject;
+    use objc2::ClassType;
+    use objc2_app_kit::{NSTrackingArea, NSTrackingAreaOptions, NSView};
+    use objc2_foundation::NSRect;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = window.window_handle() else {
+        tracing::warn!("Mouse tracking skipped: window handle unavailable");
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    let view_ptr = appkit.ns_view.as_ptr().cast::<AnyObject>();
+    if view_ptr.is_null() {
+        tracing::warn!("Mouse tracking skipped: macOS view handle is null");
+        return;
+    }
+
+    // SAFETY: the handle comes from the live winit window and the tracking
+    // area is retained by the view for its lifetime.
+    unsafe {
+        let view: &NSView = &*view_ptr.cast::<NSView>();
+        let options = NSTrackingAreaOptions::NSTrackingMouseMoved
+            | NSTrackingAreaOptions::NSTrackingActiveInKeyWindow
+            | NSTrackingAreaOptions::NSTrackingInVisibleRect;
+        let area = NSTrackingArea::initWithRect_options_owner_userInfo(
+            NSTrackingArea::alloc(),
+            NSRect::ZERO,
+            options,
+            Some(view),
+            None,
+        );
+        view.addTrackingArea(&area);
+    }
+}
+
+/// True while the macOS application itself is active. Winit also reports
+/// window-level focus loss when a helper overlay is ordered front, so tooltip
+/// clearing must look at AppKit rather than the window flag alone.
+#[cfg(target_os = "macos")]
+fn app_is_active() -> bool {
+    use objc2::runtime::AnyObject;
+    // SAFETY: `sharedApplication` and `isActive` are main-thread AppKit calls,
+    // and this runs from winit's main-thread window-event handler.
+    unsafe {
+        let app: *mut AnyObject = objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
+        if app.is_null() {
+            true
+        } else {
+            objc2::msg_send![app, isActive]
+        }
+    }
+}
+
+/// Windows and Linux have no equivalent app-level check here; treat a main
+/// window focus loss as the app losing focus.
+#[cfg(not(target_os = "macos"))]
+fn app_is_active() -> bool {
+    false
+}
+
 /// Convert an egui content-space point into physical screen coordinates.
 ///
 /// egui coordinates start at the main window's *content* origin, while the
@@ -1160,6 +1318,15 @@ fn is_reopen_tab_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
         && !modifiers.alt_key()
         && !modifiers.shift_key()
         && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("z"))
+}
+
+/// `Cmd/Ctrl+Shift+B` opens the native bookmark manager dialog. Matching the
+/// logical character keeps the shortcut identical on every keyboard layout.
+fn is_bookmark_manager_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
+    is_primary_shortcut_modifier(modifiers)
+        && !modifiers.alt_key()
+        && modifiers.shift_key()
+        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("b"))
 }
 
 /// Cmd/Ctrl+Q quits through the same deferred shutdown path as the window's
@@ -1267,6 +1434,13 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             }
         };
 
+        // AppKit sends `mouseMoved:` to the first responder. Once the CEF
+        // child view takes keyboard focus, winit's view stops receiving hover
+        // updates, which freezes rail/HUD tooltips. A tracking area delivers
+        // moves to the winit view regardless of the first responder.
+        #[cfg(target_os = "macos")]
+        install_mouse_moved_tracking(&window);
+
         let Some(chrome) = ChromeRenderer::new(
             Arc::clone(&window),
             &self.wgpu_instance,
@@ -1312,12 +1486,15 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
 
         let size = window.inner_size();
         let scale = window.scale_factor();
-        let rect = ContentRect::from_window(
+        let mut rect = ContentRect::from_window(
             size.width,
             size.height,
             scale,
             rail_width(self.chrome_state.rail_expanded),
         );
+        rect.height = rect
+            .height
+            .saturating_sub((PAGE_HUD_HEIGHT + PAGE_HUD_MARGIN * 2.0) as u32);
         tracing::info!("CEF content rect (logical): {:?}", rect);
 
         let storage_mgr = StorageManager::new(db_path.clone());
@@ -1345,6 +1522,10 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
         self.chrome = Some(chrome);
         self.tab_manager = Some(tab_manager);
         self.storage_handle = Some(storage_handle);
+
+        // The bottom page HUD is drawn by the main chrome renderer in the
+        // reserved strip below the CEF child view, so no separate native
+        // window is needed.
 
         // Capture shell shortcuts before AppKit can hand them to the CEF child
         // view. The monitor is owned by this handler and removed on shutdown.
@@ -1399,6 +1580,57 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                     }
                     self.handle_ui_actions(actions);
                     self.sync_chrome_overlay(event_loop);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Page HUD events stay in their small native strips. The main window
+        // never sees them, so page controls work even while the CEF child view
+        // owns keyboard focus.
+        let page_hud_window = Some(window_id) == self.page_hud_window_id;
+        if page_hud_window {
+            let _consumed = if let (Some(window), Some(renderer)) =
+                (self.page_hud_window.as_ref(), self.page_hud.as_mut())
+            {
+                renderer.on_window_event(window, &event)
+            } else {
+                false
+            };
+
+            match event {
+                WindowEvent::Resized(new_size) => {
+                    if let Some(renderer) = self.page_hud.as_mut() {
+                        renderer.resize(new_size);
+                    }
+                }
+                WindowEvent::ScaleFactorChanged { .. } => self.position_page_huds(),
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    ..
+                } => {
+                    if let Some(main) = self.window.as_ref() {
+                        main.focus_window();
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    let actions = if let (Some(window), Some(renderer)) =
+                        (self.page_hud_window.as_ref(), self.page_hud.as_mut())
+                    {
+                        renderer.render(window, &mut self.chrome_state)
+                    } else {
+                        Vec::new()
+                    };
+                    let had_actions = !actions.is_empty();
+                    self.handle_ui_actions(actions);
+                    if had_actions {
+                        if self.chrome_state.has_modal_overlay() {
+                            self.sync_chrome_overlay(event_loop);
+                        } else if let Some(main) = self.window.as_ref() {
+                            main.focus_window();
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1472,7 +1704,25 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                     if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
                     }
+                    self.request_page_hud_redraw();
                 }
+            }
+            WindowEvent::Focused(focused) => {
+                // Tooltips are only meaningful while Kasumi is the active app;
+                // hide the always-on-top overlay as soon as focus leaves.
+                // Creating the inactive tooltip window can also raise a
+                // window-level blur, so consult AppKit before clearing.
+                if !*focused && !app_is_active() {
+                    self.chrome_state.tooltip = None;
+                    self.hide_tooltip_overlay();
+                }
+                // Keep the helper bar above the browser window in every focus
+                // state; demoting it on blur made macOS hide it behind the
+                // main window.
+                if let Some(window) = self.page_hud_window.as_ref() {
+                    window.set_window_level(WindowLevel::AlwaysOnTop);
+                }
+                self.request_page_hud_redraw();
             }
             WindowEvent::CursorLeft { .. } => {
                 // The pointer may leave the rail without egui receiving a
@@ -1481,12 +1731,21 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                 self.chrome_state.tooltip = None;
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let scale = self
-                    .window
-                    .as_ref()
-                    .map_or(1.0, |window| window.scale_factor());
-                if pointer_is_past_rail(position.x, scale, self.chrome_state.rail_expanded) {
-                    self.chrome_state.tooltip = None;
+                if let Some(window) = self.window.as_ref() {
+                    let scale = window.scale_factor();
+                    let logical_y = if scale > 0.0 { position.y / scale } else { 0.0 };
+                    let logical_height = if scale > 0.0 {
+                        window.inner_size().height as f64 / scale
+                    } else {
+                        0.0
+                    };
+                    let hud_top = logical_height - (PAGE_HUD_HEIGHT + PAGE_HUD_MARGIN * 2.0) as f64;
+                    let over_page =
+                        pointer_is_past_rail(position.x, scale, self.chrome_state.rail_expanded)
+                            && logical_y < hud_top;
+                    if over_page {
+                        self.chrome_state.tooltip = None;
+                    }
                 }
             }
             WindowEvent::KeyboardInput {
@@ -1505,6 +1764,8 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
 
                 if is_quit_shortcut(self.modifiers, logical_key) {
                     self.request_shutdown();
+                } else if is_bookmark_manager_shortcut(self.modifiers, logical_key) {
+                    self.handle_browser_shortcut(BrowserShortcut::OpenBookmarkManager);
                 } else if alt {
                     if let Key::Character(c) = logical_key {
                         if c.eq_ignore_ascii_case("h") {
@@ -1562,6 +1823,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                 // Keep helper windows on the same display as the browser when
                 // the user drags the main window between monitors.
                 self.position_chrome_overlay();
+                self.position_page_huds();
                 self.chrome_state.tooltip = None;
                 self.hide_tooltip_overlay();
             }
@@ -1570,15 +1832,19 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                     chrome.resize(*new_size);
                 }
                 self.position_chrome_overlay();
+                self.position_page_huds();
                 if let (Some(window), Some(tm)) = (self.window.as_ref(), self.tab_manager.as_mut())
                 {
                     let scale = window.scale_factor();
-                    let rect = ContentRect::from_window(
+                    let mut rect = ContentRect::from_window(
                         new_size.width,
                         new_size.height,
                         scale,
                         rail_width(self.chrome_state.rail_expanded),
                     );
+                    rect.height = rect
+                        .height
+                        .saturating_sub((PAGE_HUD_HEIGHT + PAGE_HUD_MARGIN * 2.0) as u32);
                     tm.resize(rect);
                 }
             }
@@ -1599,15 +1865,19 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                     {
                         let size = window.inner_size();
                         let scale = window.scale_factor();
-                        let rect = ContentRect::from_window(
+                        let mut rect = ContentRect::from_window(
                             size.width,
                             size.height,
                             scale,
                             rail_width(self.chrome_state.rail_expanded),
                         );
+                        rect.height = rect
+                            .height
+                            .saturating_sub((PAGE_HUD_HEIGHT + PAGE_HUD_MARGIN * 2.0) as u32);
                         tracing::info!("Workspace rail toggled; CEF content rect: {:?}", rect);
                         tm.resize(rect);
                     }
+                    self.position_page_huds();
                 }
             }
             _ => {}
@@ -1667,12 +1937,16 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             if tm.consume_settings_request() {
                 self.chrome_state.open_settings();
             }
+            if tm.consume_bookmark_manager_request() {
+                self.chrome_state.open_bookmark_manager();
+            }
             if !self.shutdown_requested {
                 tm.tick();
             }
             tm.update_chrome_state(&mut self.chrome_state);
         }
 
+        self.request_page_hud_redraw();
         self.sync_chrome_overlay(event_loop);
         self.sync_tooltip_overlay(event_loop);
 

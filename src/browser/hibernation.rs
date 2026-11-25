@@ -418,6 +418,9 @@ pub struct TabManager {
     // Set when CEF forwards Cmd/Ctrl+J; consumed by the winit handler.
     downloads_requested: bool,
 
+    // Set when CEF forwards Cmd/Ctrl+Shift+B; consumed by the winit handler.
+    bookmark_manager_requested: bool,
+
     // Favicon URLs already requested, and URLs seen before the browser exists.
     requested_favicons: HashSet<(u64, String)>,
     pending_favicon_urls: HashMap<u64, Vec<String>>,
@@ -527,6 +530,7 @@ impl TabManager {
             command_palette_requested: false,
             settings_requested: false,
             downloads_requested: false,
+            bookmark_manager_requested: false,
             requested_favicons: HashSet::new(),
             pending_favicon_urls: HashMap::new(),
             resolved_favicons: HashSet::new(),
@@ -1645,6 +1649,50 @@ impl TabManager {
         self.sync_session();
     }
 
+    /// Move an unpinned tab into another workspace while preserving its live
+    /// CEF browser and its position in the target workspace's normal tab group.
+    pub fn move_tab_to_workspace(&mut self, tab_id: u64, workspace_id: u64) {
+        if !self
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == workspace_id)
+        {
+            return;
+        }
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+            return;
+        };
+        if self.tabs[index].pinned || self.tabs[index].workspace_id == workspace_id {
+            return;
+        }
+
+        let old_workspace = self.tabs[index].workspace_id;
+        let was_active = self.active_tab_id == Some(tab_id);
+        let mut tab = self.tabs.remove(index);
+        tab.workspace_id = workspace_id;
+        let at = insertion_index(&self.tabs, workspace_id, None, false);
+        self.tabs.insert(at, tab);
+
+        if self.active_tab_by_workspace.get(&old_workspace) == Some(&tab_id) {
+            self.active_tab_by_workspace.remove(&old_workspace);
+            if let Some(fallback) = self
+                .tabs
+                .iter()
+                .find(|candidate| candidate.workspace_id == old_workspace)
+                .map(|candidate| candidate.id)
+            {
+                self.active_tab_by_workspace.insert(old_workspace, fallback);
+            }
+        }
+
+        if was_active {
+            self.active_workspace_id = workspace_id;
+            self.active_tab_by_workspace.insert(workspace_id, tab_id);
+            self.show_active_tab_view();
+        }
+        self.sync_session();
+    }
+
     /// Focus an existing tab by ID. Focusing a tab in another workspace also
     /// switches the visible workspace.
     pub fn focus_tab(&mut self, id: u64) {
@@ -2446,6 +2494,11 @@ impl TabManager {
         std::mem::take(&mut self.downloads_requested)
     }
 
+    /// Consume a Cmd/Ctrl+Shift+B request forwarded from the CEF web view.
+    pub fn consume_bookmark_manager_request(&mut self) -> bool {
+        std::mem::take(&mut self.bookmark_manager_requested)
+    }
+
     /// Consume a request to reveal the downloads bubble after a new transfer.
     pub fn consume_download_bubble_request(&mut self) -> bool {
         std::mem::take(&mut self.download_bubble_requested)
@@ -2458,7 +2511,14 @@ impl TabManager {
 
     fn handle_browser_event(&mut self, event: BrowserEvent) {
         match event {
-            BrowserEvent::DownloadStarted(info) => self.record_download(info, None),
+            BrowserEvent::DownloadStarted(info) => {
+                // A navigation that turns into a download never commits, so
+                // the blank-frame watchdog must stop retrying it. Reissuing the
+                // URL would start duplicate transfers and make CEF cancel the
+                // second "save as" dialog.
+                self.pending_navigation_checks.remove(&info.tab_id);
+                self.record_download(info, None);
+            }
             BrowserEvent::DownloadUpdated { mut info, callback } => {
                 // CEF's first update can omit the suggested filename even when
                 // `on_before_download` supplied a good one. Keep that name so
@@ -2628,6 +2688,9 @@ impl TabManager {
                     // The shell owns the shared overlay and downloads bubble.
                     // This flag makes all shortcut sources converge on one path.
                     self.downloads_requested = true;
+                }
+                BrowserShortcut::OpenBookmarkManager => {
+                    self.bookmark_manager_requested = true;
                 }
                 BrowserShortcut::Quit => {
                     // The shell exits the event loop from its own shortcut
@@ -2948,6 +3011,12 @@ impl TabManager {
             }
             UiAction::SwitchWorkspace { workspace_id } => {
                 self.switch_workspace(workspace_id);
+            }
+            UiAction::MoveTabToWorkspace {
+                tab_id,
+                workspace_id,
+            } => {
+                self.move_tab_to_workspace(tab_id, workspace_id);
             }
             UiAction::CreateWorkspace { name, icon, color } => {
                 self.create_workspace(name, icon, color);

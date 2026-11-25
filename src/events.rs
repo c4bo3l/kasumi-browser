@@ -309,6 +309,7 @@ pub enum BrowserShortcut {
     OpenDevTools,
     OpenSettings,
     OpenDownloads,
+    OpenBookmarkManager,
     /// Gracefully close all CEF browsers and exit. Handled by the shell; CEF
     /// key forwarding deliberately never emits it because TabManager cannot
     /// exit the winit event loop.
@@ -460,6 +461,11 @@ pub enum UiAction {
     },
     /// Switch the visible native workspace and its active tab.
     SwitchWorkspace {
+        workspace_id: u64,
+    },
+    /// Move an unpinned tab to another workspace without reloading it.
+    MoveTabToWorkspace {
+        tab_id: u64,
         workspace_id: u64,
     },
     /// Create a workspace with the user's chosen name, icon, and accent colour.

@@ -8,7 +8,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ### Added
 
-- Native bookmark manager improvements in **Settings → Bookmarks**: search by title, URL, or folder; select a row to edit its title and URL; move it between workspace-named folder options; and delete individual bookmarks with icon-only actions. Open it from the rail **Settings** button, `Cmd/Ctrl+,` then **Bookmarks**, or the command palette's **Open bookmark manager** command. Edits are keyed by the original `(workspace_id, url)` pair and persisted through the SQLite worker, so in-memory bookmarks added with a temporary id can still be saved safely.
+- Native bookmark manager improvements in a dedicated `Cmd/Ctrl+Shift+B` dialog: search by title, URL, or folder; select a row to edit its title and URL; move it between workspace-named folder options; and delete individual bookmarks with icon-only actions. Open it from the shortcut, the command palette's **Open bookmark manager** command, or the rail **Settings** button. Edits are keyed by the original `(workspace_id, url)` pair and persisted through the SQLite worker, so in-memory bookmarks added with a temporary id can still be saved safely.
 - Toggle the current page's bookmark from the expanded rail address field or the command palette. An outlined star means the page is not bookmarked; clicking saves it and shows **Bookmark saved**. A filled accent star means it is bookmarked; clicking removes it and shows **Bookmark removed**.
 - Transparent click-through native notifications for terminal download outcomes. Completed transfers show **Download complete** with the file name; interrupted transfers show **Download failed**. The notification appears above the CEF child view without stealing focus or blocking page input, and dismisses automatically.
 - A native **Copied** confirmation after copying the URL from the rail address field.
@@ -17,8 +17,11 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 ### Changed
 
 - Widened the expanded rail from 180 px to 208 px so vertical tabs and the framed address field have more comfortable room.
+- The expanded rail now places **New tab** immediately below pinned tabs. Command and DevTools moved to a bottom-left page HUD above the CEF view; blocked-request count and RAM usage moved to a bottom-right page HUD.
+- Right-clicking an unpinned tab offers **Move tab to** another workspace; pinned tabs are excluded.
 - The rail address field now has compact bookmark and copy actions, and long URLs still scroll inside the field instead of stretching the frame. The bookmark action uses a native outlined star when unbookmarked and the filled Material star when saved.
 - Bumped the project, macOS bundle, About-menu version, docs, canonical spec, and lockfile from `0.7.0` to `0.8.0`.
+- Updated CEF to `156.7.0+156.0.31`, `adblock` to `0.13.6`, and `url` to `2.5.9`; the egui/wgpu/rusqlite/sysinfo major versions remain pinned until a dedicated migration.
 
 ### Fixed
 
@@ -26,12 +29,17 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 - Terminal downloads first observed already complete or interrupted now emit a native notification instead of being missed.
 - Toasts raised while Settings, the command palette, a tab menu, or the downloads bubble is open wait until the modal closes, then start their four-second timer. Multiple outcomes are shown in order instead of overwriting each other.
 - Toast-only overlays stay click-through and leave keyboard focus on the browser; opening a modal from that state now correctly transfers focus to the overlay, and closing it returns focus to the browser.
+- A navigation that turns into a download now cancels the blank-frame retry for that tab, preventing duplicate transfers and the second “save as” dialog from being canceled.
+
+### Known Issues
+
+- **macOS bottom HUD and rail tooltips** may still fail to appear, particularly after the CEF page has keyboard focus. The HUD sets the tooltip state, the native overlay is created at always-on-top level with an inactive window, and winit now has an `NSTrackingArea`; the remaining macOS event-routing/window-ordering problem is not resolved in this release.
 
 ### Verification
 
 - `cargo fmt --all -- --check`
 - `cargo check --bins`
-- `cargo test --bin kasumi-browser` — 169 tests
+- `cargo test --bin kasumi-browser` — 174 tests
 - `cargo build --release`
 - PR CI checks formatting, binaries, and unit tests on macOS 15 Intel, Windows, and Linux; interactive macOS verification is required before merge.
 

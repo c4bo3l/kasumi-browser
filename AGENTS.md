@@ -64,7 +64,7 @@ edition = "2021"
 
 [dependencies]
 # CEF safe bindings (v156.x; auto-fetches matching CEF binary if CEF_PATH is unset)
-cef = "156.6"
+cef = "156.7"
 
 # Low-fragmentation global allocator
 mimalloc = { version = "0.1", default-features = false }
@@ -83,7 +83,7 @@ wgpu = "23"
 sysinfo = "0.33"
 
 # Brave's native Rust ad & tracker blocking engine (v0.13.x)
-adblock = { version = "0.13", default-features = false, features = ["embedded-domain-resolver"] }
+adblock = { version = "0.13.6", default-features = false, features = ["embedded-domain-resolver"] }
 
 # Async storage worker & crash-safe SQLite persistence
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs"] }
@@ -106,7 +106,7 @@ objc2 = "0.5"
 # NSEvent's local monitor lets shell shortcuts work even when the CEF child
 # view has keyboard focus; NSMenu/NSMenuItem build the native File menu;
 # block2 is required by the Objective-C block API.
-objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow", "NSEvent", "NSMenu", "NSMenuItem", "block2"] }
+objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow", "NSEvent", "NSMenu", "NSMenuItem", "NSTrackingArea", "block2"] }
 objc2-foundation = { version = "0.2", features = ["NSGeometry"] }
 block2 = "0.5"
 
