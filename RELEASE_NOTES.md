@@ -4,7 +4,21 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
-## v0.9.0 — Unreleased
+## v0.10.0 — Unreleased
+
+### Added
+
+- Native WebRTC media-access prompts bridge CEF camera, microphone, and desktop audio/video capture requests into the egui chrome. Allow/Deny decisions resolve each CEF callback exactly once on the main UI thread.
+- Normal-space permission decisions are remembered in SQLite WAL by origin. Incognito requests never reach SQLite; their decisions stay in memory until the private workspace closes.
+
+### Changed
+
+- Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.9.0` to `0.10.0`.
+- Condensed `README.md` into a concise overview while keeping build, signing, verification, roadmap, and filter-list instructions.
+
+---
+
+## v0.9.0 — 2026-11-25
 
 ### Added
 

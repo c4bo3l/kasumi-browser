@@ -2,7 +2,7 @@ use crate::events::{BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo,
 use cef::*;
 use crossbeam_channel::Sender;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -135,6 +135,65 @@ wrap_life_span_handler! {
                 });
             }
             1 // Cancel ordinary popup windows; open them as Kasumi tabs instead.
+        }
+    }
+}
+
+/// Monotonic ids for media-access prompts. CEF handlers are per browser, so a
+/// process-wide counter is the simplest way to keep concurrent prompts distinct
+/// without sharing any mutable state across Chromium threads.
+static NEXT_MEDIA_PERMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_media_permission_request_id() -> u64 {
+    NEXT_MEDIA_PERMISSION_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+wrap_permission_handler! {
+    pub struct TabPermissionHandler {
+        tab_id: u64,
+        event_sender: Sender<BrowserEvent>,
+    }
+
+    impl PermissionHandler {
+        fn on_request_media_access_permission(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut MediaAccessCallback>,
+        ) -> i32 {
+            let Some(callback) = callback else {
+                return 0;
+            };
+            let origin = requesting_origin
+                .map(|origin| origin.to_string())
+                .unwrap_or_default();
+            let request_id = next_media_permission_request_id();
+            tracing::info!(
+                "Media access request {} from {} for tab {} (permissions={})",
+                request_id,
+                origin,
+                self.tab_id,
+                requested_permissions
+            );
+            let event = BrowserEvent::MediaAccessPermissionRequested {
+                request_id,
+                tab_id: self.tab_id,
+                origin,
+                permissions: requested_permissions,
+                callback: callback.clone(),
+            };
+            if self.event_sender.send(event).is_err() {
+                // Taking ownership means the callback must still be resolved if
+                // the UI thread disappeared before it could show the prompt.
+                tracing::warn!(
+                    "UI receiver dropped before media permission {} could be shown",
+                    request_id
+                );
+                callback.cancel();
+            }
+            1
         }
     }
 }
@@ -661,6 +720,7 @@ wrap_client! {
         download_handler: DownloadHandler,
         keyboard_handler: KeyboardHandler,
         context_menu_handler: ContextMenuHandler,
+        permission_handler: PermissionHandler,
     }
 
     impl Client {
@@ -685,6 +745,9 @@ wrap_client! {
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
             Some(self.context_menu_handler.clone())
         }
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            Some(self.permission_handler.clone())
+        }
     }
 }
 
@@ -700,6 +763,7 @@ pub fn create_tab_client(
     let display_handler = TabDisplayHandler::new(tab_id, event_sender.clone());
     let keyboard_handler = TabKeyboardHandler::new(tab_id, event_sender.clone());
     let context_menu_handler = TabContextMenuHandler::new(tab_id, event_sender.clone());
+    let permission_handler = TabPermissionHandler::new(tab_id, event_sender.clone());
     let download_handler =
         TabDownloadHandler::new(tab_id, event_sender.clone(), download_preferences);
     let request_handler = super::adblocker::create_tab_request_handler(
@@ -717,6 +781,7 @@ pub fn create_tab_client(
         download_handler.into(),
         keyboard_handler.into(),
         context_menu_handler.into(),
+        permission_handler.into(),
     )
 }
 

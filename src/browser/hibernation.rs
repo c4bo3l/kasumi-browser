@@ -8,14 +8,15 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cef::{
-    CefString, ImplBrowser, ImplBrowserHost, ImplDownloadItemCallback, ImplFrame, ImplUrlrequest,
+    CefString, ImplBrowser, ImplBrowserHost, ImplDownloadItemCallback, ImplFrame,
+    ImplMediaAccessCallback, ImplUrlrequest,
 };
 use crossbeam_channel::{Receiver, Sender};
 use sysinfo::{ProcessesToUpdate, System};
@@ -31,12 +32,13 @@ use crate::config::{
     RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_PRESSURE, TAB_WATCHDOG_TICK_INTERVAL,
 };
 use crate::events::{
-    BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadNotification,
-    DownloadNotificationKind, DownloadState, ParallelDownloadEvent, UiAction,
+    normalize_permission_origin, BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo,
+    DownloadNotification, DownloadNotificationKind, DownloadState, MediaAccessPermissions,
+    ParallelDownloadEvent, UiAction,
 };
-use crate::storage::db::{BookmarkItem, SessionTabSnapshot, StorageHandle};
+use crate::storage::db::{BookmarkItem, SessionTabSnapshot, SitePermission, StorageHandle};
 use crate::ui::chrome::{
-    BookmarkInfo, ChromeState, Favicon, TabDisplayState, TabInfo, WorkspaceInfo,
+    BookmarkInfo, ChromeState, Favicon, PermissionPrompt, TabDisplayState, TabInfo, WorkspaceInfo,
 };
 use crate::ui::platform_view::{self, ContentRect};
 
@@ -331,6 +333,86 @@ struct ParallelRuntime {
     started_at: u64,
 }
 
+/// One unresolved native media-access prompt. The CEF callback is moved to the
+/// main UI thread and kept here until Allow/Deny/dismiss removes this entry,
+/// which makes every callback callable at most once.
+struct PendingMediaPermission {
+    tab_id: u64,
+    origin: String,
+    permissions: u32,
+    private: bool,
+    callback: cef::MediaAccessCallback,
+}
+
+impl std::fmt::Debug for PendingMediaPermission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingMediaPermission")
+            .field("tab_id", &self.tab_id)
+            .field("origin", &self.origin)
+            .field("permissions", &self.permissions)
+            .field("private", &self.private)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Remove a pending item and its queue position atomically. Returning the removed
+/// value is what guarantees a one-shot callback cannot be resolved twice.
+fn take_pending_permission<T>(
+    pending: &mut HashMap<u64, T>,
+    queue: &mut VecDeque<u64>,
+    request_id: u64,
+) -> Option<T> {
+    let value = pending.remove(&request_id)?;
+    queue.retain(|id| *id != request_id);
+    Some(value)
+}
+
+/// A saved decision only auto-resolves when every recognized permission in the
+/// request has the same answer. Mixed rules are shown to the user instead.
+fn remembered_permission_decision(
+    saved: &BTreeMap<(String, String), bool>,
+    origin: &str,
+    permissions: u32,
+) -> Option<bool> {
+    let kinds = MediaAccessPermissions::from_bits(permissions).kinds();
+    let mut decision = None;
+    for kind in kinds {
+        let allowed = *saved.get(&(origin.to_string(), kind.to_string()))?;
+        match decision {
+            None => decision = Some(allowed),
+            Some(previous) if previous != allowed => return None,
+            Some(_) => {}
+        }
+    }
+    decision
+}
+
+/// Record an explicit Allow/Deny decision. Private decisions only touch the
+/// in-memory incognito map; `storage` is deliberately not called for them.
+fn record_media_permission(
+    saved: &mut BTreeMap<(String, String), bool>,
+    private_saved: &mut BTreeMap<(String, String), bool>,
+    storage: Option<&StorageHandle>,
+    origin: &str,
+    permissions: u32,
+    is_private: bool,
+    granted: bool,
+) {
+    let kinds = MediaAccessPermissions::from_bits(permissions).kinds();
+    if kinds.is_empty() || origin.is_empty() {
+        return;
+    }
+    let target = if is_private { private_saved } else { saved };
+    for kind in kinds {
+        target.insert((origin.to_string(), kind.to_string()), granted);
+        if !is_private {
+            if let Some(storage) = storage {
+                storage.save_site_permission(origin.to_string(), kind.to_string(), granted);
+            }
+        }
+    }
+}
+
 pub struct TabManager {
     pub tabs: Vec<Tab>,
     pub active_tab_id: Option<u64>,
@@ -407,6 +489,13 @@ pub struct TabManager {
     // Download ids originating from incognito tabs. They stay in memory even
     // after the source tab closes so late CEF updates cannot reach SQLite.
     private_download_ids: HashSet<u32>,
+
+    // Unresolved WebRTC permission prompts. Both maps and callbacks live only
+    // on the main UI thread; CEF handlers send plain events over crossbeam.
+    pending_media_permissions: HashMap<u64, PendingMediaPermission>,
+    pending_media_permission_queue: VecDeque<u64>,
+    saved_site_permissions: BTreeMap<(String, String), bool>,
+    private_site_permissions: BTreeMap<(String, String), bool>,
 
     // Number of `host.close_browser(1)` calls awaiting an `on_before_close` event.
     pending_browser_closes: u32,
@@ -548,6 +637,10 @@ impl TabManager {
             private_context: None,
             last_normal_workspace_id: active_workspace_id,
             private_download_ids: HashSet::new(),
+            pending_media_permissions: HashMap::new(),
+            pending_media_permission_queue: VecDeque::new(),
+            saved_site_permissions: BTreeMap::new(),
+            private_site_permissions: BTreeMap::new(),
             pending_browser_closes: 0,
             pending_browser_spawns: VecDeque::new(),
             pending_navigation_checks: HashMap::new(),
@@ -586,6 +679,25 @@ impl TabManager {
         }
         downloads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
         self.downloads = downloads;
+    }
+
+    /// Seed remembered Allow/Deny answers from SQLite. Normal-space requests
+    /// can then resolve without showing a prompt; Incognito keeps its own
+    /// in-memory map and never reads or writes this cache.
+    pub fn seed_site_permissions(&mut self, permissions: Vec<SitePermission>) {
+        self.saved_site_permissions.clear();
+        for permission in permissions {
+            let bit = MediaAccessPermissions::bits_for_kind(&permission.permission);
+            if bit == 0 {
+                continue;
+            }
+            let origin = normalize_permission_origin(&permission.origin);
+            if origin.is_empty() {
+                continue;
+            }
+            self.saved_site_permissions
+                .insert((origin, permission.permission), permission.allowed);
+        }
     }
 
     /// Copy a download snapshot for shell actions that must not borrow
@@ -763,6 +875,66 @@ impl TabManager {
                 .any(|info| info.id == download_id && self.is_private_tab(info.tab_id))
     }
 
+    fn active_media_permission_request_id(&self) -> Option<u64> {
+        self.pending_media_permission_queue.front().copied()
+    }
+
+    /// Resolve one prompt exactly once: remove it first, then call the one-shot
+    /// callback only if removal succeeded. Explicit Allow/Deny are remembered;
+    /// Escape/click-outside dismisses the current request without saving a rule.
+    fn resolve_media_permission(&mut self, request_id: u64, granted: bool, persist: bool) {
+        let Some(pending) = take_pending_permission(
+            &mut self.pending_media_permissions,
+            &mut self.pending_media_permission_queue,
+            request_id,
+        ) else {
+            tracing::warn!("Ignoring stale media permission resolution {request_id}");
+            return;
+        };
+        // CEF requires getUserMedia callbacks to grant exactly the requested
+        // mask. Unknown future bits are still passed through on explicit Allow;
+        // only persistence is limited to permissions Kasumi can describe.
+        if granted {
+            pending.callback.cont(pending.permissions);
+        } else {
+            pending.callback.cancel();
+        }
+        if persist {
+            self.remember_media_permission(&pending, granted);
+        }
+    }
+
+    fn remember_media_permission(&mut self, pending: &PendingMediaPermission, granted: bool) {
+        record_media_permission(
+            &mut self.saved_site_permissions,
+            &mut self.private_site_permissions,
+            self.storage.as_ref(),
+            &pending.origin,
+            pending.permissions,
+            pending.private,
+            granted,
+        );
+    }
+
+    fn cancel_media_permissions_for_tab(&mut self, tab_id: u64) {
+        let ids: Vec<u64> = self
+            .pending_media_permissions
+            .iter()
+            .filter(|(_, pending)| pending.tab_id == tab_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.resolve_media_permission(id, false, false);
+        }
+    }
+
+    fn cancel_all_media_permissions(&mut self) {
+        let ids: Vec<u64> = self.pending_media_permissions.keys().copied().collect();
+        for id in ids {
+            self.resolve_media_permission(id, false, false);
+        }
+    }
+
     /// Single storage boundary for download snapshots. Private downloads are
     /// shown in the native bubble for the session but never reach the WAL.
     fn persist_download(&self, info: DownloadInfo) {
@@ -822,6 +994,7 @@ impl TabManager {
         self.workspaces
             .retain(|workspace| !Self::is_private_workspace(workspace.id));
         self.private_context = None;
+        self.private_site_permissions.clear();
         if Self::is_private_workspace(self.active_workspace_id) {
             self.active_workspace_id = self.normal_workspace_fallback();
         }
@@ -1703,6 +1876,7 @@ impl TabManager {
 
     /// Close every live browser while preserving tab metadata for session restore.
     pub fn close_all_browsers(&mut self) {
+        self.cancel_all_media_permissions();
         for tab in &mut self.tabs {
             if let Some(browser) = tab.browser.take() {
                 if let Some(host) = browser.host() {
@@ -1964,6 +2138,7 @@ impl TabManager {
             self.active_tab_by_workspace.remove(&tab.workspace_id);
         }
         self.pending_navigation_checks.remove(&id);
+        self.cancel_media_permissions_for_tab(id);
         self.requested_favicons.retain(|(tab_id, _)| *tab_id != id);
         self.pending_favicon_urls.remove(&id);
         self.resolved_favicons.remove(&id);
@@ -2040,6 +2215,7 @@ impl TabManager {
         }
 
         self.pending_navigation_checks.remove(&id);
+        self.cancel_media_permissions_for_tab(id);
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tracing::info!("Hibernating tab {} ({})", id, tab.title);
             if let Some(browser) = tab.browser.take() {
@@ -2786,6 +2962,63 @@ impl TabManager {
                 }
             }
             BrowserEvent::ParallelDownload(event) => self.handle_parallel_event(event),
+            BrowserEvent::MediaAccessPermissionRequested {
+                request_id,
+                tab_id,
+                origin,
+                permissions,
+                callback,
+            } => {
+                let Some(private) = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| Self::is_private_workspace(tab.workspace_id))
+                else {
+                    // A prompt from a browser whose tab metadata is gone must
+                    // still be resolved, but must never open an orphan dialog.
+                    callback.cancel();
+                    return;
+                };
+                if let Some(previous) = take_pending_permission(
+                    &mut self.pending_media_permissions,
+                    &mut self.pending_media_permission_queue,
+                    request_id,
+                ) {
+                    tracing::warn!("Replacing duplicate media permission request {request_id}");
+                    previous.callback.cancel();
+                }
+                let origin = normalize_permission_origin(&origin);
+                let saved = if private {
+                    &self.private_site_permissions
+                } else {
+                    &self.saved_site_permissions
+                };
+                let requested = MediaAccessPermissions::from_bits(permissions);
+                if !requested.has_unrecognized_bits() {
+                    if let Some(allowed) =
+                        remembered_permission_decision(saved, &origin, permissions)
+                    {
+                        if allowed {
+                            callback.cont(permissions);
+                        } else {
+                            callback.cancel();
+                        }
+                        return;
+                    }
+                }
+                self.pending_media_permissions.insert(
+                    request_id,
+                    PendingMediaPermission {
+                        tab_id,
+                        origin,
+                        permissions,
+                        private,
+                        callback,
+                    },
+                );
+                self.pending_media_permission_queue.push_back(request_id);
+            }
             BrowserEvent::BrowserCreated { tab_id, browser } => {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.browser = Some(browser);
@@ -2837,6 +3070,10 @@ impl TabManager {
                 self.sync_session();
             }
             BrowserEvent::AddressChange { tab_id, url } => {
+                // A committed navigation invalidates any prompt from the page
+                // that was showing before it. The callback is cancelled here
+                // rather than lingering behind a prompt for a different site.
+                self.cancel_media_permissions_for_tab(tab_id);
                 let committed_initial = !is_blank_navigation_url(&url)
                     && self.pending_navigation_checks.remove(&tab_id).is_some();
                 if committed_initial {
@@ -2892,6 +3129,7 @@ impl TabManager {
             }
             BrowserEvent::BrowserClosed { tab_id } => {
                 self.pending_navigation_checks.remove(&tab_id);
+                self.cancel_media_permissions_for_tab(tab_id);
                 // CEF browser is gone (user tab close, hibernation, or app shutdown).
                 // Never remove the tab metadata here — only release the handle.
                 tracing::info!(
@@ -3370,6 +3608,11 @@ impl TabManager {
             UiAction::ApplyPreferences(preferences) => {
                 self.apply_preferences(&preferences);
             }
+            UiAction::ResolveMediaAccessPermission {
+                request_id,
+                granted,
+                persist,
+            } => self.resolve_media_permission(request_id, granted, persist),
             // The winit handler persists the live rail toggle; tab state needs
             // no change for a chrome width update.
             UiAction::SetRailExpanded(_) => {}
@@ -3554,6 +3797,22 @@ impl TabManager {
             state.last_synced_tab_id = None;
             state.last_synced_url.clear();
         }
+
+        state.permission_prompt = match self.active_media_permission_request_id().and_then(|id| {
+            self.pending_media_permissions
+                .get(&id)
+                .map(|pending| (id, pending))
+        }) {
+            Some((request_id, pending)) => Some(PermissionPrompt {
+                request_id,
+                tab_id: pending.tab_id,
+                origin: pending.origin.clone(),
+                permissions: pending.permissions,
+                label: MediaAccessPermissions::from_bits(pending.permissions).label(),
+                private: pending.private,
+            }),
+            None => None,
+        };
     }
 }
 
@@ -3563,8 +3822,9 @@ mod tests {
         closed_tab_from, fallback_favicon_url, idle_timeout_for_pressure, insertion_index,
         is_blank_navigation_url, is_critical_pressure, needs_initial_navigation,
         next_navigation_retry_delay, normalize_workspace_selection, pinned_insert_index,
-        preferred_favicon_url, ram_pressure, restore_insert_index, should_hibernate_tab,
-        should_sync_omnibox, BrowserSpawnMode, Tab, TabManager, TabState,
+        preferred_favicon_url, ram_pressure, record_media_permission,
+        remembered_permission_decision, restore_insert_index, should_hibernate_tab,
+        should_sync_omnibox, take_pending_permission, BrowserSpawnMode, Tab, TabManager, TabState,
     };
     use crate::config::{
         BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
@@ -3576,8 +3836,106 @@ mod tests {
     };
     use crate::storage::db::{BookmarkItem, DbCommand, SessionTabSnapshot, StorageHandle};
     use crate::ui::platform_view::ContentRect;
+    use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc::UnboundedReceiver;
+
+    #[test]
+    fn pending_permission_is_taken_once_and_removed_from_queue() {
+        let mut pending = HashMap::new();
+        pending.insert(9, "callback");
+        let mut queue = VecDeque::from(vec![8, 9, 10]);
+
+        assert_eq!(
+            take_pending_permission(&mut pending, &mut queue, 9),
+            Some("callback")
+        );
+        assert_eq!(queue, VecDeque::from(vec![8, 10]));
+        assert_eq!(take_pending_permission(&mut pending, &mut queue, 9), None);
+    }
+
+    #[test]
+    fn saved_permission_decision_requires_a_uniform_answer() {
+        let mut saved = BTreeMap::new();
+        saved.insert(
+            ("https://example.com".to_string(), "camera".to_string()),
+            true,
+        );
+        saved.insert(
+            ("https://example.com".to_string(), "microphone".to_string()),
+            true,
+        );
+
+        assert_eq!(
+            remembered_permission_decision(&saved, "https://example.com", 3),
+            Some(true)
+        );
+        assert_eq!(
+            remembered_permission_decision(&saved, "https://other.example", 3),
+            None
+        );
+        assert_eq!(
+            remembered_permission_decision(&saved, "https://example.com", 0),
+            None
+        );
+
+        saved.insert(
+            ("https://example.com".to_string(), "microphone".to_string()),
+            false,
+        );
+        assert_eq!(
+            remembered_permission_decision(&saved, "https://example.com", 3),
+            None
+        );
+    }
+
+    #[test]
+    fn incognito_media_permissions_bypass_sqlite() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let storage = StorageHandle::from_sender(tx);
+        let mut saved = BTreeMap::new();
+        let mut private = BTreeMap::new();
+
+        record_media_permission(
+            &mut saved,
+            &mut private,
+            Some(&storage),
+            "https://meet.example",
+            3,
+            true,
+            true,
+        );
+        assert!(saved.is_empty());
+        assert_eq!(private.len(), 2);
+        assert!(rx.try_recv().is_err());
+
+        record_media_permission(
+            &mut saved,
+            &mut private,
+            Some(&storage),
+            "https://meet.example",
+            3,
+            false,
+            true,
+        );
+        assert_eq!(saved.len(), 2);
+        let mut written = Vec::new();
+        for _ in 0..2 {
+            match rx.try_recv().expect("site permission command") {
+                DbCommand::SaveSitePermission {
+                    origin,
+                    permission,
+                    allowed,
+                } => {
+                    assert_eq!(origin, "https://meet.example");
+                    assert!(allowed);
+                    written.push(permission);
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
+        assert_eq!(written, vec!["microphone", "camera"]);
+    }
 
     fn test_download_info_with_id(id: u32, state: DownloadState) -> DownloadInfo {
         DownloadInfo {

@@ -493,6 +493,8 @@ const DOWNLOADS_WIDTH: f32 = 460.0;
 const DOWNLOADS_MAX_HEIGHT: f32 = 460.0;
 const DOWNLOADS_BOTTOM_MARGIN: f32 = 18.0;
 const DOWNLOADS_RAIL_GAP: f32 = 12.0;
+const PERMISSION_PROMPT_WIDTH: f32 = 420.0;
+const PERMISSION_PROMPT_TOP_OFFSET: f32 = 72.0;
 
 /// Prefer egui's recommended non-sRGB surface formats. Some drivers only list
 /// `Bgra8UnormSrgb` first, which makes `egui_wgpu` warn about linear sRGB
@@ -699,6 +701,17 @@ pub struct RailMenu {
     pub height: f32,
 }
 
+/// A native camera/microphone prompt mirrored from `TabManager`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionPrompt {
+    pub request_id: u64,
+    pub tab_id: u64,
+    pub origin: String,
+    pub permissions: u32,
+    pub label: String,
+    pub private: bool,
+}
+
 /// Commands offered by the rail tab context menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RailMenuAction {
@@ -802,6 +815,8 @@ pub struct ChromeState {
     pub menu_selection: usize,
     /// True while the native downloads bubble is visible in the overlay.
     pub downloads_open: bool,
+    /// Highest-priority modal: a CEF WebRTC permission request awaiting a reply.
+    pub permission_prompt: Option<PermissionPrompt>,
     /// True when at least one closed tab can be restored with Cmd/Ctrl+Z.
     pub can_reopen_tab: bool,
     /// Current OS light/dark appearance. The user preference may override it.
@@ -871,6 +886,7 @@ impl Default for ChromeState {
             menu: None,
             menu_selection: 0,
             downloads_open: false,
+            permission_prompt: None,
             can_reopen_tab: false,
             system_theme: ChromeTheme::default(),
             theme: ChromeTheme::default(),
@@ -985,7 +1001,8 @@ impl ChromeState {
 
     /// True when the shared overlay must capture pointer/keyboard input.
     pub fn has_modal_overlay(&self) -> bool {
-        self.command_palette_open
+        self.permission_prompt.is_some()
+            || self.command_palette_open
             || self.menu.is_some()
             || self.settings_open
             || self.bookmark_manager_open
@@ -1096,6 +1113,19 @@ impl ChromeState {
     pub fn close_downloads(&mut self) {
         self.downloads_open = false;
         self.tooltip = None;
+    }
+
+    /// Emit a transient dismissal for the highest-priority modal. The actual
+    /// CEF callback is resolved by `TabManager`; clearing state here alone would
+    /// leave the request hanging.
+    pub fn dismiss_permission_prompt(&self, actions: &mut Vec<UiAction>) {
+        if let Some(prompt) = self.permission_prompt.as_ref() {
+            actions.push(UiAction::ResolveMediaAccessPermission {
+                request_id: prompt.request_id,
+                granted: false,
+                persist: false,
+            });
+        }
     }
 
     /// Open the native Settings overlay on a specific page, seeded from
@@ -2491,6 +2521,147 @@ impl ChromeRenderer {
 
         // Keep the rail width associated with the panel for tests/debugging.
         let _ = rail.response.rect;
+    }
+
+    /// Draw a native WebRTC permission prompt above the page. Unlike a browser
+    /// dialog, this lives in Kasumi's transparent native overlay so it can be
+    /// keyboard-driven and keeps the page visible behind it.
+    pub fn build_permission_prompt(
+        ctx: &egui::Context,
+        state: &ChromeState,
+        actions: &mut Vec<UiAction>,
+    ) {
+        let Some(prompt) = state.permission_prompt.as_ref() else {
+            return;
+        };
+        let request_id = prompt.request_id;
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            state.dismiss_permission_prompt(actions);
+            return;
+        }
+
+        let palette = state.palette();
+        let screen = ctx.viewport_rect();
+        let width = PERMISSION_PROMPT_WIDTH.min((screen.width() - 24.0).max(240.0));
+        let x = (screen.width() - width) / 2.0;
+        let y = PERMISSION_PROMPT_TOP_OFFSET.min((screen.height() - 140.0).max(4.0));
+
+        egui::Area::new(egui::Id::new("permission_scrim"))
+            .order(Order::Foreground)
+            .fixed_pos(screen.min)
+            .movable(false)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, CornerRadius::ZERO, palette.scrim);
+            });
+
+        let mut card_rect = egui::Rect::from_min_size(pos2(x, y), vec2(width, 0.0));
+        let mut allow_clicked = false;
+        let mut deny_clicked = false;
+        egui::Area::new(egui::Id::new("permission_prompt"))
+            .order(Order::Foreground)
+            .fixed_pos(pos2(x, y))
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                card_rect = Frame::NONE
+                    .fill(palette.palette_bg)
+                    .stroke(Stroke::new(1.0_f32, palette.palette_border))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(16, 14))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("🛡")
+                                    .font(FontId::new(16.0, FontFamily::Proportional)),
+                            );
+                            ui.label(
+                                RichText::new("Permission request")
+                                    .size(13.0)
+                                    .color(palette.text_strong),
+                            );
+                            if prompt.private {
+                                ui.label(
+                                    RichText::new("Incognito")
+                                        .size(10.0)
+                                        .color(palette.rail_accent),
+                                );
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Allow {} to use {}?",
+                                prompt.origin, prompt.label
+                            ))
+                            .size(14.0)
+                            .color(palette.text_strong),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(if prompt.private {
+                                "This choice is forgotten when Incognito closes."
+                            } else {
+                                "Kasumi remembers your choice for this site."
+                            })
+                            .size(10.0)
+                            .color(palette.palette_subtext),
+                        );
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    allow_clicked = material_button(
+                                        ui,
+                                        RailIcon::Check,
+                                        "Allow",
+                                        MaterialButtonStyle::Filled,
+                                        &palette,
+                                        true,
+                                    )
+                                    .clicked();
+                                    deny_clicked = material_button(
+                                        ui,
+                                        RailIcon::Close,
+                                        "Deny",
+                                        MaterialButtonStyle::Tonal,
+                                        &palette,
+                                        true,
+                                    )
+                                    .clicked();
+                                },
+                            );
+                        });
+                    })
+                    .response
+                    .rect
+                    .expand(8.0);
+            });
+
+        if deny_clicked {
+            actions.push(UiAction::ResolveMediaAccessPermission {
+                request_id,
+                granted: false,
+                persist: true,
+            });
+        } else if allow_clicked {
+            actions.push(UiAction::ResolveMediaAccessPermission {
+                request_id,
+                granted: true,
+                persist: true,
+            });
+        } else if ctx.input(|i| {
+            command_palette_click_outside(
+                card_rect,
+                i.pointer.latest_pos(),
+                i.pointer.primary_clicked(),
+            )
+        }) {
+            state.dismiss_permission_prompt(actions);
+        }
     }
 
     /// Draw the floating command palette over a dimmed full-window layer.
@@ -4869,25 +5040,35 @@ impl ChromeOverlayRenderer {
         let mut raw_input = self.egui_state.take_egui_input(window);
         state.expire_toast();
         state.promote_pending_toast();
-        // Only one surface may own the shared overlay. Settings has priority,
-        // then the bookmark manager, context menu, command palette, and
-        // downloads bubble. A toast paints only when no modal surface is active.
-        let settings_open = state.settings_open;
-        let bookmark_manager_open = state.bookmark_manager_open && !settings_open;
-        let menu_open = state.menu.is_some() && !settings_open && !bookmark_manager_open;
-        let palette_open =
-            state.command_palette_open && !menu_open && !settings_open && !bookmark_manager_open;
+        // Only one surface may own the shared overlay. A native permission
+        // prompt always wins because a WebRTC request must not be hidden behind
+        // Settings or the palette. Then come Settings, bookmark manager,
+        // context menu, command palette, and downloads bubble. A toast paints
+        // only when no modal surface is active.
+        let permission_open = state.permission_prompt.is_some();
+        let settings_open = state.settings_open && !permission_open;
+        let bookmark_manager_open =
+            state.bookmark_manager_open && !settings_open && !permission_open;
+        let menu_open =
+            state.menu.is_some() && !settings_open && !bookmark_manager_open && !permission_open;
+        let palette_open = state.command_palette_open
+            && !menu_open
+            && !settings_open
+            && !bookmark_manager_open
+            && !permission_open;
         let downloads_open = state.downloads_open
             && !palette_open
             && !menu_open
             && !settings_open
-            && !bookmark_manager_open;
+            && !bookmark_manager_open
+            && !permission_open;
         let toast_open = state.toast.is_some()
             && !settings_open
             && !bookmark_manager_open
             && !menu_open
             && !palette_open
-            && !downloads_open;
+            && !downloads_open
+            && !permission_open;
         let focus_before = state.command_palette_focus_requested && palette_open;
         let select_all_before = state.command_palette_select_all_requested && palette_open;
         state.apply_visuals(&self.egui_ctx);
@@ -4910,7 +5091,9 @@ impl ChromeOverlayRenderer {
         let egui_ctx = self.egui_ctx.clone();
         let mut full_output = egui_ctx.run_ui(raw_input, |ui| {
             let ctx = ui.ctx().clone();
-            if settings_open {
+            if permission_open {
+                ChromeRenderer::build_permission_prompt(&ctx, state, &mut actions);
+            } else if settings_open {
                 ChromeRenderer::build_settings(&ctx, state, &mut actions);
             } else if bookmark_manager_open {
                 ChromeRenderer::build_bookmark_manager(&ctx, state, &mut actions);
@@ -6573,8 +6756,8 @@ mod tests {
         resolve_omnibox, resolve_omnibox_with_search, tab_close_center, tab_status_center,
         tooltip_size_for_text, truncate_title, workspace_form_actions, BookmarkInfo, ChromePalette,
         ChromeRenderer, ChromeState, ChromeTheme, CommandAction, DownloadBadge, DownloadSummary,
-        RailMenuAction, SettingsTab, TabDisplayState, TabInfo, ToastKind, WorkspaceInfo,
-        RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED, RAIL_STATUS_ICON_EXPANDED,
+        PermissionPrompt, RailMenuAction, SettingsTab, TabDisplayState, TabInfo, ToastKind,
+        WorkspaceInfo, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED, RAIL_STATUS_ICON_EXPANDED,
         TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_MAX_WIDTH,
     };
     use crate::config::{
@@ -6612,6 +6795,34 @@ mod tests {
             title: title.to_string(),
             folder: folder.to_string(),
         }
+    }
+
+    #[test]
+    fn permission_prompt_is_modal_and_dismissal_does_not_persist() {
+        let mut state = ChromeState::default();
+        assert!(!state.has_modal_overlay());
+
+        state.permission_prompt = Some(PermissionPrompt {
+            request_id: 42,
+            tab_id: 7,
+            origin: "https://meet.example".to_string(),
+            permissions: 3,
+            label: "microphone and camera".to_string(),
+            private: false,
+        });
+        assert!(state.has_modal_overlay());
+        assert!(!state.is_toast_only());
+
+        let mut actions = Vec::new();
+        state.dismiss_permission_prompt(&mut actions);
+        assert_eq!(
+            actions,
+            vec![UiAction::ResolveMediaAccessPermission {
+                request_id: 42,
+                granted: false,
+                persist: false,
+            }]
+        );
     }
 
     #[test]
