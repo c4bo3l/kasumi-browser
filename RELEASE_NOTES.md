@@ -16,6 +16,10 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 - Reduced both bottom page HUD strips from 32 DIPs to 24 DIPs, with 18×18 icon buttons, a 2 DIP icon inset, 2 DIP vertical margin, and 9 pt numeric labels.
 - Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.8.1` to `0.9.0`.
 
+### Fixed
+
+- Long rail and page-HUD tooltip labels now wrap inside a text-sized card that grows vertically. The card width follows the longest laid-out row up to a bounded maximum, so incognito, workspace, and URL tooltips stay readable instead of running outside the translucent overlay.
+
 ### Privacy
 
 - Private navigations and titles never emit `history` writes, and private tabs/workspaces are filtered from session and workspace snapshots.
@@ -27,7 +31,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 - `cargo fmt --all -- --check`
 - `cargo check --bins`
-- `cargo test --bin kasumi-browser` — 187 tests
+- `cargo test --bin kasumi-browser` — 188 tests
 - `cargo build --release`
 
 ---

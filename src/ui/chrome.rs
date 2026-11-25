@@ -466,7 +466,14 @@ fn workspace_form_actions(
     actions
 }
 
-const TOOLTIP_WIDTH: f32 = 190.0;
+/// Tooltips wrap inside this maximum card width; short labels get a narrower
+/// card sized from the laid-out text.
+const TOOLTIP_MAX_WIDTH: f32 = 280.0;
+const TOOLTIP_MIN_WIDTH: f32 = 120.0;
+const TOOLTIP_TEXT_MARGIN_X: f32 = 8.0;
+const TOOLTIP_TEXT_MARGIN_Y: f32 = 6.0;
+const TOOLTIP_FONT_SIZE: f32 = 11.0;
+const TOOLTIP_MAX_ROWS: usize = 6;
 const TOOLTIP_HEIGHT_EXPANDED: f32 = 44.0;
 const TOOLTIP_HEIGHT_COLLAPSED: f32 = 38.0;
 const RAIL_MENU_WIDTH: f32 = 224.0;
@@ -1951,19 +1958,14 @@ impl ChromeRenderer {
             .map_or(0, |tab| tab.blocked_requests);
         let ram_mb = state.ram_mb;
         let palette = state.palette();
-        let (tooltip_width, tooltip_height) = rail_tooltip_metrics(false);
         let set_tooltip = |state: &mut ChromeState, response: &Response, text: String| {
             if response.hovered() {
+                let (width, height) = tooltip_size_for_text(ctx, &text, false);
                 state.tooltip = Some(RailTooltip {
                     text,
-                    anchor: bottom_hud_tooltip_anchor(
-                        response.rect,
-                        screen,
-                        tooltip_width,
-                        tooltip_height,
-                    ),
-                    width: tooltip_width,
-                    height: tooltip_height,
+                    anchor: bottom_hud_tooltip_anchor(response.rect, screen, width, height),
+                    width,
+                    height,
                 });
             }
         };
@@ -4351,10 +4353,11 @@ impl ChromeRenderer {
 
         let rail = ui.clip_rect();
         let screen = ui.ctx().viewport_rect();
-        let (width, height) = rail_tooltip_metrics(expanded);
+        let text = text.into();
+        let (width, height) = tooltip_size_for_text(ui.ctx(), &text, expanded);
         let anchor = page_tooltip_anchor(rail, response.rect, screen, width, height);
         *tooltip = Some(RailTooltip {
-            text: text.into(),
+            text,
             anchor,
             width,
             height,
@@ -5138,34 +5141,30 @@ impl TooltipRenderer {
                         .fill(palette.tooltip_bg)
                         .stroke(Stroke::new(1.0_f32, palette.tooltip_border))
                         .corner_radius(CornerRadius::same(6))
-                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .inner_margin(egui::Margin::symmetric(
+                            TOOLTIP_TEXT_MARGIN_X as i8,
+                            TOOLTIP_TEXT_MARGIN_Y as i8,
+                        ))
                         .show(ui, |ui| {
                             // Fill the whole overlay window so the visible card is
-                            // vertically centered on the hovered tab row. A plain
-                            // label sizes the frame to its text and leaves the card
-                            // pinned near the top of the taller transparent window.
+                            // centered on the hovered tab row. Reuse the same
+                            // wrapped galley that sized the window, so long text
+                            // cannot overflow the card.
+                            let galley = with_tooltip_galley(ui.ctx(), &card.text, |galley| galley);
                             let inner_size = vec2(
-                                (card.width - 16.0).max(80.0),
-                                (card.height - 12.0).max(10.0),
+                                (card.width - 2.0 * TOOLTIP_TEXT_MARGIN_X).max(40.0),
+                                (card.height - 2.0 * TOOLTIP_TEXT_MARGIN_Y).max(10.0),
                             );
                             let (rect, _) = ui.allocate_exact_size(inner_size, Sense::hover());
-                            let lines: Vec<&str> = card.text.lines().collect();
-                            let line_height = 15.0_f32;
-                            let total_height = lines.len() as f32 * line_height;
-                            let first_line_y =
-                                rect.center().y - total_height * 0.5 + line_height * 0.5;
-                            for (index, line) in lines.iter().enumerate() {
-                                ui.painter().text(
-                                    pos2(
-                                        rect.center().x,
-                                        first_line_y + index as f32 * line_height,
-                                    ),
-                                    Align2::CENTER_CENTER,
-                                    *line,
-                                    FontId::proportional(11.0),
-                                    palette.tooltip_text,
-                                );
-                            }
+                            let text_pos = pos2(
+                                rect.left() + (rect.width() - galley.rect.width()) * 0.5,
+                                rect.top() + (rect.height() - galley.rect.height()) * 0.5,
+                            );
+                            ui.painter().galley_with_override_text_color(
+                                text_pos,
+                                galley,
+                                palette.tooltip_text,
+                            );
                         });
                 });
         });
@@ -5739,14 +5738,52 @@ pub fn rail_tooltip_enabled(expanded: bool) -> bool {
     !expanded
 }
 
-/// Tooltip width/height for each rail mode. Both modes use a readable card
-/// placed over the page; expanded rows include the URL and need more height.
+/// Maximum tooltip width and minimum card height for each rail mode. Actual
+/// tooltip cards are sized from their wrapped text with `tooltip_size_for_text`.
 pub fn rail_tooltip_metrics(expanded: bool) -> (f32, f32) {
     if expanded {
-        (TOOLTIP_WIDTH, TOOLTIP_HEIGHT_EXPANDED)
+        (TOOLTIP_MAX_WIDTH, TOOLTIP_HEIGHT_EXPANDED)
     } else {
-        (TOOLTIP_WIDTH, TOOLTIP_HEIGHT_COLLAPSED)
+        (TOOLTIP_MAX_WIDTH, TOOLTIP_HEIGHT_COLLAPSED)
     }
+}
+
+/// Lay out tooltip text with the same wrapping rules in both the chrome frame
+/// that sizes the overlay window and the overlay frame that paints it.
+fn with_tooltip_galley<R>(
+    ctx: &egui::Context,
+    text: &str,
+    use_galley: impl FnOnce(Arc<egui::text::Galley>) -> R,
+) -> R {
+    ctx.fonts_mut(|fonts| {
+        let mut job = egui::text::LayoutJob::simple(
+            text.to_owned(),
+            FontId::proportional(TOOLTIP_FONT_SIZE),
+            Color32::PLACEHOLDER,
+            TOOLTIP_MAX_WIDTH - 2.0 * TOOLTIP_TEXT_MARGIN_X,
+        );
+        // Long titles and URLs often have no spaces; break them rather than
+        // letting a single row run outside the card.
+        job.wrap.break_anywhere = true;
+        job.wrap.max_rows = TOOLTIP_MAX_ROWS;
+        use_galley(fonts.layout_job(job))
+    })
+}
+
+/// Size a tooltip card from its wrapped text so long labels never run outside
+/// the overlay window. Width shrinks to the longest row and height grows with
+/// the row count, within a bounded maximum width and row count.
+pub fn tooltip_size_for_text(ctx: &egui::Context, text: &str, expanded: bool) -> (f32, f32) {
+    let (_, min_height) = rail_tooltip_metrics(expanded);
+    with_tooltip_galley(ctx, text, |galley| {
+        let text_width = galley.rect.width().clamp(
+            TOOLTIP_MIN_WIDTH,
+            TOOLTIP_MAX_WIDTH - 2.0 * TOOLTIP_TEXT_MARGIN_X,
+        );
+        let width = (text_width + 2.0 * TOOLTIP_TEXT_MARGIN_X).min(TOOLTIP_MAX_WIDTH);
+        let height = (galley.rect.height() + 2.0 * TOOLTIP_TEXT_MARGIN_Y).max(min_height);
+        (width, height)
+    })
 }
 
 /// Icon size for the RAM/ad-block status rows. The collapsed rail uses larger
@@ -6534,11 +6571,11 @@ mod tests {
         rail_menu_anchor, rail_menu_click_outside, rail_menu_items, rail_menu_metrics,
         rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled, rail_tooltip_metrics,
         resolve_omnibox, resolve_omnibox_with_search, tab_close_center, tab_status_center,
-        truncate_title, workspace_form_actions, BookmarkInfo, ChromePalette, ChromeRenderer,
-        ChromeState, ChromeTheme, CommandAction, DownloadBadge, DownloadSummary, RailMenuAction,
-        SettingsTab, TabDisplayState, TabInfo, ToastKind, WorkspaceInfo, RAIL_STATUS_HEIGHT,
-        RAIL_STATUS_ICON_COLLAPSED, RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED,
-        TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
+        tooltip_size_for_text, truncate_title, workspace_form_actions, BookmarkInfo, ChromePalette,
+        ChromeRenderer, ChromeState, ChromeTheme, CommandAction, DownloadBadge, DownloadSummary,
+        RailMenuAction, SettingsTab, TabDisplayState, TabInfo, ToastKind, WorkspaceInfo,
+        RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED, RAIL_STATUS_ICON_EXPANDED,
+        TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_MAX_WIDTH,
     };
     use crate::config::{
         BrowserPreferences, SearchEngine, ThemePreference, Workspace, WorkspaceColor,
@@ -6842,9 +6879,9 @@ mod tests {
     #[test]
     fn collapsed_tooltips_are_compact_translucent_and_render_over_the_page() {
         let (width, height) = rail_tooltip_metrics(false);
-        assert_eq!(width, TOOLTIP_WIDTH);
+        assert_eq!(width, TOOLTIP_MAX_WIDTH);
         assert_eq!(height, TOOLTIP_HEIGHT_COLLAPSED);
-        assert!((150.0..=220.0).contains(&width));
+        assert!((240.0..=320.0).contains(&width));
         assert!((30.0..=48.0).contains(&height));
 
         for palette in [ChromePalette::DARK, ChromePalette::LIGHT] {
@@ -6860,6 +6897,35 @@ mod tests {
         assert!(anchor.x >= rail.right());
         assert!(anchor.x + width <= screen.right());
         assert!(anchor.y + height <= screen.bottom());
+    }
+
+    #[test]
+    fn long_tooltips_wrap_and_grow_instead_of_overflowing() {
+        // Font metrics are only available after the first egui pass.
+        let ctx = egui::Context::default();
+        let mut initial_frame = ctx.run_ui(egui::RawInput::default(), |_| {});
+        initial_frame.textures_delta.clear();
+
+        let short = tooltip_size_for_text(&ctx, "RAM 512 MB", false);
+        let long = tooltip_size_for_text(
+            &ctx,
+            "Switch to a workspace with an extremely long custom name that definitely needs more than two rows in the collapsed rail tooltip overlay",
+            false,
+        );
+        let multiline = tooltip_size_for_text(
+            &ctx,
+            "Secret title with a long descriptive prefix\nhttps://a-really-long.example.com/some/deep/path/that/keeps/going",
+            false,
+        );
+
+        assert!(short.1 <= TOOLTIP_HEIGHT_COLLAPSED);
+        assert!(long.1 > short.1, "wrapped label must make the card taller");
+        assert!(
+            multiline.1 > short.1,
+            "explicit lines must make the card taller"
+        );
+        assert!(long.0 <= TOOLTIP_MAX_WIDTH);
+        assert!(multiline.0 <= TOOLTIP_MAX_WIDTH);
     }
 
     #[test]
@@ -6986,8 +7052,8 @@ mod tests {
         let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
         let button = egui::Rect::from_min_size(pos2(230.0, 760.0), vec2(30.0, 30.0));
         let anchor =
-            bottom_hud_tooltip_anchor(button, screen, TOOLTIP_WIDTH, TOOLTIP_HEIGHT_COLLAPSED);
-        assert_eq!(anchor.x, button.center().x - TOOLTIP_WIDTH * 0.5);
+            bottom_hud_tooltip_anchor(button, screen, TOOLTIP_MAX_WIDTH, TOOLTIP_HEIGHT_COLLAPSED);
+        assert_eq!(anchor.x, button.center().x - TOOLTIP_MAX_WIDTH * 0.5);
         assert_eq!(anchor.y, button.top() - TOOLTIP_HEIGHT_COLLAPSED - 6.0);
         assert!(anchor.y + TOOLTIP_HEIGHT_COLLAPSED <= button.top());
     }
@@ -6997,7 +7063,7 @@ mod tests {
         let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
         let button = egui::Rect::from_min_size(pos2(2.0, 760.0), vec2(30.0, 30.0));
         let anchor =
-            bottom_hud_tooltip_anchor(button, screen, TOOLTIP_WIDTH, TOOLTIP_HEIGHT_COLLAPSED);
+            bottom_hud_tooltip_anchor(button, screen, TOOLTIP_MAX_WIDTH, TOOLTIP_HEIGHT_COLLAPSED);
         assert_eq!(anchor.x, 6.0);
     }
 
@@ -7044,7 +7110,13 @@ mod tests {
         let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(RAIL_WIDTH_EXPANDED, 800.0));
         let row = egui::Rect::from_min_size(pos2(6.0, 200.0), vec2(168.0, 36.0));
         let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
-        let anchor = page_tooltip_anchor(rail, row, screen, TOOLTIP_WIDTH, TOOLTIP_HEIGHT_EXPANDED);
+        let anchor = page_tooltip_anchor(
+            rail,
+            row,
+            screen,
+            TOOLTIP_MAX_WIDTH,
+            TOOLTIP_HEIGHT_EXPANDED,
+        );
         assert_eq!(
             anchor,
             pos2(
@@ -7054,7 +7126,7 @@ mod tests {
         );
         assert_eq!(anchor.y + TOOLTIP_HEIGHT_EXPANDED * 0.5, row.center().y);
         assert!(anchor.x >= rail.right());
-        assert!(anchor.x + TOOLTIP_WIDTH <= screen.right());
+        assert!(anchor.x + TOOLTIP_MAX_WIDTH <= screen.right());
         assert!(anchor.y + TOOLTIP_HEIGHT_EXPANDED <= screen.bottom());
     }
 
@@ -7063,7 +7135,13 @@ mod tests {
         let rail = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(RAIL_WIDTH_EXPANDED, 800.0));
         let row = egui::Rect::from_min_size(pos2(6.0, 790.0), vec2(168.0, 36.0));
         let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
-        let anchor = page_tooltip_anchor(rail, row, screen, TOOLTIP_WIDTH, TOOLTIP_HEIGHT_EXPANDED);
+        let anchor = page_tooltip_anchor(
+            rail,
+            row,
+            screen,
+            TOOLTIP_MAX_WIDTH,
+            TOOLTIP_HEIGHT_EXPANDED,
+        );
         assert_eq!(anchor.y, 800.0 - TOOLTIP_HEIGHT_EXPANDED - 6.0);
         assert!(anchor.y + TOOLTIP_HEIGHT_EXPANDED <= screen.bottom());
     }
