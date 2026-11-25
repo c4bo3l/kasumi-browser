@@ -397,6 +397,17 @@ pub struct TabManager {
     pub storage: Option<StorageHandle>,
     pub recently_closed: Vec<ClosedTab>,
 
+    // One in-memory CEF request context shared by the incognito workspace. It
+    // lives on the main UI thread and survives tab hibernation, but is dropped
+    // as soon as the last private tab closes.
+    private_context: Option<cef::RequestContext>,
+    // Normal space to restore on the next launch when the user leaves the
+    // incognito space visible. Private state is never persisted.
+    last_normal_workspace_id: u64,
+    // Download ids originating from incognito tabs. They stay in memory even
+    // after the source tab closes so late CEF updates cannot reach SQLite.
+    private_download_ids: HashSet<u32>,
+
     // Number of `host.close_browser(1)` calls awaiting an `on_before_close` event.
     pending_browser_closes: u32,
 
@@ -488,6 +499,11 @@ impl TabManager {
         let download_preferences = client::SharedDownloadPreferences::from_preferences(preferences);
 
         let mut workspaces = workspaces;
+        // A private workspace must never be restored from SQLite, even if an
+        // older database somehow contains one.
+        workspaces.retain(|workspace| !Workspace::is_private_id(workspace.id));
+        let mut bookmarks = bookmarks;
+        bookmarks.retain(|bookmark| !Workspace::is_private_id(bookmark.workspace_id));
         if workspaces.is_empty() {
             workspaces.push(Workspace::default_workspace());
         }
@@ -529,6 +545,9 @@ impl TabManager {
             home_url: preferences.home_url().to_string(),
             storage,
             recently_closed: Vec::new(),
+            private_context: None,
+            last_normal_workspace_id: active_workspace_id,
+            private_download_ids: HashSet::new(),
             pending_browser_closes: 0,
             pending_browser_spawns: VecDeque::new(),
             pending_navigation_checks: HashMap::new(),
@@ -600,6 +619,12 @@ impl TabManager {
             return;
         }
 
+        // Remember privacy before the tab can close: late CEF updates keep
+        // arriving after `on_before_close` and must still bypass SQLite.
+        if self.is_private_download(&info) {
+            self.private_download_ids.insert(info.id);
+        }
+
         let is_new = !self.downloads.iter().any(|download| download.id == info.id);
         let previous_state = self
             .downloads
@@ -657,9 +682,7 @@ impl TabManager {
             self.download_callbacks.remove(&info.id);
         }
 
-        if let Some(ref storage) = self.storage {
-            storage.save_download(info);
-        }
+        self.persist_download(info);
     }
 
     fn set_download_state(&mut self, download_id: u32, state: DownloadState) {
@@ -676,9 +699,7 @@ impl TabManager {
         }
         info.updated_at = Self::now_unix_secs();
         let info = info.clone();
-        if let Some(ref storage) = self.storage {
-            storage.save_download(info);
-        }
+        self.persist_download(info);
     }
 
     fn now_unix_secs() -> u64 {
@@ -688,13 +709,138 @@ impl TabManager {
             .unwrap_or_default()
     }
 
+    /// Reserved incognito space is the only workspace that must never touch
+    /// SQLite. Keeping the check in one place avoids accidental persistence
+    /// when new tab actions are added.
+    fn is_private_workspace(workspace_id: u64) -> bool {
+        Workspace::is_private_id(workspace_id)
+    }
+
+    fn is_private_tab(&self, tab_id: u64) -> bool {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .is_some_and(|tab| Self::is_private_workspace(tab.workspace_id))
+    }
+
+    /// Lazily create CEF's in-memory request context. An empty cache path puts
+    /// the browser into Chromium's incognito mode: cookies, HTTP cache,
+    /// IndexedDB, localStorage, and service workers stay off disk.
+    fn private_context(&mut self) -> Option<cef::RequestContext> {
+        if self.private_context.is_none() {
+            let mut settings = cef::RequestContextSettings::default();
+            settings.cache_path = cef::CefString::from("");
+            settings.persist_session_cookies = 0;
+            self.private_context = cef::request_context_create_context(Some(&settings), None);
+            if self.private_context.is_none() {
+                tracing::error!("Could not create CEF incognito request context");
+            }
+        }
+        self.private_context.clone()
+    }
+
     fn request_context_for_tab(&self, tab_id: u64) -> Option<cef::RequestContext> {
+        if self.is_private_tab(tab_id) {
+            return self.private_context.clone();
+        }
         self.tabs
             .iter()
             .find(|tab| tab.id == tab_id)
             .and_then(|tab| tab.browser.as_ref())
             .and_then(|browser| browser.host())
             .and_then(|host| host.request_context())
+    }
+
+    fn is_private_download(&self, info: &DownloadInfo) -> bool {
+        self.private_download_ids.contains(&info.id) || self.is_private_tab(info.tab_id)
+    }
+
+    fn is_private_download_id(&self, download_id: u32) -> bool {
+        self.private_download_ids.contains(&download_id)
+            || self
+                .downloads
+                .iter()
+                .any(|info| info.id == download_id && self.is_private_tab(info.tab_id))
+    }
+
+    /// Single storage boundary for download snapshots. Private downloads are
+    /// shown in the native bubble for the session but never reach the WAL.
+    fn persist_download(&self, info: DownloadInfo) {
+        if self.is_private_download(&info) {
+            return;
+        }
+        if let Some(ref storage) = self.storage {
+            storage.save_download(info);
+        }
+    }
+
+    fn normal_workspace_fallback(&self) -> u64 {
+        if !Self::is_private_workspace(self.last_normal_workspace_id)
+            && self
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == self.last_normal_workspace_id)
+        {
+            return self.last_normal_workspace_id;
+        }
+        self.workspaces
+            .iter()
+            .find(|workspace| !Self::is_private_workspace(workspace.id))
+            .map(|workspace| workspace.id)
+            .unwrap_or(Workspace::DEFAULT_ID)
+    }
+
+    fn remember_normal_workspace(&mut self, workspace_id: u64) {
+        if !Self::is_private_workspace(workspace_id) {
+            self.last_normal_workspace_id = workspace_id;
+        }
+    }
+
+    fn ensure_private_workspace(&mut self) {
+        if !self
+            .workspaces
+            .iter()
+            .any(|workspace| Self::is_private_workspace(workspace.id))
+        {
+            self.workspaces.push(Workspace::private_workspace());
+            self.regroup_tabs();
+        }
+    }
+
+    /// Remove the ephemeral workspace and CEF request context after the last
+    /// private tab closes. Download ids are retained until their CEF callbacks
+    /// finish so late updates still bypass SQLite.
+    fn cleanup_private_workspace_if_empty(&mut self, workspace_id: u64) -> bool {
+        if !Self::is_private_workspace(workspace_id)
+            || self
+                .tabs
+                .iter()
+                .any(|tab| Self::is_private_workspace(tab.workspace_id))
+        {
+            return false;
+        }
+        self.workspaces
+            .retain(|workspace| !Self::is_private_workspace(workspace.id));
+        self.private_context = None;
+        if Self::is_private_workspace(self.active_workspace_id) {
+            self.active_workspace_id = self.normal_workspace_fallback();
+        }
+        true
+    }
+
+    /// Open the incognito space from a shell shortcut, native menu, or palette.
+    /// Pressing it again while incognito is visible opens another private tab,
+    /// matching the familiar browser behavior without spawning a second native
+    /// window.
+    pub fn new_private_window(&mut self) {
+        self.ensure_private_workspace();
+        if Workspace::is_private_id(self.active_workspace_id) {
+            tracing::info!("Opening another tab in the incognito space");
+            self.create_tab(None, true);
+            return;
+        }
+        tracing::info!("Opening incognito space with isolated CEF request context");
+        self.switch_workspace(Workspace::PRIVATE_ID);
     }
 
     fn unique_download_path(directory: &Path, suggested_name: &str) -> PathBuf {
@@ -859,21 +1005,21 @@ impl TabManager {
             runtime.ranged = false;
             runtime.segments.clear();
         }
-        if let Some(info) = self
+        let snapshot = self
             .downloads
             .iter_mut()
             .find(|item| item.id == download_id)
-        {
-            info.segments = 1;
-            info.total_bytes = total_bytes;
-            info.received_bytes = 0;
-            info.percent_complete = 0;
-            info.state = DownloadState::InProgress;
-            info.updated_at = Self::now_unix_secs();
-            let snapshot = info.clone();
-            if let Some(ref storage) = self.storage {
-                storage.save_download(snapshot);
-            }
+            .map(|info| {
+                info.segments = 1;
+                info.total_bytes = total_bytes;
+                info.received_bytes = 0;
+                info.percent_complete = 0;
+                info.state = DownloadState::InProgress;
+                info.updated_at = Self::now_unix_secs();
+                info.clone()
+            });
+        if let Some(snapshot) = snapshot {
+            self.persist_download(snapshot);
         }
         self.begin_single_segment(download_id, total_bytes, false);
     }
@@ -926,18 +1072,18 @@ impl TabManager {
             runtime.segments[index].request = request;
         }
 
-        if let Some(info) = self
+        let snapshot = self
             .downloads
             .iter_mut()
             .find(|item| item.id == download_id)
-        {
-            info.segments = ranges.len().min(u8::MAX as usize) as u8;
-            info.total_bytes = runtime.total_bytes;
-            info.updated_at = Self::now_unix_secs();
-            let snapshot = info.clone();
-            if let Some(ref storage) = self.storage {
-                storage.save_download(snapshot);
-            }
+            .map(|info| {
+                info.segments = ranges.len().min(u8::MAX as usize) as u8;
+                info.total_bytes = runtime.total_bytes;
+                info.updated_at = Self::now_unix_secs();
+                info.clone()
+            });
+        if let Some(snapshot) = snapshot {
+            self.persist_download(snapshot);
         }
     }
 
@@ -1210,15 +1356,7 @@ impl TabManager {
     }
 
     fn sync_native_download_info(&mut self, download_id: u32, persist: bool) {
-        let runtime = self.parallel_downloads.get(&download_id);
-        let Some(info) = self
-            .downloads
-            .iter_mut()
-            .find(|item| item.id == download_id)
-        else {
-            return;
-        };
-        let Some(runtime) = runtime else {
+        let Some(runtime) = self.parallel_downloads.get(&download_id) else {
             return;
         };
         let received = runtime
@@ -1231,19 +1369,27 @@ impl TabManager {
         } else {
             received
         };
-        info.received_bytes = received;
-        info.total_bytes = total;
-        info.segments = runtime.segments.len().min(u8::MAX as usize) as u8;
-        info.percent_complete = if total > 0 {
-            ((received.saturating_mul(100)) / total).clamp(0, 100) as i32
-        } else {
-            0
-        };
-        info.updated_at = Self::now_unix_secs();
-        let snapshot = info.clone();
+        let segments = runtime.segments.len().min(u8::MAX as usize) as u8;
+
+        let snapshot = self
+            .downloads
+            .iter_mut()
+            .find(|item| item.id == download_id)
+            .map(|info| {
+                info.received_bytes = received;
+                info.total_bytes = total;
+                info.segments = segments;
+                info.percent_complete = if total > 0 {
+                    ((received.saturating_mul(100)) / total).clamp(0, 100) as i32
+                } else {
+                    0
+                };
+                info.updated_at = Self::now_unix_secs();
+                info.clone()
+            });
         if persist {
-            if let Some(ref storage) = self.storage {
-                storage.save_download(snapshot);
+            if let Some(snapshot) = snapshot {
+                self.persist_download(snapshot);
             }
         }
     }
@@ -1277,16 +1423,16 @@ impl TabManager {
                 runtime.last_speed_at = last_speed_at;
             }
             self.sync_native_download_info(download_id, false);
-            if let Some(info) = self
+            let snapshot = self
                 .downloads
                 .iter_mut()
                 .find(|item| item.id == download_id)
-            {
-                info.current_speed = speed;
-                let snapshot = info.clone();
-                if let Some(ref storage) = self.storage {
-                    storage.save_download(snapshot);
-                }
+                .map(|info| {
+                    info.current_speed = speed;
+                    info.clone()
+                });
+            if let Some(snapshot) = snapshot {
+                self.persist_download(snapshot);
             }
         }
     }
@@ -1324,25 +1470,25 @@ impl TabManager {
         self.cancel_native_requests(download_id);
         self.download_writer.flush(download_id);
         self.download_writer.finish(download_id);
-        if let Some(info) = self
+        let snapshot = self
             .downloads
             .iter_mut()
             .find(|item| item.id == download_id)
-        {
-            info.state = DownloadState::Completed;
-            info.received_bytes = if total > 0 {
-                total
-            } else {
-                info.received_bytes
-            };
-            info.total_bytes = if total > 0 { total } else { info.total_bytes };
-            info.percent_complete = 100;
-            info.current_speed = 0;
-            info.updated_at = Self::now_unix_secs();
-            let snapshot = info.clone();
-            if let Some(ref storage) = self.storage {
-                storage.save_download(snapshot);
-            }
+            .map(|info| {
+                info.state = DownloadState::Completed;
+                info.received_bytes = if total > 0 {
+                    total
+                } else {
+                    info.received_bytes
+                };
+                info.total_bytes = if total > 0 { total } else { info.total_bytes };
+                info.percent_complete = 100;
+                info.current_speed = 0;
+                info.updated_at = Self::now_unix_secs();
+                info.clone()
+            });
+        if let Some(snapshot) = snapshot {
+            self.persist_download(snapshot);
         }
         if let Some(info) = self.download_snapshot(download_id) {
             self.queue_download_notification(&info, DownloadNotificationKind::Completed);
@@ -1369,7 +1515,13 @@ impl TabManager {
     /// Restore previous session tabs (instant startup: only the active tab of
     /// the active workspace is live; everything else starts hibernated).
     pub fn restore_session(&mut self, restored: Vec<SessionTabSnapshot>) {
-        if restored.is_empty() {
+        // Defensive guard: a stale/corrupt database must never resurrect private
+        // navigation into a normal workspace on startup.
+        let mut ordered: Vec<SessionTabSnapshot> = restored
+            .into_iter()
+            .filter(|snapshot| !Self::is_private_workspace(snapshot.workspace_id))
+            .collect();
+        if ordered.is_empty() {
             self.create_tab(None, true);
             self.sync_session();
             return;
@@ -1381,7 +1533,6 @@ impl TabManager {
             .enumerate()
             .map(|(index, workspace)| (workspace.id, index))
             .collect();
-        let mut ordered = restored;
         // Group by workspace first, then keep pinned tabs at the top of each group.
         ordered.sort_by_key(|snapshot| {
             (
@@ -1462,7 +1613,10 @@ impl TabManager {
         let Some(closed) = self.recently_closed.pop() else {
             return;
         };
-        let workspace_id = if self.workspaces.iter().any(|w| w.id == closed.workspace_id) {
+        let workspace_id = if Self::is_private_workspace(closed.workspace_id) {
+            self.ensure_private_workspace();
+            Workspace::PRIVATE_ID
+        } else if self.workspaces.iter().any(|w| w.id == closed.workspace_id) {
             closed.workspace_id
         } else {
             self.active_workspace_id
@@ -1491,13 +1645,21 @@ impl TabManager {
 
     /// Generate session snapshot for SQLite persistence.
     pub fn session_snapshots(&self) -> Vec<SessionTabSnapshot> {
+        let active_id = if Self::is_private_workspace(self.active_workspace_id) {
+            self.active_tab_by_workspace
+                .get(&self.normal_workspace_fallback())
+                .copied()
+        } else {
+            self.active_tab_id
+        };
         self.tabs
             .iter()
+            .filter(|tab| !Self::is_private_workspace(tab.workspace_id))
             .map(|t| SessionTabSnapshot {
                 workspace_id: t.workspace_id,
                 url: t.url.clone(),
                 title: t.title.clone(),
-                is_active: self.active_tab_by_workspace.get(&t.workspace_id).copied() == Some(t.id),
+                is_active: active_id == Some(t.id),
                 is_hibernated: t.state == TabState::Hibernated,
                 is_pinned: t.pinned,
             })
@@ -1505,16 +1667,25 @@ impl TabManager {
     }
 
     fn workspace_snapshots(&self) -> Vec<Workspace> {
-        if self.workspaces.is_empty() {
-            return vec![Workspace::default_workspace()];
-        }
-        self.workspaces
+        let active_id = if Self::is_private_workspace(self.active_workspace_id) {
+            self.normal_workspace_fallback()
+        } else {
+            self.active_workspace_id
+        };
+        let snapshots: Vec<Workspace> = self
+            .workspaces
             .iter()
+            .filter(|workspace| !Self::is_private_workspace(workspace.id))
             .map(|workspace| Workspace {
-                is_active: workspace.id == self.active_workspace_id,
+                is_active: workspace.id == active_id,
                 ..workspace.clone()
             })
-            .collect()
+            .collect();
+        if snapshots.is_empty() {
+            vec![Workspace::default_workspace()]
+        } else {
+            snapshots
+        }
     }
 
     /// Sync open tabs and workspace metadata to SQLite.
@@ -1558,7 +1729,13 @@ impl TabManager {
     /// Unlike restored tabs, the browser is live; unlike the active tab, its
     /// native child view stays hidden until the user selects it.
     pub fn create_background_tab(&mut self, url: String) -> u64 {
-        let id = self.insert_tab(Some(url.clone()), None, None, false, false);
+        self.create_background_tab_in_workspace(url, self.active_workspace_id)
+    }
+
+    /// Open a background tab in a specific workspace, used by incognito popups.
+    fn create_background_tab_in_workspace(&mut self, url: String, workspace_id: u64) -> u64 {
+        let id =
+            self.insert_tab_in_workspace(Some(url.clone()), None, None, false, false, workspace_id);
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tab.state = TabState::Background {
                 since: Instant::now(),
@@ -1668,7 +1845,11 @@ impl TabManager {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
             return;
         };
-        if self.tabs[index].pinned || self.tabs[index].workspace_id == workspace_id {
+        if self.tabs[index].pinned
+            || self.tabs[index].workspace_id == workspace_id
+            || Self::is_private_workspace(self.tabs[index].workspace_id)
+            || Self::is_private_workspace(workspace_id)
+        {
             return;
         }
 
@@ -1741,6 +1922,7 @@ impl TabManager {
 
         self.active_tab_id = Some(id);
         self.active_workspace_id = target_workspace;
+        self.remember_normal_workspace(target_workspace);
         self.active_tab_by_workspace.insert(target_workspace, id);
 
         let (target_url, is_hibernated, has_browser) = {
@@ -1776,6 +1958,7 @@ impl TabManager {
 
         let workspace_id = self.tabs[index].workspace_id;
         let mut tab = self.tabs.remove(index);
+        let private_workspace_closed = self.cleanup_private_workspace_if_empty(workspace_id);
         self.recently_closed.push(closed_tab_from(&tab, index));
         if self.active_tab_by_workspace.get(&tab.workspace_id) == Some(&id) {
             self.active_tab_by_workspace.remove(&tab.workspace_id);
@@ -1810,7 +1993,20 @@ impl TabManager {
                     .filter(|(_, tab)| tab.workspace_id == workspace_id)
                     .map(|(i, tab)| (i, tab.id))
                     .collect();
-                if same_workspace.is_empty() {
+                if same_workspace.is_empty() && private_workspace_closed {
+                    // Incognito is gone, so return to the normal space that was
+                    // visible before it rather than opening a private tab.
+                    let fallback = self
+                        .tabs
+                        .iter()
+                        .find(|tab| tab.workspace_id == self.active_workspace_id)
+                        .map(|tab| tab.id);
+                    if let Some(id) = fallback {
+                        self.focus_tab(id);
+                    } else {
+                        self.create_tab(None, true);
+                    }
+                } else if same_workspace.is_empty() {
                     // The workspace still exists but has no tabs left; open a
                     // fresh one there instead of silently jumping workspaces.
                     self.create_tab(None, true);
@@ -1918,6 +2114,7 @@ impl TabManager {
         }
 
         self.active_workspace_id = workspace_id;
+        self.remember_normal_workspace(workspace_id);
         let target = self
             .active_tab_by_workspace
             .get(&workspace_id)
@@ -1940,10 +2137,11 @@ impl TabManager {
     /// Choose the workspace that opens at startup. This does not change which
     /// workspace is visible in the current session.
     pub fn set_default_workspace(&mut self, workspace_id: u64) {
-        if !self
-            .workspaces
-            .iter()
-            .any(|workspace| workspace.id == workspace_id)
+        if Self::is_private_workspace(workspace_id)
+            || !self
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == workspace_id)
         {
             return;
         }
@@ -1983,13 +2181,14 @@ impl TabManager {
     pub fn create_workspace(&mut self, name: String, icon: WorkspaceIcon, color: WorkspaceColor) {
         let name = self.unique_workspace_name(&name, None);
 
-        let id = self
+        let highest = self
             .workspaces
             .iter()
+            .filter(|workspace| !Self::is_private_workspace(workspace.id))
             .map(|workspace| workspace.id)
             .max()
-            .unwrap_or(Workspace::DEFAULT_ID)
-            + 1;
+            .unwrap_or(Workspace::DEFAULT_ID);
+        let id = highest.checked_add(1).unwrap_or(Workspace::DEFAULT_ID + 1);
         self.workspaces.push(Workspace {
             id,
             name,
@@ -2011,6 +2210,9 @@ impl TabManager {
         icon: WorkspaceIcon,
         color: WorkspaceColor,
     ) {
+        if Self::is_private_workspace(workspace_id) {
+            return;
+        }
         let name = self.unique_workspace_name(&name, Some(workspace_id));
         let Some(workspace) = self
             .workspaces
@@ -2041,7 +2243,8 @@ impl TabManager {
     /// Delete a workspace without losing its tabs or bookmarks. Tabs move to
     /// the first remaining workspace; bookmarks move to an archived folder.
     pub fn delete_workspace(&mut self, workspace_id: u64) {
-        if self.workspaces.len() <= 1
+        if Self::is_private_workspace(workspace_id)
+            || self.workspaces.len() <= 1
             || !self
                 .workspaces
                 .iter()
@@ -2114,6 +2317,10 @@ impl TabManager {
             return;
         };
         let workspace_id = tab.workspace_id;
+        if Self::is_private_workspace(workspace_id) {
+            tracing::info!("Bookmarks are disabled in the incognito space");
+            return;
+        }
         let folder = self.workspace_name(workspace_id);
         let url = tab.url.clone();
         let title = tab.title.clone();
@@ -2150,6 +2357,11 @@ impl TabManager {
         title: String,
         folder: String,
     ) {
+        if Self::is_private_workspace(original_workspace_id)
+            || Self::is_private_workspace(workspace_id)
+        {
+            return;
+        }
         let Some(index) = self.bookmarks.iter().position(|bookmark| {
             bookmark.workspace_id == original_workspace_id && bookmark.url == original_url
         }) else {
@@ -2194,6 +2406,9 @@ impl TabManager {
 
     /// Remove a bookmark without touching the page it points to.
     pub fn delete_bookmark(&mut self, workspace_id: u64, url: String) {
+        if Self::is_private_workspace(workspace_id) {
+            return;
+        }
         let Some(index) = self
             .bookmarks
             .iter()
@@ -2316,7 +2531,14 @@ impl TabManager {
 
     /// Spawns a CEF browser for a specific tab ID. `hidden` keeps a
     /// middle-clicked background tab from flashing over the active page.
-    fn spawn_browser(&self, tab_id: u64, url: &str, hidden: bool) {
+    fn spawn_browser(&mut self, tab_id: u64, url: &str, hidden: bool) {
+        // Private tabs receive CEF's in-memory request context. Keeping it on
+        // the UI thread avoids sharing a request context across FFI handlers.
+        let mut private_context = if self.is_private_tab(tab_id) {
+            self.private_context()
+        } else {
+            None
+        };
         let mut client = client::create_tab_client(
             tab_id,
             self.event_sender.clone(),
@@ -2364,7 +2586,7 @@ impl TabManager {
             Some(&cef_url),
             Some(&browser_settings),
             None,
-            None,
+            private_context.as_mut(),
         );
 
         if success == 1 {
@@ -2603,10 +2825,13 @@ impl TabManager {
                 // icon only after a real URL has committed.
             }
             BrowserEvent::TitleChange { tab_id, title } => {
+                let private = self.is_private_tab(tab_id);
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.title = title.clone();
-                    if let Some(ref storage) = self.storage {
-                        storage.record_visit(tab.url.clone(), title);
+                    if !private {
+                        if let Some(ref storage) = self.storage {
+                            storage.record_visit(tab.url.clone(), title);
+                        }
                     }
                 }
                 self.sync_session();
@@ -2617,6 +2842,7 @@ impl TabManager {
                 if committed_initial {
                     tracing::info!("Initial navigation committed for tab {tab_id}: {url}");
                 }
+                let private = self.is_private_tab(tab_id);
                 let mut fallback = None;
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     if tab.url != url {
@@ -2631,8 +2857,10 @@ impl TabManager {
                     }
                     fallback = fallback_favicon_url(&url);
                     tab.url = url.clone();
-                    if let Some(ref storage) = self.storage {
-                        storage.record_visit(url, tab.title.clone());
+                    if !private {
+                        if let Some(ref storage) = self.storage {
+                            storage.record_visit(url, tab.title.clone());
+                        }
                     }
                 }
                 self.sync_session();
@@ -2680,6 +2908,9 @@ impl TabManager {
                 BrowserShortcut::NewTab => {
                     self.create_tab(None, true);
                 }
+                BrowserShortcut::NewPrivateWindow => {
+                    self.new_private_window();
+                }
                 BrowserShortcut::CloseTab => {
                     self.close_tab(tab_id);
                 }
@@ -2713,7 +2944,7 @@ impl TabManager {
                     // path; TabManager must never call process::exit().
                 }
             },
-            BrowserEvent::ViewSource { url, .. } => {
+            BrowserEvent::ViewSource { tab_id, url } => {
                 if url.is_empty() {
                     return;
                 }
@@ -2722,11 +2953,31 @@ impl TabManager {
                 } else {
                     format!("view-source:{}", url)
                 };
-                let existing = self.tabs.iter().find(|t| t.url == source_url).map(|t| t.id);
+                let workspace_id = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| tab.workspace_id)
+                    .unwrap_or(self.active_workspace_id);
+                if Self::is_private_workspace(workspace_id) {
+                    self.ensure_private_workspace();
+                }
+                let existing = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.workspace_id == workspace_id && tab.url == source_url)
+                    .map(|tab| tab.id);
                 if let Some(id) = existing {
                     self.focus_tab(id);
                 } else {
-                    self.create_tab(Some(source_url), true);
+                    self.insert_tab_in_workspace(
+                        Some(source_url),
+                        None,
+                        None,
+                        true,
+                        false,
+                        workspace_id,
+                    );
                 }
             }
             BrowserEvent::FaviconUrlChanged { tab_id, urls } => {
@@ -2805,14 +3056,37 @@ impl TabManager {
             BrowserEvent::NewWindow { url } => {
                 self.create_tab(Some(url), true);
             }
-            BrowserEvent::OpenUrlFromTab { url, background } => {
+            BrowserEvent::OpenUrlFromTab {
+                tab_id,
+                url,
+                background,
+            } => {
                 if url.is_empty() {
                     return;
                 }
+                // Popups and middle-clicks inherit the originating tab's
+                // workspace, so an incognito page cannot escape to a normal
+                // (persisted) browser context.
+                let source_workspace = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| tab.workspace_id)
+                    .unwrap_or(self.active_workspace_id);
+                if Self::is_private_workspace(source_workspace) {
+                    self.ensure_private_workspace();
+                }
                 if background {
-                    self.create_background_tab(url);
+                    self.create_background_tab_in_workspace(url, source_workspace);
                 } else {
-                    self.create_tab(Some(url), true);
+                    self.insert_tab_in_workspace(
+                        Some(url),
+                        None,
+                        None,
+                        true,
+                        false,
+                        source_workspace,
+                    );
                 }
             }
         }
@@ -2824,6 +3098,7 @@ impl TabManager {
             UiAction::NewTab { url } => {
                 self.create_tab(url, true);
             }
+            UiAction::NewPrivateWindow => self.new_private_window(),
             UiAction::ReopenClosedTab => {
                 self.reopen_closed_tab();
             }
@@ -2990,8 +3265,10 @@ impl TabManager {
                 // Keep the superseded id for the whole session: a late CEF
                 // cancellation callback must not resurrect a removed download.
                 self.downloads.retain(|download| download.id != download_id);
-                if let Some(ref storage) = self.storage {
-                    storage.remove_download(download_id);
+                if !self.is_private_download_id(download_id) {
+                    if let Some(ref storage) = self.storage {
+                        storage.remove_download(download_id);
+                    }
                 }
             }
             UiAction::ClearCompletedDownloads => {
@@ -3013,9 +3290,22 @@ impl TabManager {
                 }
             }
             UiAction::RetryDownload { download_id } => {
+                let private = self.is_private_download_id(download_id);
                 if let Some(info) = self.download_snapshot(download_id) {
                     if info.engine == DownloadEngine::Parallel {
                         self.start_native_download(info);
+                    } else if private {
+                        // Never replay an incognito URL into the persisted space:
+                        // recreate the ephemeral workspace if it was closed.
+                        self.ensure_private_workspace();
+                        self.insert_tab_in_workspace(
+                            Some(info.url),
+                            None,
+                            None,
+                            true,
+                            false,
+                            Workspace::PRIVATE_ID,
+                        );
                     } else {
                         self.create_tab(Some(info.url), true);
                     }
@@ -3102,19 +3392,19 @@ impl TabManager {
                 tracing::error!(
                     "Native download {download_id} could not be finalized; marking interrupted"
                 );
-                if let Some(info) = self
+                let snapshot = self
                     .downloads
                     .iter_mut()
                     .find(|item| item.id == download_id)
-                {
-                    if info.state == DownloadState::Completed {
+                    .filter(|info| info.state == DownloadState::Completed)
+                    .map(|info| {
                         info.state = DownloadState::Interrupted;
                         info.current_speed = 0;
                         info.updated_at = Self::now_unix_secs();
-                        if let Some(ref storage) = self.storage {
-                            storage.save_download(info.clone());
-                        }
-                    }
+                        info.clone()
+                    });
+                if let Some(snapshot) = snapshot {
+                    self.persist_download(snapshot);
                 }
             }
         }
@@ -3280,10 +3570,14 @@ mod tests {
         BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
         TAB_IDLE_TIMEOUT_NORMAL, TAB_IDLE_TIMEOUT_PRESSURE,
     };
-    use crate::events::{DownloadEngine, DownloadInfo, DownloadNotificationKind, DownloadState};
-    use crate::storage::db::{BookmarkItem, SessionTabSnapshot};
+    use crate::events::{
+        BrowserEvent, DownloadEngine, DownloadInfo, DownloadNotificationKind, DownloadState,
+        UiAction,
+    };
+    use crate::storage::db::{BookmarkItem, DbCommand, SessionTabSnapshot, StorageHandle};
     use crate::ui::platform_view::ContentRect;
     use std::time::{Duration, Instant};
+    use tokio::sync::mpsc::UnboundedReceiver;
 
     fn test_download_info_with_id(id: u32, state: DownloadState) -> DownloadInfo {
         DownloadInfo {
@@ -4213,5 +4507,334 @@ mod tests {
             preferred_favicon_url(&urls),
             Some("https://cdn.example.com/a.png".to_string())
         );
+    }
+
+    type DbReceiver = UnboundedReceiver<DbCommand>;
+
+    fn test_manager_with_storage() -> (TabManager, DbReceiver, u64) {
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let (db_tx, mut db_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut manager = TabManager::new(
+            event_tx,
+            event_rx,
+            std::ptr::null_mut(),
+            ContentRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                scale_factor: 1.0,
+            },
+            Some(StorageHandle::from_sender(db_tx)),
+            &BrowserPreferences::default(),
+            vec![Workspace::default_workspace()],
+            vec![],
+        );
+        let normal_tab_id = manager.create_tab(Some("https://personal.example".to_string()), true);
+        let _ = drain_db_commands(&mut db_rx);
+        (manager, db_rx, normal_tab_id)
+    }
+
+    fn drain_db_commands(receiver: &mut DbReceiver) -> Vec<DbCommand> {
+        let mut commands = Vec::new();
+        while let Ok(command) = receiver.try_recv() {
+            commands.push(command);
+        }
+        commands
+    }
+
+    fn private_tab_id(manager: &TabManager) -> u64 {
+        manager
+            .tabs
+            .iter()
+            .find(|tab| Workspace::is_private_id(tab.workspace_id))
+            .map(|tab| tab.id)
+            .expect("incognito tab should exist")
+    }
+
+    fn assert_public_snapshots(commands: &[DbCommand]) {
+        for command in commands {
+            match command {
+                DbCommand::SaveSession { tabs } => assert!(
+                    tabs.iter()
+                        .all(|tab| !Workspace::is_private_id(tab.workspace_id)),
+                    "private tab reached the session snapshot"
+                ),
+                DbCommand::SaveWorkspaces { workspaces } => assert!(
+                    workspaces
+                        .iter()
+                        .all(|workspace| !Workspace::is_private_id(workspace.id)),
+                    "private workspace reached the workspace snapshot"
+                ),
+                DbCommand::AddBookmark { workspace_id, .. }
+                | DbCommand::DeleteBookmark { workspace_id, .. } => assert!(
+                    !Workspace::is_private_id(*workspace_id),
+                    "private bookmark reached SQLite"
+                ),
+                DbCommand::SaveBookmark {
+                    original_workspace_id,
+                    workspace_id,
+                    ..
+                } => assert!(
+                    !Workspace::is_private_id(*original_workspace_id)
+                        && !Workspace::is_private_id(*workspace_id),
+                    "private bookmark edit reached SQLite"
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn incognito_shortcut_reuses_one_private_workspace() {
+        let (mut manager, mut db_rx, _normal_tab_id) = test_manager_with_storage();
+
+        manager.new_private_window();
+        assert_eq!(manager.active_workspace_id, Workspace::PRIVATE_ID);
+        assert_eq!(
+            manager
+                .workspaces
+                .iter()
+                .filter(|workspace| Workspace::is_private_id(workspace.id))
+                .count(),
+            1
+        );
+        let first_private = private_tab_id(&manager);
+
+        manager.new_private_window();
+        assert_eq!(
+            manager
+                .tabs
+                .iter()
+                .filter(|tab| Workspace::is_private_id(tab.workspace_id))
+                .count(),
+            2
+        );
+        assert_eq!(
+            manager
+                .workspaces
+                .iter()
+                .filter(|workspace| Workspace::is_private_id(workspace.id))
+                .count(),
+            1
+        );
+        let private_ids: Vec<u64> = manager
+            .tabs
+            .iter()
+            .filter(|tab| Workspace::is_private_id(tab.workspace_id))
+            .map(|tab| tab.id)
+            .collect();
+        assert_eq!(private_ids.len(), 2);
+        assert_ne!(private_ids[0], private_ids[1]);
+        assert!(private_ids.contains(&first_private));
+        assert_public_snapshots(&drain_db_commands(&mut db_rx));
+    }
+
+    #[test]
+    fn incognito_navigation_and_snapshots_never_emit_history_writes() {
+        let (mut manager, mut db_rx, _normal_tab_id) = test_manager_with_storage();
+        manager.new_private_window();
+        let private_id = private_tab_id(&manager);
+        let _ = drain_db_commands(&mut db_rx);
+
+        manager.handle_browser_event(BrowserEvent::AddressChange {
+            tab_id: private_id,
+            url: "https://secret.example/path".to_string(),
+        });
+        manager.handle_browser_event(BrowserEvent::TitleChange {
+            tab_id: private_id,
+            title: "Secret title".to_string(),
+        });
+        manager.sync_session();
+
+        let commands = drain_db_commands(&mut db_rx);
+        assert!(
+            commands
+                .iter()
+                .all(|command| !matches!(command, DbCommand::RecordVisit { .. })),
+            "incognito navigation wrote a history visit"
+        );
+        assert_public_snapshots(&commands);
+        assert!(manager
+            .session_snapshots()
+            .iter()
+            .all(|tab| !Workspace::is_private_id(tab.workspace_id)
+                && tab.url != "https://secret.example/path"));
+        assert!(manager
+            .workspace_snapshots()
+            .iter()
+            .all(|workspace| !Workspace::is_private_id(workspace.id)));
+    }
+
+    #[test]
+    fn incognito_popups_and_view_source_inherit_private_workspace() {
+        let (mut manager, mut db_rx, normal_tab_id) = test_manager_with_storage();
+        manager.new_private_window();
+        let private_id = private_tab_id(&manager);
+        let _ = drain_db_commands(&mut db_rx);
+
+        manager.handle_browser_event(BrowserEvent::OpenUrlFromTab {
+            tab_id: private_id,
+            url: "https://popup.example".to_string(),
+            background: false,
+        });
+        manager.handle_browser_event(BrowserEvent::OpenUrlFromTab {
+            tab_id: private_id,
+            url: "https://background.example".to_string(),
+            background: true,
+        });
+        manager.handle_browser_event(BrowserEvent::ViewSource {
+            tab_id: private_id,
+            url: "https://secret.example".to_string(),
+        });
+
+        let private_tabs: Vec<_> = manager
+            .tabs
+            .iter()
+            .filter(|tab| Workspace::is_private_id(tab.workspace_id))
+            .collect();
+        assert_eq!(private_tabs.len(), 4);
+        assert_eq!(
+            manager
+                .tabs
+                .iter()
+                .filter(|tab| tab.id == normal_tab_id)
+                .count(),
+            1
+        );
+        assert!(private_tabs
+            .iter()
+            .any(|tab| tab.url == "https://popup.example"));
+        assert!(private_tabs
+            .iter()
+            .any(|tab| tab.url == "https://background.example"));
+        assert!(private_tabs
+            .iter()
+            .any(|tab| tab.url == "view-source:https://secret.example"));
+
+        let commands = drain_db_commands(&mut db_rx);
+        assert!(
+            commands
+                .iter()
+                .all(|command| !matches!(command, DbCommand::RecordVisit { .. })),
+            "incognito popup wrote a history visit"
+        );
+        assert_public_snapshots(&commands);
+    }
+
+    #[test]
+    fn closing_last_incognito_tab_returns_to_the_previous_workspace() {
+        let (mut manager, mut db_rx, normal_tab_id) = test_manager_with_storage();
+        manager.new_private_window();
+        let private_id = private_tab_id(&manager);
+        let _ = drain_db_commands(&mut db_rx);
+
+        manager.close_tab(private_id);
+
+        assert!(!manager
+            .workspaces
+            .iter()
+            .any(|workspace| Workspace::is_private_id(workspace.id)));
+        assert_eq!(manager.active_workspace_id, Workspace::DEFAULT_ID);
+        assert_eq!(manager.active_tab_id, Some(normal_tab_id));
+        assert!(manager.private_context.is_none());
+        assert_eq!(
+            manager.recently_closed.last().map(|tab| tab.workspace_id),
+            Some(Workspace::PRIVATE_ID)
+        );
+        assert_public_snapshots(&drain_db_commands(&mut db_rx));
+    }
+
+    #[test]
+    fn incognito_bookmarks_and_downloads_bypass_sqlite() {
+        let (mut manager, mut db_rx, normal_tab_id) = test_manager_with_storage();
+        manager.new_private_window();
+        let private_id = private_tab_id(&manager);
+        let _ = drain_db_commands(&mut db_rx);
+
+        let mut info = test_download_info_with_id(91, DownloadState::InProgress);
+        info.tab_id = private_id;
+        manager.record_download(info, None);
+        manager.add_bookmark(private_id);
+        manager.save_bookmark(
+            Workspace::PRIVATE_ID,
+            "https://secret.example".to_string(),
+            Workspace::PRIVATE_ID,
+            "https://secret.example".to_string(),
+            "Secret".to_string(),
+            Workspace::PRIVATE_NAME.to_string(),
+        );
+        manager.delete_bookmark(Workspace::PRIVATE_ID, "https://secret.example".to_string());
+
+        let commands = drain_db_commands(&mut db_rx);
+        assert!(
+            commands.iter().all(|command| !matches!(
+                command,
+                DbCommand::SaveDownload { .. }
+                    | DbCommand::AddBookmark { .. }
+                    | DbCommand::SaveBookmark { .. }
+                    | DbCommand::DeleteBookmark { .. }
+            )),
+            "incognito bookmark or download reached SQLite"
+        );
+        assert_public_snapshots(&commands);
+
+        // The same channel still carries normal writes, so the assertions above
+        // prove privacy rather than a disconnected storage handle.
+        manager.add_bookmark(normal_tab_id);
+        assert!(drain_db_commands(&mut db_rx)
+            .iter()
+            .any(|command| matches!(command, DbCommand::AddBookmark { .. })));
+    }
+
+    #[test]
+    fn retrying_a_private_download_reopens_it_incognito() {
+        let (mut manager, mut db_rx, _normal_tab_id) = test_manager_with_storage();
+        manager.new_private_window();
+        let private_id = private_tab_id(&manager);
+        let _ = drain_db_commands(&mut db_rx);
+
+        let mut info = test_download_info_with_id(92, DownloadState::Interrupted);
+        info.tab_id = private_id;
+        manager.record_download(info, None);
+        let _ = drain_db_commands(&mut db_rx);
+
+        manager.close_tab(private_id);
+        let _ = drain_db_commands(&mut db_rx);
+        assert_eq!(manager.active_workspace_id, Workspace::DEFAULT_ID);
+
+        manager.handle_ui_action(UiAction::RetryDownload { download_id: 92 });
+
+        let active_id = manager.active_tab_id.expect("retry opens a tab");
+        let active = manager
+            .tabs
+            .iter()
+            .find(|tab| tab.id == active_id)
+            .expect("active tab exists");
+        assert_eq!(active.workspace_id, Workspace::PRIVATE_ID);
+        assert_eq!(active.url, "https://example.com/file.zip");
+        assert_public_snapshots(&drain_db_commands(&mut db_rx));
+    }
+
+    #[test]
+    fn restore_ignores_private_rows_from_a_stale_database() {
+        let (mut manager, mut db_rx, _normal_tab_id) = test_manager_with_storage();
+
+        manager.restore_session(vec![SessionTabSnapshot {
+            workspace_id: Workspace::PRIVATE_ID,
+            url: "https://secret.example".to_string(),
+            title: "Secret".to_string(),
+            is_active: true,
+            is_hibernated: true,
+            is_pinned: false,
+        }]);
+
+        assert!(manager
+            .tabs
+            .iter()
+            .all(|tab| !Workspace::is_private_id(tab.workspace_id)
+                && tab.url != "https://secret.example"));
+        assert_ne!(manager.active_workspace_id, Workspace::PRIVATE_ID);
+        assert_public_snapshots(&drain_db_commands(&mut db_rx));
     }
 }

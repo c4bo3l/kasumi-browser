@@ -431,6 +431,7 @@ mod native_shortcuts {
         match key {
             'b' if shift => Some(BrowserShortcut::OpenBookmarkManager),
             'c' if shift => Some(BrowserShortcut::CopyUrl),
+            'n' if shift => Some(BrowserShortcut::NewPrivateWindow),
             't' if shift => Some(BrowserShortcut::ReopenClosedTab),
             't' => Some(BrowserShortcut::NewTab),
             'w' if !shift => Some(BrowserShortcut::CloseTab),
@@ -483,6 +484,10 @@ fn setup_mac_application() {
         send_menu_shortcut(BrowserShortcut::NewTab);
     }
 
+    extern "C" fn menu_new_incognito_window(_this: *mut c_void, _cmd: *mut c_void) {
+        send_menu_shortcut(BrowserShortcut::NewPrivateWindow);
+    }
+
     extern "C" fn menu_close_tab(_this: *mut c_void, _cmd: *mut c_void) {
         send_menu_shortcut(BrowserShortcut::CloseTab);
     }
@@ -531,6 +536,7 @@ fn setup_mac_application() {
                 objc2::ffi::class_addMethod(cls_mut, sel, imp, types.as_ptr());
             };
             register_action("kasumiNewTab:", menu_new_tab);
+            register_action("kasumiNewIncognitoWindow:", menu_new_incognito_window);
             register_action("kasumiCloseTab:", menu_close_tab);
             register_action("kasumiOpenSettings:", menu_open_settings);
             register_action("kasumiOpenDownloads:", menu_open_downloads);
@@ -580,7 +586,7 @@ fn install_macos_main_menu() {
     let app_menu = NSMenu::new(mtm);
     let app_version = NSMenuItem::new(mtm);
     unsafe {
-        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.8.1"));
+        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.9.0"));
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
@@ -598,6 +604,12 @@ fn install_macos_main_menu() {
     };
 
     add_item("New Tab", objc2::sel!(kasumiNewTab:), "t");
+    // AppKit derives Command+Shift from the uppercase key equivalent.
+    add_item(
+        "New Incognito Window",
+        objc2::sel!(kasumiNewIncognitoWindow:),
+        "N",
+    );
     add_item("Close Tab", objc2::sel!(kasumiCloseTab:), "w");
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     add_item("Downloads…", objc2::sel!(kasumiOpenDownloads:), "j");
@@ -1229,6 +1241,11 @@ impl KasumiBrowserHandler {
                     tm.handle_ui_action(UiAction::NewTab { url: None });
                 }
             }
+            BrowserShortcut::NewPrivateWindow => {
+                if let Some(tm) = self.tab_manager.as_mut() {
+                    tm.handle_ui_action(UiAction::NewPrivateWindow);
+                }
+            }
             BrowserShortcut::CloseTab => {
                 if let Some(tm) = self.tab_manager.as_mut() {
                     if let Some(id) = tm.active_tab_id {
@@ -1475,6 +1492,15 @@ fn is_copy_url_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
         && !modifiers.alt_key()
         && modifiers.shift_key()
         && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("c"))
+}
+
+/// `Cmd/Ctrl+Shift+N` opens an isolated incognito space. Shift keeps plain
+/// `Cmd/Ctrl+N` free for a future native new-window command.
+fn is_new_private_window_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
+    is_primary_shortcut_modifier(modifiers)
+        && !modifiers.alt_key()
+        && modifiers.shift_key()
+        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("n"))
 }
 
 /// Cmd/Ctrl+Q quits through the same deferred shutdown path as the window's
@@ -1917,6 +1943,8 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                     self.handle_browser_shortcut(BrowserShortcut::OpenBookmarkManager);
                 } else if is_copy_url_shortcut(self.modifiers, logical_key) {
                     self.handle_browser_shortcut(BrowserShortcut::CopyUrl);
+                } else if is_new_private_window_shortcut(self.modifiers, logical_key) {
+                    self.handle_browser_shortcut(BrowserShortcut::NewPrivateWindow);
                 } else if alt {
                     if let Key::Character(c) = logical_key {
                         if c.eq_ignore_ascii_case("h") {
@@ -2394,8 +2422,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_copy_url_shortcut, is_primary_shortcut_modifier, is_quit_shortcut,
-        is_reopen_tab_shortcut, overlay_screen_position, pointer_is_past_rail, BrowserShortcut,
+        is_copy_url_shortcut, is_new_private_window_shortcut, is_primary_shortcut_modifier,
+        is_quit_shortcut, is_reopen_tab_shortcut, overlay_screen_position, pointer_is_past_rail,
+        BrowserShortcut,
     };
     use crate::config::rail_width;
     use winit::dpi::PhysicalPosition;
@@ -2467,6 +2496,31 @@ mod tests {
         assert!(!is_copy_url_shortcut(
             ModifiersState::SUPER | ModifiersState::SHIFT,
             &Key::Character("v".into())
+        ));
+    }
+
+    #[test]
+    fn incognito_shortcut_requires_primary_and_shift_without_alt() {
+        let n: Key = Key::Character("n".into());
+        let upper_n: Key = Key::Character("N".into());
+
+        assert!(is_new_private_window_shortcut(
+            ModifiersState::CONTROL | ModifiersState::SHIFT,
+            &n
+        ));
+        assert!(is_new_private_window_shortcut(
+            ModifiersState::SUPER | ModifiersState::SHIFT,
+            &upper_n
+        ));
+        assert!(!is_new_private_window_shortcut(ModifiersState::CONTROL, &n));
+        assert!(!is_new_private_window_shortcut(ModifiersState::SHIFT, &n));
+        assert!(!is_new_private_window_shortcut(
+            ModifiersState::SUPER | ModifiersState::SHIFT | ModifiersState::ALT,
+            &n
+        ));
+        assert!(!is_new_private_window_shortcut(
+            ModifiersState::SUPER | ModifiersState::SHIFT,
+            &Key::Character("t".into())
         ));
     }
 
@@ -2579,6 +2633,17 @@ mod tests {
             shortcut_from_parts('t', 0x11, cmd | shift),
             Some(BrowserShortcut::ReopenClosedTab)
         );
+        assert_eq!(
+            shortcut_from_parts('n', 0x12, cmd | shift),
+            Some(BrowserShortcut::NewPrivateWindow)
+        );
+        // The monitor lowercases charactersIgnoringModifiers before classifying,
+        // so Shift+N arrives here as 'n'.
+        assert_eq!(
+            shortcut_from_parts('n', 0x12, cmd | shift),
+            Some(BrowserShortcut::NewPrivateWindow)
+        );
+        assert_eq!(shortcut_from_parts('n', 0x12, cmd), None);
         assert_eq!(
             shortcut_from_parts('\0', 0x58, cmd),
             Some(BrowserShortcut::OpenDevTools)

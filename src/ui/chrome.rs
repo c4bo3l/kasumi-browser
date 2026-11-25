@@ -476,6 +476,10 @@ const RAIL_STATUS_HEIGHT: f32 = 144.0;
 const RAIL_STATUS_ICON_EXPANDED: f32 = 15.0;
 const RAIL_STATUS_ICON_COLLAPSED: f32 = 20.0;
 const RAIL_STATUS_BADGE_HEIGHT: f32 = 24.0;
+/// Compact bottom-HUD controls sized to fit `PAGE_HUD_HEIGHT` without clipping.
+const PAGE_HUD_BUTTON_SIZE: f32 = 18.0;
+const PAGE_HUD_ICON_INSET: f32 = 2.0;
+const PAGE_HUD_VERTICAL_MARGIN: i8 = 2;
 const SETTINGS_WIDTH: f32 = 660.0;
 const SETTINGS_MAX_CONTENT_HEIGHT: f32 = 560.0;
 const DOWNLOADS_WIDTH: f32 = 460.0;
@@ -513,6 +517,7 @@ enum RailIcon {
     Moon,
     Shield,
     Chip,
+    Private,
     Globe,
     Close,
     Pin,
@@ -628,6 +633,7 @@ pub struct BookmarkInfo {
 pub enum CommandAction {
     SelectTab(u64),
     NewTab(Option<String>),
+    NewPrivateWindow,
     Navigate { tab_id: u64, url: String },
     TogglePinTab(u64),
     HibernateAll,
@@ -1253,12 +1259,19 @@ impl ChromeState {
         if self.settings_open {
             return;
         }
+        let editable = |workspace: &&WorkspaceInfo| !Workspace::is_private_id(workspace.id);
         let selected = self
             .workspaces
             .iter()
+            .filter(editable)
             .find(|workspace| Some(workspace.id) == self.selected_workspace_id)
-            .or_else(|| self.active_workspace())
-            .or_else(|| self.workspaces.first())
+            .or_else(|| {
+                self.workspaces
+                    .iter()
+                    .filter(editable)
+                    .find(|workspace| workspace.id == self.active_workspace_id)
+            })
+            .or_else(|| self.workspaces.iter().find(editable))
             .cloned();
         self.selected_workspace_id = selected.as_ref().map(|workspace| workspace.id);
         if let Some(workspace) = selected {
@@ -1666,10 +1679,15 @@ impl ChromeRenderer {
                         ),
                         egui::StrokeKind::Inside,
                     );
+                    let icon = if Workspace::is_private_id(workspace.id) {
+                        RailIcon::Private
+                    } else {
+                        workspace.icon.into()
+                    };
                     paint_rail_icon(
                         ui,
                         rect.shrink(9.0),
-                        workspace.icon.into(),
+                        icon,
                         if active {
                             palette.text_strong
                         } else {
@@ -1683,7 +1701,9 @@ impl ChromeRenderer {
                             accent,
                         );
                     }
-                    let tooltip = if active {
+                    let tooltip = if Workspace::is_private_id(workspace.id) {
+                        "Incognito — private space, never saved".to_string()
+                    } else if active {
                         format!("{} — current space", workspace.name)
                     } else if workspace.is_default {
                         format!("Switch to {} (default)", workspace.name)
@@ -1736,7 +1756,12 @@ impl ChromeRenderer {
                 pos2(rect.min.x + 16.0, rect.center().y),
                 vec2(16.0, 16.0),
             );
-            paint_rail_icon(ui, icon_rect, workspace.icon.into(), color);
+            let icon = if Workspace::is_private_id(workspace.id) {
+                RailIcon::Private
+            } else {
+                workspace.icon.into()
+            };
+            paint_rail_icon(ui, icon_rect, icon, color);
             ui.painter().text(
                 pos2(rect.min.x + 30.0, rect.center().y),
                 Align2::LEFT_CENTER,
@@ -1852,8 +1877,15 @@ impl ChromeRenderer {
                             palette.text
                         },
                     );
+                    let private_active = active_tab_is_private(state);
                     if bookmark_response.clicked() {
-                        if let Some((workspace_id, url)) = bookmark_key.clone() {
+                        if private_active {
+                            state.show_toast(
+                                ToastKind::Error,
+                                "Incognito",
+                                "Bookmarks are unavailable in a private space",
+                            );
+                        } else if let Some((workspace_id, url)) = bookmark_key.clone() {
                             actions.push(UiAction::DeleteBookmark { workspace_id, url });
                             state.show_toast(
                                 ToastKind::Success,
@@ -1869,7 +1901,9 @@ impl ChromeRenderer {
                             );
                         }
                     }
-                    bookmark_response.on_hover_text(if is_bookmarked {
+                    bookmark_response.on_hover_text(if private_active {
+                        "Bookmarks are unavailable in Incognito"
+                    } else if is_bookmarked {
                         "Remove bookmark"
                     } else {
                         "Bookmark this page"
@@ -1946,14 +1980,15 @@ impl ChromeRenderer {
                 Frame::NONE
                     .fill(palette.menu_bg)
                     .corner_radius(CornerRadius::same(8))
-                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .inner_margin(egui::Margin::symmetric(8, PAGE_HUD_VERTICAL_MARGIN))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            let command = Self::rail_icon_button(
+                            let command = Self::rail_icon_button_with_inset(
                                 ui,
-                                vec2(30.0, 30.0),
+                                vec2(PAGE_HUD_BUTTON_SIZE, PAGE_HUD_BUTTON_SIZE),
                                 RailIcon::Search,
                                 &palette,
+                                PAGE_HUD_ICON_INSET,
                             );
                             if command.clicked() {
                                 state.open_command_palette();
@@ -1964,11 +1999,12 @@ impl ChromeRenderer {
                                 "Command palette (Cmd/Ctrl+K)".to_string(),
                             );
 
-                            let devtools = Self::rail_icon_button(
+                            let devtools = Self::rail_icon_button_with_inset(
                                 ui,
-                                vec2(30.0, 30.0),
+                                vec2(PAGE_HUD_BUTTON_SIZE, PAGE_HUD_BUTTON_SIZE),
                                 RailIcon::Code,
                                 &palette,
+                                PAGE_HUD_ICON_INSET,
                             );
                             if devtools.clicked() {
                                 if let Some(tab_id) = active_tab_id {
@@ -1978,24 +2014,26 @@ impl ChromeRenderer {
                             set_tooltip(state, &devtools, "DevTools (F12)".to_string());
 
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let ram = Self::rail_icon_button(
+                                let ram = Self::rail_icon_button_with_inset(
                                     ui,
-                                    vec2(30.0, 30.0),
+                                    vec2(PAGE_HUD_BUTTON_SIZE, PAGE_HUD_BUTTON_SIZE),
                                     RailIcon::Chip,
                                     &palette,
+                                    PAGE_HUD_ICON_INSET,
                                 );
                                 set_tooltip(state, &ram, format!("RAM {ram_mb} MB"));
                                 ui.label(
                                     RichText::new(format!("{ram_mb}"))
-                                        .size(10.0)
+                                        .size(9.0)
                                         .color(palette.text_dim),
                                 );
 
-                                let shield = Self::rail_icon_button(
+                                let shield = Self::rail_icon_button_with_inset(
                                     ui,
-                                    vec2(30.0, 30.0),
+                                    vec2(PAGE_HUD_BUTTON_SIZE, PAGE_HUD_BUTTON_SIZE),
                                     RailIcon::Shield,
                                     &palette,
+                                    PAGE_HUD_ICON_INSET,
                                 );
                                 set_tooltip(
                                     state,
@@ -2004,7 +2042,7 @@ impl ChromeRenderer {
                                 );
                                 ui.label(
                                     RichText::new(blocked_requests.to_string())
-                                        .size(10.0)
+                                        .size(9.0)
                                         .color(palette.shield_ok),
                                 );
                             });
@@ -2099,6 +2137,22 @@ impl ChromeRenderer {
                                     ui,
                                     &new_tab,
                                     "New tab (Cmd/Ctrl+T)",
+                                    state.rail_expanded,
+                                );
+                                let incognito = Self::rail_icon_button(
+                                    ui,
+                                    vec2(34.0, 30.0),
+                                    RailIcon::Private,
+                                    palette,
+                                );
+                                if incognito.clicked() {
+                                    actions.push(UiAction::NewPrivateWindow);
+                                }
+                                Self::chrome_tooltip(
+                                    tooltip_slot,
+                                    ui,
+                                    &incognito,
+                                    "New Incognito Window (Cmd/Ctrl+Shift+N)",
                                     state.rail_expanded,
                                 );
                                 for tab in state.tabs.iter().filter(|tab| {
@@ -2294,6 +2348,24 @@ impl ChromeRenderer {
                                 ui,
                                 &new_tab,
                                 "New tab (Cmd/Ctrl+T)",
+                                state.rail_expanded,
+                            );
+                            let incognito = Self::rail_action_button(
+                                ui,
+                                width - 12.0,
+                                30.0,
+                                RailIcon::Private,
+                                "Incognito",
+                                palette,
+                            );
+                            if incognito.clicked() {
+                                actions.push(UiAction::NewPrivateWindow);
+                            }
+                            Self::chrome_tooltip(
+                                tooltip_slot,
+                                ui,
+                                &incognito,
+                                "New Incognito Window (Cmd/Ctrl+Shift+N)",
                                 state.rail_expanded,
                             );
                             for tab in state.tabs.iter().filter(|tab| {
@@ -3459,9 +3531,19 @@ impl ChromeRenderer {
         let mut new_name = state.workspace_new_name_draft.clone();
         let mut new_icon = state.workspace_new_icon_draft;
         let mut new_color = state.workspace_new_color_draft;
-        let workspaces = state.workspaces.clone();
-        let active_workspace = state.active_workspace().cloned();
-        let workspace_count = state.workspaces.len();
+        // Incognito is intentionally ephemeral: it appears in the rail but not
+        // in Settings, where workspaces can be renamed or persisted.
+        let workspaces: Vec<WorkspaceInfo> = state
+            .workspaces
+            .iter()
+            .filter(|workspace| !Workspace::is_private_id(workspace.id))
+            .cloned()
+            .collect();
+        let active_workspace = workspaces
+            .iter()
+            .find(|workspace| workspace.id == state.active_workspace_id)
+            .cloned();
+        let workspace_count = workspaces.len();
         let mut settings_tab = state.settings_tab;
         let mut workspace_actions: Vec<UiAction> = Vec::new();
         let mut selected_workspace_id = state
@@ -4317,16 +4399,32 @@ impl ChromeRenderer {
         icon: RailIcon,
         palette: &ChromePalette,
     ) -> Response {
+        Self::rail_icon_button_with_inset(ui, size, icon, palette, 5.0)
+    }
+
+    /// Same button with a configurable glyph inset, used by the compact
+    /// bottom HUD where the default 5 DIP inset would shrink icons too far.
+    fn rail_icon_button_with_inset(
+        ui: &mut Ui,
+        size: egui::Vec2,
+        icon: RailIcon,
+        palette: &ChromePalette,
+        inset: f32,
+    ) -> Response {
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
         let fill = if response.hovered() {
             palette.rail_surface
         } else {
             Color32::TRANSPARENT
         };
-        ui.painter().rect_filled(rect, CornerRadius::same(7), fill);
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same((size.min_elem() * 0.24).max(3.0) as u8),
+            fill,
+        );
         paint_rail_icon(
             ui,
-            rect.shrink(5.0),
+            rect.shrink(inset),
             icon,
             if response.hovered() {
                 palette.text_strong
@@ -4626,7 +4724,12 @@ impl ChromeRenderer {
             *menu_request = Some((tab_id, anchor));
         }
 
-        let label = if tab.is_pinned {
+        let private = Workspace::is_private_id(tab.workspace_id);
+        let label = if private && tab.is_pinned {
+            format!("Incognito · Pinned · {}", tab.title)
+        } else if private {
+            format!("Incognito · {}", tab.title)
+        } else if tab.is_pinned {
             format!("Pinned · {}", tab.title)
         } else {
             tab.title.clone()
@@ -5284,30 +5387,32 @@ impl PageHudRenderer {
             egui::CentralPanel::no_frame()
                 .frame(Frame::NONE.fill(Color32::TRANSPARENT))
                 .show(ui, |ui| {
-                    ui.set_height(PAGE_HUD_HEIGHT - 4.0);
+                    ui.set_height(PAGE_HUD_HEIGHT);
                     Frame::NONE
                         .fill(palette.menu_bg)
                         .stroke(Stroke::new(0.0_f32, Color32::TRANSPARENT))
                         .corner_radius(CornerRadius::same(8))
-                        .inner_margin(egui::Margin::symmetric(8, 4))
+                        .inner_margin(egui::Margin::symmetric(8, PAGE_HUD_VERTICAL_MARGIN))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                let command = ChromeRenderer::rail_icon_button(
+                                let command = ChromeRenderer::rail_icon_button_with_inset(
                                     ui,
-                                    vec2(30.0, 30.0),
+                                    vec2(PAGE_HUD_BUTTON_SIZE, PAGE_HUD_BUTTON_SIZE),
                                     RailIcon::Search,
                                     &palette,
+                                    PAGE_HUD_ICON_INSET,
                                 );
                                 if command.clicked() {
                                     state.open_command_palette();
                                 }
                                 command.on_hover_text("Command palette (Cmd/Ctrl+K)");
 
-                                let devtools = ChromeRenderer::rail_icon_button(
+                                let devtools = ChromeRenderer::rail_icon_button_with_inset(
                                     ui,
-                                    vec2(30.0, 30.0),
+                                    vec2(PAGE_HUD_BUTTON_SIZE, PAGE_HUD_BUTTON_SIZE),
                                     RailIcon::Code,
                                     &palette,
+                                    PAGE_HUD_ICON_INSET,
                                 );
                                 if devtools.clicked() && active_tab_id.is_some() {
                                     if let Some(tab_id) = active_tab_id {
@@ -5317,29 +5422,31 @@ impl PageHudRenderer {
                                 devtools.on_hover_text("DevTools (F12)");
 
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    let ram = ChromeRenderer::rail_icon_button(
+                                    let ram = ChromeRenderer::rail_icon_button_with_inset(
                                         ui,
-                                        vec2(30.0, 30.0),
+                                        vec2(PAGE_HUD_BUTTON_SIZE, PAGE_HUD_BUTTON_SIZE),
                                         RailIcon::Chip,
                                         &palette,
+                                        PAGE_HUD_ICON_INSET,
                                     );
                                     ram.on_hover_text(format!("RAM {ram_mb} MB"));
                                     ui.label(
                                         RichText::new(format!("{ram_mb}"))
-                                            .size(10.0)
+                                            .size(9.0)
                                             .color(palette.text_dim),
                                     );
 
-                                    let shield = ChromeRenderer::rail_icon_button(
+                                    let shield = ChromeRenderer::rail_icon_button_with_inset(
                                         ui,
-                                        vec2(30.0, 30.0),
+                                        vec2(PAGE_HUD_BUTTON_SIZE, PAGE_HUD_BUTTON_SIZE),
                                         RailIcon::Shield,
                                         &palette,
+                                        PAGE_HUD_ICON_INSET,
                                     );
                                     shield.on_hover_text(format!("{blocked_requests} ads blocked"));
                                     ui.label(
                                         RichText::new(blocked_requests.to_string())
-                                            .size(10.0)
+                                            .size(9.0)
                                             .color(palette.shield_ok),
                                     );
                                 });
@@ -5435,7 +5542,7 @@ fn rail_icon_glyph(icon: RailIcon) -> &'static str {
         ICON_EDIT, ICON_FOLDER_OPEN, ICON_MEMORY, ICON_MUSIC_NOTE, ICON_OPEN_IN_NEW, ICON_PALETTE,
         ICON_PAUSE, ICON_PIN, ICON_PLAY_ARROW, ICON_PUBLIC, ICON_PUSH_PIN, ICON_REFRESH,
         ICON_ROCKET, ICON_SCHOOL, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD, ICON_STAR,
-        ICON_VIEW_SIDEBAR, ICON_WORK,
+        ICON_VIEW_SIDEBAR, ICON_VISIBILITY_OFF, ICON_WORK,
     };
 
     match icon {
@@ -5447,6 +5554,7 @@ fn rail_icon_glyph(icon: RailIcon) -> &'static str {
         RailIcon::Moon => ICON_BEDTIME.into(),
         RailIcon::Shield => ICON_SHIELD.into(),
         RailIcon::Chip => ICON_MEMORY.into(),
+        RailIcon::Private => ICON_VISIBILITY_OFF.into(),
         RailIcon::Globe => ICON_PUBLIC.into(),
         RailIcon::Close => ICON_CLOSE.into(),
         RailIcon::Pin => ICON_PUSH_PIN.into(),
@@ -5773,6 +5881,13 @@ pub fn rail_menu_items(state: &ChromeState, tab_id: u64) -> Vec<RailMenuItem> {
         item("DevTools (new window)", RailMenuAction::OpenDevTools, true),
     ];
 
+    let current_workspace_id = state
+        .tabs
+        .iter()
+        .find(|tab| tab.id == tab_id)
+        .map(|tab| tab.workspace_id)
+        .unwrap_or(state.active_workspace_id);
+
     // Pinned tabs stay in their workspace. Offering a move would break the
     // pinned section invariant, so the heading explains why no targets appear.
     if is_pinned {
@@ -5783,18 +5898,22 @@ pub fn rail_menu_items(state: &ChromeState, tab_id: u64) -> Vec<RailMenuItem> {
         ));
         return items;
     }
+    if Workspace::is_private_id(current_workspace_id) {
+        items.push(item(
+            "Incognito tabs stay private",
+            RailMenuAction::MoveTabToHeader,
+            false,
+        ));
+        return items;
+    }
 
     items.push(item("MOVE TAB TO", RailMenuAction::MoveTabToHeader, false));
-    let current_workspace_id = state
-        .tabs
-        .iter()
-        .find(|tab| tab.id == tab_id)
-        .map(|tab| tab.workspace_id)
-        .unwrap_or(state.active_workspace_id);
     let mut targets: Vec<&WorkspaceInfo> = state
         .workspaces
         .iter()
-        .filter(|workspace| workspace.id != current_workspace_id)
+        .filter(|workspace| {
+            workspace.id != current_workspace_id && !Workspace::is_private_id(workspace.id)
+        })
         .collect();
     targets.sort_by_key(|workspace| workspace.name.clone());
     if targets.is_empty() {
@@ -6020,7 +6139,9 @@ pub fn command_palette_items(
     let mut items = Vec::new();
 
     let tab_item = |tab: &TabInfo| CommandPaletteItem {
-        icon: if tab.is_pinned {
+        icon: if Workspace::is_private_id(tab.workspace_id) {
+            "🕶"
+        } else if tab.is_pinned {
             "📌"
         } else if tab.display_state == TabDisplayState::Hibernated {
             "💤"
@@ -6110,6 +6231,12 @@ pub fn command_palette_items(
             items.push(item);
         }
         items.push(bookmark_manager_item());
+        items.push(CommandPaletteItem {
+            icon: "🕶",
+            label: "New Incognito Window (Cmd/Ctrl+Shift+N)".to_string(),
+            subtitle: "Private space with no history, cookies, or session writes".to_string(),
+            action: CommandAction::NewPrivateWindow,
+        });
         return items;
     }
 
@@ -6200,6 +6327,15 @@ pub fn command_palette_items(
         }
     }
 
+    if needle.contains("incognito") || needle.contains("private") {
+        items.push(CommandPaletteItem {
+            icon: "🕶",
+            label: "New Incognito Window (Cmd/Ctrl+Shift+N)".to_string(),
+            subtitle: "Private space with no history, cookies, or session writes".to_string(),
+            action: CommandAction::NewPrivateWindow,
+        });
+    }
+
     items
 }
 
@@ -6211,6 +6347,7 @@ fn apply_command_item(
     match action {
         CommandAction::SelectTab(tab_id) => actions.push(UiAction::SelectTab { tab_id: *tab_id }),
         CommandAction::NewTab(url) => actions.push(UiAction::NewTab { url: url.clone() }),
+        CommandAction::NewPrivateWindow => actions.push(UiAction::NewPrivateWindow),
         CommandAction::Navigate { tab_id, url } => actions.push(UiAction::Navigate {
             tab_id: *tab_id,
             url: url.clone(),
@@ -6229,7 +6366,13 @@ fn apply_command_item(
         CommandAction::OpenDownloads => state.open_downloads(),
         CommandAction::OpenBookmarkManager => state.open_bookmark_manager(),
         CommandAction::BookmarkActiveTab => {
-            if let Some((workspace_id, url)) = active_bookmark_key(state) {
+            if active_tab_is_private(state) {
+                state.show_toast(
+                    ToastKind::Error,
+                    "Incognito",
+                    "Bookmarks are unavailable in a private space",
+                );
+            } else if let Some((workspace_id, url)) = active_bookmark_key(state) {
                 actions.push(UiAction::DeleteBookmark { workspace_id, url });
                 state.show_toast(
                     ToastKind::Success,
@@ -6278,15 +6421,28 @@ fn apply_menu_item(
 /// Key of the bookmark for the active tab, if it has one. Bookmarks are keyed
 /// by workspace and URL so new in-memory rows never need a database id.
 pub fn active_bookmark_key(state: &ChromeState) -> Option<(u64, String)> {
-    let tab = state
-        .tabs
-        .iter()
-        .find(|tab| Some(tab.id) == state.active_tab_id)?;
+    let tab = active_tab(state)?;
+    if Workspace::is_private_id(tab.workspace_id) {
+        return None;
+    }
     state
         .bookmarks
         .iter()
         .any(|bookmark| bookmark.workspace_id == tab.workspace_id && bookmark.url == tab.url)
         .then(|| (tab.workspace_id, tab.url.clone()))
+}
+
+/// True when the selected tab belongs to the ephemeral incognito workspace.
+pub fn active_tab_is_private(state: &ChromeState) -> bool {
+    active_tab(state).is_some_and(|tab| Workspace::is_private_id(tab.workspace_id))
+}
+
+/// Shared lookup for helpers that need the active tab's metadata.
+fn active_tab(state: &ChromeState) -> Option<&TabInfo> {
+    state
+        .tabs
+        .iter()
+        .find(|tab| Some(tab.id) == state.active_tab_id)
 }
 
 /// Filter bookmarks by title, URL, or folder without changing their order.
@@ -6385,8 +6541,9 @@ mod tests {
         TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_WIDTH,
     };
     use crate::config::{
-        BrowserPreferences, SearchEngine, ThemePreference, WorkspaceColor, WorkspaceIcon,
-        DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX, RAIL_WIDTH_COLLAPSED, RAIL_WIDTH_EXPANDED,
+        BrowserPreferences, SearchEngine, ThemePreference, Workspace, WorkspaceColor,
+        WorkspaceIcon, DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX, RAIL_WIDTH_COLLAPSED,
+        RAIL_WIDTH_EXPANDED,
     };
     use crate::events::{
         DownloadEngine, DownloadInfo, DownloadNotification, DownloadNotificationKind,
@@ -6851,7 +7008,11 @@ mod tests {
         let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
         let rail = crate::config::rail_width(state.rail_expanded);
         // Center of the first icon button in the bottom HUD strip.
-        let pointer = pos2(rail + 10.0 + 8.0 + 15.0, 800.0 - 46.0 + 4.0 + 15.0);
+        let hud_x = rail + crate::config::PAGE_HUD_MARGIN + 8.0 + super::PAGE_HUD_BUTTON_SIZE / 2.0;
+        let hud_y = 800.0 - crate::config::PAGE_HUD_HEIGHT - crate::config::PAGE_HUD_MARGIN
+            + super::PAGE_HUD_VERTICAL_MARGIN as f32
+            + super::PAGE_HUD_BUTTON_SIZE / 2.0;
+        let pointer = pos2(hud_x, hud_y);
         let mut raw = egui::RawInput::default();
         raw.screen_rect = Some(screen);
         raw.events.push(egui::Event::PointerMoved(pointer));
@@ -7041,6 +7202,24 @@ mod tests {
         assert_eq!(items[6].action, CommandAction::SelectTab(1));
         assert_eq!(items[7].action, CommandAction::BookmarkActiveTab);
         assert_eq!(items[8].action, CommandAction::OpenBookmarkManager);
+        assert_eq!(items[9].action, CommandAction::NewPrivateWindow);
+    }
+
+    #[test]
+    fn palette_finds_incognito_action_and_marks_private_tabs() {
+        let prefs = BrowserPreferences::default();
+        let items = command_palette_items("private", &[], None, &prefs);
+        assert!(items
+            .iter()
+            .any(|item| item.action == CommandAction::NewPrivateWindow));
+
+        let mut private = tab(4, "Secret", "https://secret.example");
+        private.workspace_id = Workspace::PRIVATE_ID;
+        private.workspace_name = Workspace::PRIVATE_NAME.to_string();
+        let items = command_palette_items("secret", &[private], None, &prefs);
+        assert!(items
+            .iter()
+            .any(|item| { item.icon == "🕶" && item.action == CommandAction::SelectTab(4) }));
     }
 
     #[test]

@@ -107,6 +107,13 @@ impl StorageHandle {
         let _ = self.sender.send(cmd);
     }
 
+    /// Build a handle backed by an in-memory channel so tests can assert which
+    /// persistence commands the UI layer emits without starting a worker.
+    #[cfg(test)]
+    pub(crate) fn from_sender(sender: UnboundedSender<DbCommand>) -> Self {
+        Self { sender }
+    }
+
     pub fn record_visit(&self, url: String, title: String) {
         self.send(DbCommand::RecordVisit { url, title });
     }

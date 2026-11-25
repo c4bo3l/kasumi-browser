@@ -252,8 +252,10 @@ pub enum BrowserEvent {
     },
     /// Chromium asked to open a link in another tab (middle-click, Ctrl+click,
     /// or a popup disposition). The source navigation is cancelled and the main
-    /// UI thread opens a native Kasumi tab instead.
+    /// UI thread opens a native Kasumi tab instead. `tab_id` is the originating
+    /// browser so incognito popups inherit private isolation.
     OpenUrlFromTab {
+        tab_id: u64,
         url: String,
         background: bool,
     },
@@ -303,6 +305,8 @@ pub enum BrowserEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrowserShortcut {
     NewTab,
+    /// Open an isolated incognito space in the native window.
+    NewPrivateWindow,
     CloseTab,
     ReopenClosedTab,
     OpenCommandPalette,
@@ -358,8 +362,13 @@ impl std::fmt::Debug for BrowserEvent {
                 .field("tab_id", tab_id)
                 .finish(),
             Self::NewWindow { url } => f.debug_struct("NewWindow").field("url", url).finish(),
-            Self::OpenUrlFromTab { url, background } => f
+            Self::OpenUrlFromTab {
+                tab_id,
+                url,
+                background,
+            } => f
                 .debug_struct("OpenUrlFromTab")
+                .field("tab_id", tab_id)
                 .field("url", url)
                 .field("background", background)
                 .finish(),
@@ -422,6 +431,9 @@ pub enum UiAction {
     NewTab {
         url: Option<String>,
     },
+    /// Open an incognito space. Private tabs share one ephemeral CEF request
+    /// context and are excluded from every SQLite write.
+    NewPrivateWindow,
     ReopenClosedTab,
     CloseTab {
         tab_id: u64,
