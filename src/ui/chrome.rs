@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! egui + wgpu browser chrome: a collapsible vertical workspace rail plus a
 //! floating Cmd/Ctrl+K command palette.
 //!
@@ -20,8 +21,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{
-    pos2, vec2, Align, Align2, Color32, FontFamily, FontId, Frame, Layout, Order, Response,
-    RichText, Rounding, Sense, Stroke, TextEdit, TextureOptions, Ui, UiBuilder,
+    pos2, vec2, Align, Align2, Color32, CornerRadius, FontFamily, FontId, Frame, Layout, Order,
+    Response, RichText, Sense, Stroke, TextEdit, TextureOptions, Ui, UiBuilder,
 };
 use egui_wgpu::ScreenDescriptor;
 
@@ -758,6 +759,10 @@ pub struct ChromeState {
     pub last_synced_tab_id: Option<u64>,
     /// URL that was last copied into the omnibox.
     pub last_synced_url: String,
+    /// Set when a keyboard shortcut asks the chrome to copy the active URL.
+    /// egui owns the clipboard, so the request is served by the next chrome
+    /// frame instead of the shortcut handler.
+    pub copy_url_requested: bool,
     /// Whether the active tab is currently loading.
     pub is_loading: bool,
     /// RAM used by this process in megabytes (updated by sysinfo watchdog).
@@ -838,6 +843,7 @@ impl Default for ChromeState {
             omnibox_focused: false,
             last_synced_tab_id: None,
             last_synced_url: String::new(),
+            copy_url_requested: false,
             is_loading: false,
             ram_mb: 0,
             // Start visible so the vertical layout is immediately discoverable;
@@ -909,6 +915,26 @@ impl ChromeState {
             toast.created_at = Instant::now();
             self.toast = Some(toast);
         }
+    }
+
+    /// Ask the next chrome frame to copy the active page URL. Keyboard
+    /// shortcuts reach the shell without an egui context, so the clipboard
+    /// write is deferred to the renderer that owns the `egui::Context`.
+    pub fn request_copy_url(&mut self) {
+        self.copy_url_requested = true;
+    }
+
+    /// URL a copy command should place on the clipboard. The active tab is
+    /// authoritative; the mirrored omnibox text covers the window before the
+    /// first tab exists.
+    pub fn active_url(&self) -> Option<String> {
+        let url = self
+            .tabs
+            .iter()
+            .find(|tab| Some(tab.id) == self.active_tab_id)
+            .map(|tab| tab.url.as_str())
+            .unwrap_or(self.omnibox_text.as_str());
+        (!url.is_empty()).then(|| url.to_string())
     }
 
     /// Surface a terminal download outcome as a native notification.
@@ -1261,6 +1287,62 @@ impl ChromeState {
 }
 
 // ---------------------------------------------------------------------------
+// Surface acquisition
+// ---------------------------------------------------------------------------
+
+/// Acquire the next swapchain image, treating the non-fatal wgpu statuses as
+/// ordinary frame skips instead of errors.
+///
+/// - `Occluded` is expected on macOS and Windows whenever the window is fully
+///   hidden (minimized, behind another app, or on an inactive Space). The shell
+///   requests a redraw every loop iteration, so logging each skip would flood
+///   the log at display refresh rate. It is logged at `trace` instead, and the
+///   chrome resumes on the first frame after the window server exposes it again.
+/// - `Outdated` and `Lost` are recoverable by reconfiguring the surface, which
+///   previously only happened on `Resized` and could leave a window blank.
+/// - `Timeout` simply means the swapchain is not ready; try again next tick.
+///
+/// Returns `None` when the frame must be skipped. Callers keep their UI state
+/// (and the actions egui produced) intact either way.
+fn acquire_surface_frame(
+    surface: &wgpu::Surface<'static>,
+    device: &wgpu::Device,
+    surface_config: &wgpu::SurfaceConfiguration,
+    label: &str,
+) -> Option<wgpu::SurfaceTexture> {
+    match surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(frame)
+        | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => Some(frame),
+        wgpu::CurrentSurfaceTexture::Occluded => {
+            tracing::trace!("{label}: surface occluded; skipping frame");
+            None
+        }
+        wgpu::CurrentSurfaceTexture::Timeout => {
+            tracing::trace!("{label}: surface acquire timed out; skipping frame");
+            None
+        }
+        wgpu::CurrentSurfaceTexture::Outdated => {
+            tracing::debug!("{label}: surface outdated; reconfiguring");
+            surface.configure(device, surface_config);
+            None
+        }
+        wgpu::CurrentSurfaceTexture::Lost => {
+            // The swapchain is gone (display change, GPU switch, wake from
+            // sleep). Reconfiguring is the documented recovery for a surface
+            // that is still bound to a live window; if that is not enough the
+            // next acquire reports `Validation` and the log below fires.
+            tracing::debug!("{label}: surface lost; reconfiguring");
+            surface.configure(device, surface_config);
+            None
+        }
+        wgpu::CurrentSurfaceTexture::Validation => {
+            tracing::warn!("{label}: surface validation error; skipping frame");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ChromeRenderer
 // ---------------------------------------------------------------------------
 
@@ -1319,19 +1401,21 @@ impl ChromeRenderer {
             height: size.height.max(1).min(max_tex),
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &surface_config);
 
-        let renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let renderer =
+            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
         // Register the Material Symbols fallback used by every rail icon. It
         // is pinned to the egui 0.30-compatible crate release.
         egui_material_icons::initialize(&egui_ctx);
         // Tooltips must appear immediately; the default delay makes the chrome
         // controls look unlabeled during quick hovers.
-        egui_ctx.style_mut(|style| {
+        egui_ctx.all_styles_mut(|style| {
             style.interaction.tooltip_delay = 0.0;
         });
 
@@ -1390,19 +1474,23 @@ impl ChromeRenderer {
 
         let raw_input = self.egui_state.take_egui_input(window);
         let egui_ctx = self.egui_ctx.clone();
-        let full_output = egui_ctx.run(raw_input, |ctx| {
-            self.build_ui(ctx, state, &mut actions);
+        let mut full_output = egui_ctx.run_ui(raw_input, |ui| {
+            self.build_ui(ui, state, &mut actions);
         });
 
         self.egui_state
             .handle_platform_output(window, full_output.platform_output.clone());
 
-        let output_frame = match self.surface.get_current_texture() {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!("wgpu surface error: {:?}", e);
-                return actions;
+        for (id, deltas) in full_output.textures_delta.set.drain() {
+            for delta in deltas {
+                self.renderer
+                    .update_texture(&self.device, &self.queue, id, &delta);
             }
+        }
+        let Some(output_frame) =
+            acquire_surface_frame(&self.surface, &self.device, &self.surface_config, "chrome")
+        else {
+            return actions;
         };
         let view = output_frame
             .texture
@@ -1417,10 +1505,6 @@ impl ChromeRenderer {
             .egui_ctx
             .tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
 
-        for (id, delta) in &full_output.textures_delta.set {
-            self.renderer
-                .update_texture(&self.device, &self.queue, *id, delta);
-        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1441,6 +1525,7 @@ impl ChromeRenderer {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
+                        depth_slice: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(state.theme.clear_color()),
                             store: wgpu::StoreOp::Store,
@@ -1449,17 +1534,18 @@ impl ChromeRenderer {
                     depth_stencil_attachment: None,
                     occlusion_query_set: None,
                     timestamp_writes: None,
+                    multiview_mask: None,
                 })
                 .forget_lifetime();
             self.renderer.render(&mut rpass, &tris, &screen_descriptor);
         }
 
-        for id in &full_output.textures_delta.free {
-            self.renderer.free_texture(id);
+        for id in full_output.textures_delta.free.drain() {
+            self.renderer.free_texture(&id);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        output_frame.present();
+        self.queue.present(output_frame);
 
         actions
     }
@@ -1499,15 +1585,33 @@ impl ChromeRenderer {
     // UI construction
     // -----------------------------------------------------------------------
 
-    fn build_ui(&self, ctx: &egui::Context, state: &mut ChromeState, actions: &mut Vec<UiAction>) {
-        self.build_rail(ctx, state, actions);
-        Self::build_page_hud(ctx, state, actions);
+    fn build_ui(&self, ui: &mut Ui, state: &mut ChromeState, actions: &mut Vec<UiAction>) {
+        let ctx = ui.ctx().clone();
+        Self::serve_copy_url_request(&ctx, state);
+        self.build_rail(ui, state, actions);
+        Self::build_page_hud(&ctx, state, actions);
 
         // The CEF view occupies everything to the right of the rail. The
         // central panel is transparent so it never paints over page content.
-        egui::CentralPanel::default()
-            .frame(Frame::none().fill(Color32::TRANSPARENT))
-            .show(ctx, |_ui| {});
+        egui::CentralPanel::no_frame()
+            .frame(Frame::NONE.fill(Color32::TRANSPARENT))
+            .show(ui, |_ui| {});
+    }
+
+    /// Serve a Cmd/Ctrl+Shift+C request raised by a shell or CEF shortcut. The
+    /// clipboard write happens here because egui owns the platform clipboard
+    /// and flushes it as part of this frame's platform output.
+    fn serve_copy_url_request(ctx: &egui::Context, state: &mut ChromeState) {
+        if !state.copy_url_requested {
+            return;
+        }
+        state.copy_url_requested = false;
+        let Some(url) = state.active_url() else {
+            tracing::debug!("Copy URL shortcut ignored: no active page");
+            return;
+        };
+        ctx.copy_text(url);
+        state.show_toast(ToastKind::Success, "Copied", "Link copied to clipboard");
     }
 
     /// Draw the workspace strip at the top of the rail. Workspaces switch the
@@ -1548,10 +1652,10 @@ impl ChromeRenderer {
                     } else {
                         Color32::TRANSPARENT
                     };
-                    ui.painter().rect_filled(rect, Rounding::same(9.0), fill);
+                    ui.painter().rect_filled(rect, CornerRadius::same(9), fill);
                     ui.painter().rect_stroke(
                         rect.shrink(0.5),
-                        Rounding::same(9.0),
+                        CornerRadius::same(9),
                         Stroke::new(
                             if active { 2.0_f32 } else { 1.0_f32 },
                             if active {
@@ -1560,6 +1664,7 @@ impl ChromeRenderer {
                                 palette.palette_border
                             },
                         ),
+                        egui::StrokeKind::Inside,
                     );
                     paint_rail_icon(
                         ui,
@@ -1618,12 +1723,13 @@ impl ChromeRenderer {
             } else {
                 Color32::TRANSPARENT
             };
-            ui.painter().rect_filled(rect, Rounding::same(7.0), fill);
+            ui.painter().rect_filled(rect, CornerRadius::same(7), fill);
             if active {
                 ui.painter().rect_stroke(
                     rect.shrink(0.5),
-                    Rounding::same(7.0),
+                    CornerRadius::same(7),
                     Stroke::new(1.0_f32, color),
+                    egui::StrokeKind::Inside,
                 );
             }
             let icon_rect = egui::Rect::from_center_size(
@@ -1677,12 +1783,12 @@ impl ChromeRenderer {
         actions: &mut Vec<UiAction>,
         palette: &ChromePalette,
     ) -> Response {
-        Frame::none()
+        Frame::NONE
             .fill(palette.rail_surface)
             .stroke(Stroke::new(1.0_f32, palette.palette_border))
-            .rounding(Rounding::same(9.0))
-            .outer_margin(egui::Margin::symmetric(6.0, 0.0))
-            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+            .corner_radius(CornerRadius::same(9))
+            .outer_margin(egui::Margin::symmetric(6, 0))
+            .inner_margin(egui::Margin::symmetric(8, 6))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     // Explicit spaces below define the gaps; egui's implicit
@@ -1713,7 +1819,7 @@ impl ChromeRenderer {
                                     .desired_width(input_width)
                                     .clip_text(true)
                                     .margin(egui::Margin::ZERO)
-                                    .frame(false),
+                                    .frame(Frame::NONE),
                             )
                         })
                         .inner;
@@ -1796,7 +1902,7 @@ impl ChromeRenderer {
         actions: &mut Vec<UiAction>,
     ) {
         let rail = rail_width(state.rail_expanded);
-        let screen = ctx.screen_rect();
+        let screen = ctx.viewport_rect();
         let height = PAGE_HUD_HEIGHT;
         let margin = PAGE_HUD_MARGIN;
         let rect = egui::Rect::from_min_max(
@@ -1837,10 +1943,10 @@ impl ChromeRenderer {
             .default_size(vec2(rect.width(), height))
             .show(ctx, |ui| {
                 ui.set_width(rect.width());
-                Frame::none()
+                Frame::NONE
                     .fill(palette.menu_bg)
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(8, 4))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let command = Self::rail_icon_button(
@@ -1908,12 +2014,7 @@ impl ChromeRenderer {
     }
 
     /// Draw the collapsible left workspace rail.
-    fn build_rail(
-        &self,
-        ctx: &egui::Context,
-        state: &mut ChromeState,
-        actions: &mut Vec<UiAction>,
-    ) {
+    fn build_rail(&self, root_ui: &mut Ui, state: &mut ChromeState, actions: &mut Vec<UiAction>) {
         // Tooltips are rendered in a transparent overlay above the page, so
         // collect the hovered row for this frame instead of painting in-rail.
         let mut rail_tooltip: Option<RailTooltip> = None;
@@ -1921,16 +2022,17 @@ impl ChromeRenderer {
         // Pass a borrow into the panel closure so the collected tooltip can be
         // read again after the closure finishes.
         let tooltip_slot = &mut rail_tooltip;
+        let ctx = root_ui.ctx().clone();
         let width = rail_width(state.rail_expanded);
         let palette = state.palette();
         let palette = &palette;
         // Computed once so both rail modes show the same active-download state.
         let download_badge = download_rail_badge(&state.downloads);
-        let rail = egui::SidePanel::left("workspace_rail")
-            .exact_width(width)
+        let rail = egui::Panel::left("workspace_rail")
+            .exact_size(width)
             .resizable(false)
-            .frame(Frame::none().fill(palette.rail_bg))
-            .show(ctx, |ui| {
+            .frame(Frame::NONE.fill(palette.rail_bg))
+            .show(root_ui, |ui| {
                 if !state.rail_expanded {
                     // Favicon-only mode: show pinned tabs, then a new-tab
                     // button, then the remaining tabs. Command and DevTools
@@ -2023,7 +2125,7 @@ impl ChromeRenderer {
                             pos2(0.0, ui.clip_rect().bottom() - RAIL_STATUS_HEIGHT),
                             pos2(width, ui.clip_rect().bottom()),
                         );
-                        ui.allocate_new_ui(UiBuilder::new().max_rect(status_rect), |ui| {
+                        ui.scope_builder(UiBuilder::new().max_rect(status_rect), |ui| {
                             ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
                                 ui.add_space(5.0);
                                 let expand = Self::rail_icon_button(
@@ -2116,7 +2218,7 @@ impl ChromeRenderer {
                     // Framed omnibox: the helper reserves the fixed glyph slots
                     // and uses a zero-margin TextEdit so the frame stays inside
                     // the rail with even side margins.
-                    Self::build_rail_address_field(ui, ctx, state, actions, &palette);
+                    Self::build_rail_address_field(ui, &ctx, state, actions, &palette);
                     ui.add_space(6.0);
                     ui.separator();
                     ui.add_space(6.0);
@@ -2218,7 +2320,7 @@ impl ChromeRenderer {
                     pos2(0.0, ui.clip_rect().bottom() - RAIL_STATUS_HEIGHT),
                     pos2(width, ui.clip_rect().bottom()),
                 );
-                ui.allocate_new_ui(UiBuilder::new().max_rect(status_rect), |ui| {
+                ui.scope_builder(UiBuilder::new().max_rect(status_rect), |ui| {
                     ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                         ui.add_space(6.0);
                         let collapse = Self::rail_action_button(
@@ -2355,7 +2457,7 @@ impl ChromeRenderer {
         let palette = state.palette();
         let palette = &palette;
 
-        let screen = ctx.screen_rect();
+        let screen = ctx.viewport_rect();
         let palette_width = COMMAND_PALETTE_WIDTH.min((screen.width() - 24.0).max(200.0));
         let palette_x = (screen.width() - palette_width) / 2.0;
         let palette_y = COMMAND_PALETTE_TOP_OFFSET.min((screen.height() - 120.0).max(4.0));
@@ -2369,7 +2471,7 @@ impl ChromeRenderer {
                 // overlay; painting outside an unallocated Area gets clipped.
                 let (overlay_rect, _) = ui.allocate_exact_size(screen.size(), Sense::hover());
                 ui.painter()
-                    .rect_filled(overlay_rect, Rounding::ZERO, palette.scrim);
+                    .rect_filled(overlay_rect, CornerRadius::ZERO, palette.scrim);
             });
 
         let mut palette_rect =
@@ -2380,11 +2482,11 @@ impl ChromeRenderer {
             .movable(false)
             .show(ctx, |ui| {
                 ui.set_width(palette_width);
-                palette_rect = Frame::none()
+                palette_rect = Frame::NONE
                     .fill(palette.palette_bg)
                     .stroke(Stroke::new(1.0_f32, palette.palette_border))
-                    .rounding(Rounding::same(12.0))
-                    .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(14, 12))
                     .show(ui, |ui| {
                         let input_id = egui::Id::new("kasumi_command_palette_input");
                         if focus_command {
@@ -2395,7 +2497,7 @@ impl ChromeRenderer {
                                 .id(input_id)
                                 .hint_text("Search, open a tab, or enter an address…")
                                 .text_color(palette.text_strong)
-                                .frame(false)
+                                .frame(Frame::NONE)
                                 .desired_width(palette_width - 28.0),
                         );
                         if focus_command {
@@ -2421,12 +2523,12 @@ impl ChromeRenderer {
                                 );
                                 let fill = palette_row_fill(palette, selected, row_resp.hovered());
                                 ui.painter()
-                                    .rect_filled(row_rect, Rounding::same(6.0), fill);
+                                    .rect_filled(row_rect, CornerRadius::same(6), fill);
 
                                 // Lay the labels out *inside* the allocated row.
                                 // Adding them after `allocate_exact_size` would
                                 // place them below the highlight rect.
-                                ui.allocate_new_ui(UiBuilder::new().max_rect(row_rect), |ui| {
+                                ui.scope_builder(UiBuilder::new().max_rect(row_rect), |ui| {
                                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                         ui.add_space(8.0);
                                         ui.label(RichText::new(item.icon).size(14.0));
@@ -2514,7 +2616,7 @@ impl ChromeRenderer {
         let palette = state.palette();
         let palette = &palette;
 
-        let screen = ctx.screen_rect();
+        let screen = ctx.viewport_rect();
         let width = menu.width.min((screen.width() - 12.0).max(160.0));
         let height = menu.height.min((screen.height() - 12.0).max(96.0));
         let x = menu.anchor.x.clamp(
@@ -2534,11 +2636,11 @@ impl ChromeRenderer {
             .movable(false)
             .show(ctx, |ui| {
                 ui.set_width(width - 4.0);
-                card_rect = Frame::none()
+                card_rect = Frame::NONE
                     .fill(palette.menu_bg)
                     .stroke(Stroke::new(1.0_f32, palette.menu_border))
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(egui::Margin::symmetric(6.0, 6.0))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(6, 6))
                     .show(ui, |ui| {
                         for (index, item) in items.iter().enumerate() {
                             let (row_rect, row_resp) = ui.allocate_exact_size(
@@ -2552,7 +2654,7 @@ impl ChromeRenderer {
                                 row_resp.hovered() && item.enabled,
                             );
                             ui.painter()
-                                .rect_filled(row_rect, Rounding::same(5.0), fill);
+                                .rect_filled(row_rect, CornerRadius::same(5), fill);
 
                             let text_color = if !item.enabled {
                                 palette.menu_disabled
@@ -2633,7 +2735,7 @@ impl ChromeRenderer {
             .any(|download| download.is_finished() || download.state == DownloadState::Canceled);
         let palette = state.palette();
         let palette = &palette;
-        let screen = ctx.screen_rect();
+        let screen = ctx.viewport_rect();
         let size = downloads_bubble_size(screen);
         let anchor = downloads_bubble_anchor(screen, rail_width(state.rail_expanded));
         let mut card_rect = egui::Rect::from_min_size(anchor, size);
@@ -2644,11 +2746,11 @@ impl ChromeRenderer {
             .movable(false)
             .show(ctx, |ui| {
                 ui.set_width(size.x);
-                card_rect = Frame::none()
+                card_rect = Frame::NONE
                     .fill(palette.menu_bg)
                     .stroke(Stroke::new(1.0_f32, palette.menu_border))
-                    .rounding(Rounding::same(10.0))
-                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
@@ -3006,7 +3108,7 @@ impl ChromeRenderer {
             return;
         };
         let palette = state.palette();
-        let screen = ctx.screen_rect();
+        let screen = ctx.viewport_rect();
         let width = 330.0_f32.min((screen.width() - 32.0).max(220.0));
         let accent = match toast.kind {
             ToastKind::Success => palette.shield_ok,
@@ -3025,11 +3127,11 @@ impl ChromeRenderer {
             .movable(false)
             .show(ctx, |ui| {
                 ui.set_width(width);
-                Frame::none()
+                Frame::NONE
                     .fill(palette.palette_bg)
                     .stroke(Stroke::new(1.0_f32, accent))
-                    .rounding(Rounding::same(10.0))
-                    .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let (icon_rect, _) =
@@ -3393,7 +3495,7 @@ impl ChromeRenderer {
         let mut switch_clicked = false;
         let palette = state.palette();
         let palette = &palette;
-        let screen = ctx.screen_rect();
+        let screen = ctx.viewport_rect();
         let width = SETTINGS_WIDTH.min((screen.width() - 24.0).max(280.0));
         let mut card_rect = egui::Rect::from_min_size(screen.center(), vec2(width, 0.0));
         let mut done_clicked = false;
@@ -3409,11 +3511,11 @@ impl ChromeRenderer {
             .movable(false)
             .show(ctx, |ui| {
                 ui.set_width(width);
-                card_rect = Frame::none()
+                card_rect = Frame::NONE
                     .fill(palette.palette_bg)
                     .stroke(Stroke::new(1.0_f32, palette.palette_border))
-                    .rounding(Rounding::same(12.0))
-                    .inner_margin(egui::Margin::symmetric(20.0, 18.0))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(20, 18))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
@@ -3743,7 +3845,7 @@ impl ChromeRenderer {
                                             } else {
                                                 Color32::TRANSPARENT
                                             };
-                                            ui.painter().rect_filled(rect, Rounding::same(8.0), fill);
+                                            ui.painter().rect_filled(rect, CornerRadius::same(8), fill);
                                             let (r, g, b) = workspace.color.rgb();
                                             paint_rail_icon(
                                                 ui,
@@ -4064,7 +4166,7 @@ impl ChromeRenderer {
         }
 
         let palette = state.palette();
-        let screen = ctx.screen_rect();
+        let screen = ctx.viewport_rect();
         let width = SETTINGS_WIDTH.min((screen.width() - 24.0).max(280.0));
         let content_height = SETTINGS_MAX_CONTENT_HEIGHT.min((screen.height() - 120.0).max(160.0));
         let mut card_rect = egui::Rect::from_min_size(screen.center(), vec2(width, 0.0));
@@ -4078,11 +4180,11 @@ impl ChromeRenderer {
             .movable(false)
             .show(ctx, |ui| {
                 ui.set_width(width);
-                card_rect = Frame::none()
+                card_rect = Frame::NONE
                     .fill(palette.palette_bg)
                     .stroke(Stroke::new(1.0_f32, palette.palette_border))
-                    .rounding(Rounding::same(12.0))
-                    .inner_margin(egui::Margin::symmetric(20.0, 18.0))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(20, 18))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
@@ -4166,7 +4268,7 @@ impl ChromeRenderer {
         }
 
         let rail = ui.clip_rect();
-        let screen = ui.ctx().screen_rect();
+        let screen = ui.ctx().viewport_rect();
         let (width, height) = rail_tooltip_metrics(expanded);
         let anchor = page_tooltip_anchor(rail, response.rect, screen, width, height);
         *tooltip = Some(RailTooltip {
@@ -4221,7 +4323,7 @@ impl ChromeRenderer {
         } else {
             Color32::TRANSPARENT
         };
-        ui.painter().rect_filled(rect, Rounding::same(7.0), fill);
+        ui.painter().rect_filled(rect, CornerRadius::same(7), fill);
         paint_rail_icon(
             ui,
             rect.shrink(5.0),
@@ -4250,7 +4352,7 @@ impl ChromeRenderer {
         } else {
             Color32::TRANSPARENT
         };
-        ui.painter().rect_filled(rect, Rounding::same(7.0), fill);
+        ui.painter().rect_filled(rect, CornerRadius::same(7), fill);
         let content_color = if response.hovered() {
             palette.text_strong
         } else {
@@ -4295,7 +4397,7 @@ impl ChromeRenderer {
         );
         if row_hovered || response.hovered() {
             ui.painter()
-                .rect_filled(rect, Rounding::same(4.0), palette.close_bg);
+                .rect_filled(rect, CornerRadius::same(4), palette.close_bg);
             paint_rail_icon(ui, rect.shrink(2.0), RailIcon::Close, palette.close_icon);
         }
         response
@@ -4317,17 +4419,18 @@ impl ChromeRenderer {
         } else {
             Color32::TRANSPARENT
         };
-        ui.painter().rect_filled(rect, Rounding::same(7.0), fill);
+        ui.painter().rect_filled(rect, CornerRadius::same(7), fill);
 
         if is_active {
             ui.painter().rect_stroke(
                 rect.shrink(0.5),
-                Rounding::same(7.0),
+                CornerRadius::same(7),
                 Stroke::new(1.0_f32, palette.tab_border),
+                egui::StrokeKind::Inside,
             );
             ui.painter().rect_filled(
                 egui::Rect::from_min_size(rect.min, vec2(3.0, rect.height())),
-                Rounding::same(1.5),
+                CornerRadius::same(2),
                 palette.rail_accent,
             );
         }
@@ -4516,7 +4619,7 @@ impl ChromeRenderer {
             let anchor = rail_menu_anchor(
                 rail_rect,
                 pointer,
-                ui.ctx().screen_rect(),
+                ui.ctx().viewport_rect(),
                 menu_width,
                 menu_height,
             );
@@ -4601,12 +4704,14 @@ impl ChromeOverlayRenderer {
             height: size.height.max(1).min(max_tex),
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &surface_config);
 
-        let renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let renderer =
+            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
         egui_material_icons::initialize(&egui_ctx);
 
@@ -4697,19 +4802,20 @@ impl ChromeOverlayRenderer {
         let focus_command = focus_before;
 
         let egui_ctx = self.egui_ctx.clone();
-        let full_output = egui_ctx.run(raw_input, |ctx| {
+        let mut full_output = egui_ctx.run_ui(raw_input, |ui| {
+            let ctx = ui.ctx().clone();
             if settings_open {
-                ChromeRenderer::build_settings(ctx, state, &mut actions);
+                ChromeRenderer::build_settings(&ctx, state, &mut actions);
             } else if bookmark_manager_open {
-                ChromeRenderer::build_bookmark_manager(ctx, state, &mut actions);
+                ChromeRenderer::build_bookmark_manager(&ctx, state, &mut actions);
             } else if menu_open {
-                ChromeRenderer::build_tab_menu(ctx, state, &mut actions);
+                ChromeRenderer::build_tab_menu(&ctx, state, &mut actions);
             } else if palette_open {
-                ChromeRenderer::build_command_palette(ctx, state, &mut actions, focus_command);
+                ChromeRenderer::build_command_palette(&ctx, state, &mut actions, focus_command);
             } else if downloads_open {
-                ChromeRenderer::build_downloads_bubble(ctx, state, &mut actions);
+                ChromeRenderer::build_downloads_bubble(&ctx, state, &mut actions);
             } else if toast_open {
-                ChromeRenderer::build_toast(ctx, state);
+                ChromeRenderer::build_toast(&ctx, state);
             }
         });
         // The rail button raises this flag during the main window's render,
@@ -4722,12 +4828,19 @@ impl ChromeOverlayRenderer {
         self.egui_state
             .handle_platform_output(window, full_output.platform_output.clone());
 
-        let output_frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(e) => {
-                tracing::warn!("palette surface error: {:?}", e);
-                return actions;
+        for (id, deltas) in full_output.textures_delta.set.drain() {
+            for delta in deltas {
+                self.renderer
+                    .update_texture(&self.device, &self.queue, id, &delta);
             }
+        }
+        let Some(output_frame) = acquire_surface_frame(
+            &self.surface,
+            &self.device,
+            &self.surface_config,
+            "palette overlay",
+        ) else {
+            return actions;
         };
         let view = output_frame
             .texture
@@ -4740,10 +4853,6 @@ impl ChromeOverlayRenderer {
             .egui_ctx
             .tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
 
-        for (id, delta) in &full_output.textures_delta.set {
-            self.renderer
-                .update_texture(&self.device, &self.queue, *id, delta);
-        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -4764,6 +4873,7 @@ impl ChromeOverlayRenderer {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
+                        depth_slice: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
                                 r: 0.0,
@@ -4777,16 +4887,17 @@ impl ChromeOverlayRenderer {
                     depth_stencil_attachment: None,
                     occlusion_query_set: None,
                     timestamp_writes: None,
+                    multiview_mask: None,
                 })
                 .forget_lifetime();
             self.renderer.render(&mut rpass, &tris, &screen_descriptor);
         }
 
-        for id in &full_output.textures_delta.free {
-            self.renderer.free_texture(id);
+        for id in full_output.textures_delta.free.drain() {
+            self.renderer.free_texture(&id);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
-        output_frame.present();
+        self.queue.present(output_frame);
 
         actions
     }
@@ -4852,12 +4963,14 @@ impl TooltipRenderer {
             height: size.height.max(1).min(max_tex),
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &surface_config);
 
-        let renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let renderer =
+            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -4914,15 +5027,15 @@ impl TooltipRenderer {
         let raw_input = self.egui_state.take_egui_input(window);
         let card = tooltip.clone();
         let egui_ctx = self.egui_ctx.clone();
-        let full_output = egui_ctx.run(raw_input, |ctx| {
-            egui::CentralPanel::default()
-                .frame(Frame::none().fill(Color32::TRANSPARENT))
-                .show(ctx, |ui| {
-                    Frame::none()
+        let mut full_output = egui_ctx.run_ui(raw_input, |ui| {
+            egui::CentralPanel::no_frame()
+                .frame(Frame::NONE.fill(Color32::TRANSPARENT))
+                .show(ui, |ui| {
+                    Frame::NONE
                         .fill(palette.tooltip_bg)
                         .stroke(Stroke::new(1.0_f32, palette.tooltip_border))
-                        .rounding(Rounding::same(6.0))
-                        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(8, 6))
                         .show(ui, |ui| {
                             // Fill the whole overlay window so the visible card is
                             // vertically centered on the hovered tab row. A plain
@@ -4957,12 +5070,19 @@ impl TooltipRenderer {
         self.egui_state
             .handle_platform_output(window, full_output.platform_output.clone());
 
-        let output_frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(e) => {
-                tracing::warn!("tooltip surface error: {:?}", e);
-                return;
+        for (id, deltas) in full_output.textures_delta.set.drain() {
+            for delta in deltas {
+                self.renderer
+                    .update_texture(&self.device, &self.queue, id, &delta);
             }
+        }
+        let Some(output_frame) = acquire_surface_frame(
+            &self.surface,
+            &self.device,
+            &self.surface_config,
+            "tooltip overlay",
+        ) else {
+            return;
         };
         let view = output_frame
             .texture
@@ -4975,10 +5095,6 @@ impl TooltipRenderer {
             .egui_ctx
             .tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
 
-        for (id, delta) in &full_output.textures_delta.set {
-            self.renderer
-                .update_texture(&self.device, &self.queue, *id, delta);
-        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -4999,6 +5115,7 @@ impl TooltipRenderer {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
+                        depth_slice: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
                                 r: 0.0,
@@ -5012,16 +5129,17 @@ impl TooltipRenderer {
                     depth_stencil_attachment: None,
                     occlusion_query_set: None,
                     timestamp_writes: None,
+                    multiview_mask: None,
                 })
                 .forget_lifetime();
             self.renderer.render(&mut rpass, &tris, &screen_descriptor);
         }
 
-        for id in &full_output.textures_delta.free {
-            self.renderer.free_texture(id);
+        for id in full_output.textures_delta.free.drain() {
+            self.renderer.free_texture(&id);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
-        output_frame.present();
+        self.queue.present(output_frame);
     }
 }
 
@@ -5091,12 +5209,14 @@ impl PageHudRenderer {
             height: size.height.max(1).min(max_tex),
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &surface_config);
 
-        let renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let renderer =
+            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
         egui_material_icons::initialize(&egui_ctx);
         let egui_state = egui_winit::State::new(
@@ -5160,16 +5280,16 @@ impl PageHudRenderer {
             .map_or(0, |tab| tab.blocked_requests);
         let ram_mb = state.ram_mb;
         let egui_ctx = self.egui_ctx.clone();
-        let full_output = egui_ctx.run(raw_input, |ctx| {
-            egui::CentralPanel::default()
-                .frame(Frame::none().fill(Color32::TRANSPARENT))
-                .show(ctx, |ui| {
+        let mut full_output = egui_ctx.run_ui(raw_input, |ui| {
+            egui::CentralPanel::no_frame()
+                .frame(Frame::NONE.fill(Color32::TRANSPARENT))
+                .show(ui, |ui| {
                     ui.set_height(PAGE_HUD_HEIGHT - 4.0);
-                    Frame::none()
+                    Frame::NONE
                         .fill(palette.menu_bg)
                         .stroke(Stroke::new(0.0_f32, Color32::TRANSPARENT))
-                        .rounding(Rounding::same(8.0))
-                        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(8, 4))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 let command = ChromeRenderer::rail_icon_button(
@@ -5231,12 +5351,19 @@ impl PageHudRenderer {
         self.egui_state
             .handle_platform_output(window, full_output.platform_output.clone());
 
-        let output_frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(e) => {
-                tracing::warn!("page HUD surface error: {:?}", e);
-                return actions;
+        for (id, deltas) in full_output.textures_delta.set.drain() {
+            for delta in deltas {
+                self.renderer
+                    .update_texture(&self.device, &self.queue, id, &delta);
             }
+        }
+        let Some(output_frame) = acquire_surface_frame(
+            &self.surface,
+            &self.device,
+            &self.surface_config,
+            "page HUD",
+        ) else {
+            return actions;
         };
         let view = output_frame
             .texture
@@ -5249,10 +5376,6 @@ impl PageHudRenderer {
             .egui_ctx
             .tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
 
-        for (id, delta) in &full_output.textures_delta.set {
-            self.renderer
-                .update_texture(&self.device, &self.queue, *id, delta);
-        }
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -5273,6 +5396,7 @@ impl PageHudRenderer {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
+                        depth_slice: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
                                 r: 0.0,
@@ -5286,16 +5410,17 @@ impl PageHudRenderer {
                     depth_stencil_attachment: None,
                     occlusion_query_set: None,
                     timestamp_writes: None,
+                    multiview_mask: None,
                 })
                 .forget_lifetime();
             self.renderer.render(&mut rpass, &tris, &screen_descriptor);
         }
 
-        for id in &full_output.textures_delta.free {
-            self.renderer.free_texture(id);
+        for id in full_output.textures_delta.free.drain() {
+            self.renderer.free_texture(&id);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
-        output_frame.present();
+        self.queue.present(output_frame);
         actions
     }
 }
@@ -5314,40 +5439,40 @@ fn rail_icon_glyph(icon: RailIcon) -> &'static str {
     };
 
     match icon {
-        RailIcon::Plus => ICON_ADD,
-        RailIcon::Search => ICON_SEARCH,
-        RailIcon::Code => ICON_CODE,
-        RailIcon::ChevronLeft => ICON_CHEVRON_LEFT,
-        RailIcon::ChevronRight => ICON_CHEVRON_RIGHT,
-        RailIcon::Moon => ICON_BEDTIME,
-        RailIcon::Shield => ICON_SHIELD,
-        RailIcon::Chip => ICON_MEMORY,
-        RailIcon::Globe => ICON_PUBLIC,
-        RailIcon::Close => ICON_CLOSE,
-        RailIcon::Pin => ICON_PUSH_PIN,
-        RailIcon::PinOff => ICON_PIN,
-        RailIcon::Copy => ICON_CONTENT_COPY,
-        RailIcon::Sidebar => ICON_VIEW_SIDEBAR,
-        RailIcon::Settings => ICON_SETTINGS,
-        RailIcon::Download => ICON_DOWNLOAD,
-        RailIcon::Pause => ICON_PAUSE,
-        RailIcon::Play => ICON_PLAY_ARROW,
-        RailIcon::Retry => ICON_REFRESH,
-        RailIcon::FolderOpen => ICON_FOLDER_OPEN,
-        RailIcon::Check => ICON_CHECK,
-        RailIcon::Delete => ICON_DELETE,
-        RailIcon::Star => ICON_STAR,
-        RailIcon::Edit => ICON_EDIT,
-        RailIcon::BookmarkAdd => ICON_BOOKMARK_ADD,
-        RailIcon::OpenInNew => ICON_OPEN_IN_NEW,
-        RailIcon::WorkspaceWork => ICON_WORK,
-        RailIcon::WorkspaceCode => ICON_CODE,
-        RailIcon::WorkspaceStudy => ICON_SCHOOL,
-        RailIcon::WorkspaceLaunch => ICON_ROCKET,
-        RailIcon::WorkspaceDesign => ICON_PALETTE,
-        RailIcon::WorkspaceMusic => ICON_MUSIC_NOTE,
-        RailIcon::WorkspaceReading => ICON_BOOK,
-        RailIcon::WorkspaceWeb => ICON_PUBLIC,
+        RailIcon::Plus => ICON_ADD.into(),
+        RailIcon::Search => ICON_SEARCH.into(),
+        RailIcon::Code => ICON_CODE.into(),
+        RailIcon::ChevronLeft => ICON_CHEVRON_LEFT.into(),
+        RailIcon::ChevronRight => ICON_CHEVRON_RIGHT.into(),
+        RailIcon::Moon => ICON_BEDTIME.into(),
+        RailIcon::Shield => ICON_SHIELD.into(),
+        RailIcon::Chip => ICON_MEMORY.into(),
+        RailIcon::Globe => ICON_PUBLIC.into(),
+        RailIcon::Close => ICON_CLOSE.into(),
+        RailIcon::Pin => ICON_PUSH_PIN.into(),
+        RailIcon::PinOff => ICON_PIN.into(),
+        RailIcon::Copy => ICON_CONTENT_COPY.into(),
+        RailIcon::Sidebar => ICON_VIEW_SIDEBAR.into(),
+        RailIcon::Settings => ICON_SETTINGS.into(),
+        RailIcon::Download => ICON_DOWNLOAD.into(),
+        RailIcon::Pause => ICON_PAUSE.into(),
+        RailIcon::Play => ICON_PLAY_ARROW.into(),
+        RailIcon::Retry => ICON_REFRESH.into(),
+        RailIcon::FolderOpen => ICON_FOLDER_OPEN.into(),
+        RailIcon::Check => ICON_CHECK.into(),
+        RailIcon::Delete => ICON_DELETE.into(),
+        RailIcon::Star => ICON_STAR.into(),
+        RailIcon::Edit => ICON_EDIT.into(),
+        RailIcon::BookmarkAdd => ICON_BOOKMARK_ADD.into(),
+        RailIcon::OpenInNew => ICON_OPEN_IN_NEW.into(),
+        RailIcon::WorkspaceWork => ICON_WORK.into(),
+        RailIcon::WorkspaceCode => ICON_CODE.into(),
+        RailIcon::WorkspaceStudy => ICON_SCHOOL.into(),
+        RailIcon::WorkspaceLaunch => ICON_ROCKET.into(),
+        RailIcon::WorkspaceDesign => ICON_PALETTE.into(),
+        RailIcon::WorkspaceMusic => ICON_MUSIC_NOTE.into(),
+        RailIcon::WorkspaceReading => ICON_BOOK.into(),
+        RailIcon::WorkspaceWeb => ICON_PUBLIC.into(),
     }
 }
 
@@ -5433,7 +5558,7 @@ fn material_button(
     let button = egui::Button::new(text)
         .fill(fill)
         .stroke(stroke)
-        .rounding(Rounding::same(8.0))
+        .corner_radius(CornerRadius::same(8))
         .min_size(vec2(0.0, 28.0));
     ui.add_enabled(enabled, button)
 }
@@ -6445,6 +6570,79 @@ mod tests {
     }
 
     #[test]
+    fn copy_url_targets_the_active_tab_then_the_omnibox() {
+        let mut state = ChromeState::default();
+        assert_eq!(state.active_url(), None);
+
+        state.tabs = vec![
+            tab(1, "One", "https://one.example/"),
+            tab(2, "Two", "https://two.example/"),
+        ];
+        state.omnibox_text = "https://one.example/".to_string();
+        assert_eq!(state.active_url().as_deref(), Some("https://one.example/"));
+
+        state.active_tab_id = Some(2);
+        assert_eq!(state.active_url().as_deref(), Some("https://two.example/"));
+
+        // Before the first tab exists, the mirrored address text still copies.
+        state.tabs.clear();
+        state.omnibox_text = "https://fallback.example/".to_string();
+        assert_eq!(
+            state.active_url().as_deref(),
+            Some("https://fallback.example/")
+        );
+
+        state.omnibox_text.clear();
+        assert_eq!(state.active_url(), None);
+    }
+
+    #[test]
+    fn copy_url_shortcut_writes_the_active_url_and_confirms_once() {
+        let mut state = ChromeState::default();
+        state.tabs = vec![tab(3, "Docs", "https://example.com/docs")];
+        state.active_tab_id = Some(3);
+        state.request_copy_url();
+        assert!(state.copy_url_requested);
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput::default();
+        let mut output = ctx.run_ui(input, |ui| {
+            ChromeRenderer::serve_copy_url_request(ui.ctx(), &mut state);
+        });
+        output.textures_delta.clear();
+
+        // The request is served exactly once, even though the shell redraws
+        // every loop iteration.
+        assert!(!state.copy_url_requested);
+        assert!(output.platform_output.commands.iter().any(|command| {
+            matches!(
+                command,
+                egui::OutputCommand::CopyText(text) if text == "https://example.com/docs"
+            )
+        }));
+        let toast = state.toast.expect("copy confirmation");
+        assert_eq!(toast.kind, ToastKind::Success);
+        assert_eq!(toast.title, "Copied");
+    }
+
+    #[test]
+    fn copy_url_shortcut_without_a_page_does_nothing() {
+        let mut state = ChromeState::default();
+        state.request_copy_url();
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput::default();
+        let mut output = ctx.run_ui(input, |ui| {
+            ChromeRenderer::serve_copy_url_request(ui.ctx(), &mut state);
+        });
+        output.textures_delta.clear();
+
+        assert!(!state.copy_url_requested);
+        assert!(output.platform_output.commands.is_empty());
+        assert!(state.toast.is_none());
+    }
+
+    #[test]
     fn toasts_queue_while_a_modal_owns_the_overlay() {
         let mut state = ChromeState::default();
         state.open_settings();
@@ -6535,7 +6733,8 @@ mod tests {
         let mut field_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(0.0, 0.0));
         let mut rail_rect = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(0.0, 0.0));
 
-        let _ = ctx.run(
+        clear_textures(
+            &ctx,
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     pos2(0.0, 0.0),
@@ -6543,15 +6742,16 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ctx| {
-                egui::SidePanel::left("rail_address_field_test")
-                    .exact_width(RAIL_WIDTH_EXPANDED)
+            |ui| {
+                egui::Panel::left("rail_address_field_test")
+                    .exact_size(RAIL_WIDTH_EXPANDED)
                     .resizable(false)
-                    .frame(egui::Frame::none())
-                    .show(ctx, |ui| {
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        let ctx = ui.ctx().clone();
                         let response = ChromeRenderer::build_rail_address_field(
                             ui,
-                            ctx,
+                            &ctx,
                             &mut state,
                             &mut actions,
                             &palette,
@@ -6619,6 +6819,11 @@ mod tests {
         ));
     }
 
+    fn clear_textures(ctx: &egui::Context, raw: egui::RawInput, run: impl FnMut(&mut egui::Ui)) {
+        let mut output = ctx.run_ui(raw, run);
+        output.textures_delta.clear();
+    }
+
     #[test]
     fn bottom_hud_tooltip_anchor_sits_above_the_button_and_inside_the_window() {
         let screen = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 800.0));
@@ -6651,14 +6856,20 @@ mod tests {
         raw.screen_rect = Some(screen);
         raw.events.push(egui::Event::PointerMoved(pointer));
         let mut actions = Vec::new();
-        let _ = ctx.run(raw, |ctx| {
-            ChromeRenderer::build_page_hud(ctx, &mut state, &mut actions);
+        clear_textures(&ctx, raw, |ui| {
+            ChromeRenderer::build_page_hud(ui.ctx(), &mut state, &mut actions);
         });
         let mut raw = egui::RawInput::default();
         raw.screen_rect = Some(screen);
         raw.events.push(egui::Event::PointerMoved(pointer));
-        let _ = ctx.run(raw, |ctx| {
-            ChromeRenderer::build_page_hud(ctx, &mut state, &mut actions);
+        clear_textures(&ctx, raw, |ui| {
+            ChromeRenderer::build_page_hud(ui.ctx(), &mut state, &mut actions);
+        });
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(screen);
+        raw.events.push(egui::Event::PointerMoved(pointer));
+        clear_textures(&ctx, raw, |ui| {
+            ChromeRenderer::build_page_hud(ui.ctx(), &mut state, &mut actions);
         });
         assert!(state.tooltip.is_some());
         assert_eq!(
@@ -7238,7 +7449,8 @@ mod tests {
         // that reports an infinite width cannot poison the next frame's centering
         // math with a NaN max rect.
         for _ in 0..3 {
-            let _ = ctx.run(
+            clear_textures(
+                &ctx,
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         pos2(0.0, 0.0),
@@ -7246,7 +7458,7 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                |ctx| ChromeRenderer::build_downloads_bubble(ctx, &mut state, &mut actions),
+                |ui| ChromeRenderer::build_downloads_bubble(ui.ctx(), &mut state, &mut actions),
             );
             if let Some(area) =
                 egui::AreaState::load(&ctx, egui::Id::new("kasumi_downloads_bubble"))
@@ -7291,7 +7503,8 @@ mod tests {
         let mut actions = Vec::new();
 
         for _ in 0..3 {
-            let _ = ctx.run(
+            clear_textures(
+                &ctx,
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         pos2(0.0, 0.0),
@@ -7299,7 +7512,7 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                |ctx| ChromeRenderer::build_bookmark_manager(ctx, &mut state, &mut actions),
+                |ui| ChromeRenderer::build_bookmark_manager(ui.ctx(), &mut state, &mut actions),
             );
             if let Some(area) =
                 egui::AreaState::load(&ctx, egui::Id::new("kasumi_bookmark_manager"))

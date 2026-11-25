@@ -17,7 +17,7 @@ Every single commit must honor three non-negotiable engineering goals:
 2. **Daily-Driver Reliability & Compatibility:**
    - Full support for modern web apps (YouTube, Google Docs, Figma, WebGL, WASM, WebRTC).
    - Crash-safe session persistence, history, and bookmarks stored in **SQLite (WAL mode)**.
-   - Complete keyboard-first ergonomics (`Ctrl/Cmd+T`, `W`, `L`, `Shift+T`, `F`, `F12`, `Alt+H`, `Ctrl/Cmd+K`).
+   - Complete keyboard-first ergonomics (`Ctrl/Cmd+T`, `W`, `L`, `Shift+T`, `Shift+C` (copy URL), `F`, `F12`, `Alt+H`, `Ctrl/Cmd+K`).
 3. **Maximum Execution Speed:**
    - Use `mimalloc` as the `#[global_allocator]`.
    - Use **Native Child Window Embedding** (`raw-window-handle` + platform child view), NOT Off-Screen Rendering (OSR), to preserve zero-copy GPU compositing and hardware video decoding.
@@ -59,7 +59,7 @@ Use these exact crate versions and release profile settings:
 ```toml
 [package]
 name = "kasumi-browser"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 
 [dependencies]
@@ -72,22 +72,22 @@ mimalloc = { version = "0.1", default-features = false }
 # Native windowing & GPU-accelerated Rust browser chrome
 winit = "0.30"
 raw-window-handle = "0.6"
-egui = "0.30"
-egui-wgpu = "0.30"
-egui-winit = "0.30"
-# Material Symbols icon font, pinned to the egui 0.30-compatible release.
-egui_material_icons = "0.2.0"
-wgpu = "23"
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-wgpu = "0.37"
+egui-winit = "0.37"
+# Material Symbols icon font, pinned to the egui 0.37-compatible release.
+egui_material_icons = "0.9"
+wgpu = "30"
 
 # System RAM pressure monitoring for aggressive tab hibernation
-sysinfo = "0.33"
+sysinfo = "0.40"
 
 # Brave's native Rust ad & tracker blocking engine (v0.13.x)
 adblock = { version = "0.13.6", default-features = false, features = ["embedded-domain-resolver"] }
 
 # Async storage worker & crash-safe SQLite persistence
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
@@ -97,21 +97,24 @@ crossbeam-channel = "0.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
+# Blocking executor for wgpu adapter/device requests
+pollster = "1"
+
 # Platform-specific child window positioning (HWND / NSView / X11)
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.5"
+objc2 = "0.6"
 # NSEvent's local monitor lets shell shortcuts work even when the CEF child
 # view has keyboard focus; NSMenu/NSMenuItem build the native File menu;
 # block2 is required by the Objective-C block API.
-objc2-app-kit = { version = "0.2", features = ["NSView", "NSWindow", "NSEvent", "NSMenu", "NSMenuItem", "NSTrackingArea", "block2"] }
-objc2-foundation = { version = "0.2", features = ["NSGeometry"] }
-block2 = "0.5"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSView", "NSWindow", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSApplication", "block2"] }
+objc2-foundation = { version = "0.3", features = ["NSGeometry"] }
+block2 = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-x11rb = "0.13"
+x11rb = "0.14"
 
 [profile.release]
 lto = "thin"

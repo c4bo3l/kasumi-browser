@@ -502,7 +502,7 @@ impl StorageManager {
                 url: row.get(0)?,
                 title: row.get(1)?,
                 visit_count: row.get(2)?,
-                last_visited: row.get(3)?,
+                last_visited: row.get::<_, i64>(3)? as u64,
             })
         })?;
 
@@ -562,7 +562,7 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
                      visit_count = visit_count + 1,
                      last_visited = ?3,
                      title = CASE WHEN ?2 != '' THEN ?2 ELSE title END",
-                params![url, title, now],
+                params![url, title, now as i64],
             );
             if let Err(e) = res {
                 tracing::warn!("Failed to record history visit: {}", e);
@@ -640,7 +640,7 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
                 "INSERT INTO bookmarks (workspace_id, url, title, folder, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(workspace_id, url) DO UPDATE SET title = ?3, folder = ?4",
-                params![workspace_id as i64, url, title, folder, now],
+                params![workspace_id as i64, url, title, folder, now as i64],
             );
             if let Err(e) = res {
                 tracing::warn!("Failed to add bookmark: {}", e);

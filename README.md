@@ -14,7 +14,7 @@ Release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ## ✅ What Has Been Done
 
-Current version: **0.8.0**. A version bump is released when a PR is merged into `main`; PRs include the bump in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, `README.md`, `RELEASE_NOTES.md`, and `Cargo.lock` so CI checks the exact release state, as required by `AGENTS.md`.
+Current version: **0.8.1**. A version bump is released when a PR is merged into `main`; PRs include the bump in `Cargo.toml`, `src/bin/bundle.rs`, `AGENTS.md`, `README.md`, `RELEASE_NOTES.md`, and `Cargo.lock` so CI checks the exact release state, as required by `AGENTS.md`.
 
 - Renamed the project from LiteBrowser to **Kasumi Browser** everywhere: package, binary, CEF helper, bundle ID, window title, database path, and docs.
 - Implemented the CEF subprocess fork trap and `mimalloc` global allocator.
@@ -53,8 +53,8 @@ Current version: **0.8.0**. A version bump is released when a PR is merged into 
 - Fixed the original chrome UX/navigation feedback items: Back/Forward icon states, omnibox URL synchronization, F12 DevTools, view-source navigation, favicons, and hover tooltips.
 - Fixed DevTools refocusing after a window resize: the DevTools menu/F12 now calls `show_dev_tools` even when CEF reports an existing DevTools browser, which brings the existing window forward instead of doing nothing.
 - Fixed middle-click and Ctrl+click link activation: CEF now cancels the source-tab navigation and opens a real Kasumi tab, with middle-click loading in the background and Ctrl+click in the foreground. Background tabs use CEF's cross-platform parent-window setup: macOS starts the `NSView` hidden, Windows clears `WS_VISIBLE`, and Linux unmaps the X11 child as soon as it is created. CEF window handles now convert between pointer and XID forms through one helper on every platform.
-- Updated CEF to `156.7.0+156.0.31`, `adblock` to `0.13.6`, and `url` to `2.5.9`. The egui/wgpu/rusqlite/sysinfo major versions stay pinned to the versions in `AGENTS.md` until a dedicated migration.
-- macOS installs a mouse tracking area on the winit view; hover/tooltip delivery while the CEF page owns keyboard focus is still under investigation (see Known Issues).
+- Updated the dependency set to current releases: `egui`/`egui-wgpu`/`egui-winit` 0.37, `egui_material_icons` 0.9, `wgpu` 30, `rusqlite` 0.43, `sysinfo` 0.40, `objc2` 0.6, `objc2-app-kit`/`objc2-foundation` 0.3, `block2` 0.6, `windows-sys` 0.61, `x11rb` 0.14, and `pollster` 1, plus CEF `156.7.0+156.0.31`, `adblock` `0.13.6`, and `url` `2.5.9`.
+- Fixed macOS HUD/rail tooltips losing hover delivery after the CEF page takes keyboard focus. The shell now monitors pointer moves with a local `NSEvent` monitor and a low-frequency pointer poll, forwards them into egui, and keeps the tooltip overlay above the page without stealing page input.
 - Added 174 unit tests covering omnibox resolution, bookmark search/URL normalization and manager layout, bookmark move duplicate guards, bookmark rail/palette actions, toggle/un-bookmark state, and native confirmations, terminal download notification transitions and toast queueing, search-provider selection and homepages, rail/palette/menu/settings geometry and state, explicit this-tab/new-tab palette actions, pinned-tab ordering and menu/palette commands, workspace tab/pin/bookmark ownership, accent tinting, stale-workspace normalization, configurable last-active/default workspace startup selection, default-workspace selection/deletion and empty-workspace restore behavior, separate workspace edit/create drafts and dedicated create-mode state, collapsed workspace switching and compact translucent tooltips, collapsed status-badge sizing, Settings page selection, downloads-bubble state/aggregation/anchor/finite-layout behavior, finished-row action swapping and rail download badges, loading-spinner rotation geometry, context-menu actions, middle-click/Ctrl+click tab disposition mapping, closed-tab metadata, initial-navigation recovery, tooltip pointer-exit handling, bottom HUD tooltip placement, collapsed-only tooltip behavior, web-view shortcut forwarding (including UTF-16 character fallback), the macOS NSEvent shortcut monitor, graceful `Cmd/Ctrl+Q` routing, secondary-display overlay positioning, deferred palette text selection, light/dark palette contrast and theme override, hibernation thresholds and background-spawn rules, adblock mapping, download state/storage/restart behavior, ETA formatting, parallel segment planning, range-header parsing, eligibility, part-file writing, CEF download target paths, preference and rail-state persistence, storage (including legacy session, bookmark/workspace, and parallel-download migrations), and CEF switch invariants.
 - Verified with `cargo fmt --all -- --check`, `cargo check --bins`, `cargo test --bin kasumi-browser` (174 tests), and `cargo build --release`. PR CI now runs the same checks and unit tests on macOS 15 Intel, Windows, and Linux; interactive macOS verification is performed before each release push.
 - Removed the obsolete `BUGFIX_TASKS.md` handoff; its completed items are recorded in `RELEASE_NOTES.md`.
@@ -108,6 +108,7 @@ Kasumi uses a minimalist vertical layout instead of a Chrome-style top tab strip
 | `Ctrl / Cmd + K` | Open the floating command palette |
 | `Ctrl / Cmd + L` | Open the command palette seeded with the active URL |
 | `Ctrl / Cmd + Shift + T` | Re-open last closed tab |
+| `Ctrl / Cmd + Shift + C` | Copy the active page URL to the clipboard |
 | `Ctrl / Cmd + Z` | Undo the last tab close and restore its position |
 | `Alt + H` | Hibernate all background tabs immediately |
 | `F12` | Open Chromium DevTools for the active tab in a new window |
@@ -303,7 +304,6 @@ sha256sum kasumi-browser.tar.gz > kasumi-browser.tar.gz.sha256
 
 ## 🐞 Known Issues
 
-- **macOS bottom HUD tooltips:** the Command/DevTools and RAM/adblock HUD buttons (and some rail tooltips) may not show a tooltip, especially after the CEF page has taken keyboard focus. The hover state is computed and the native overlay is created, but the tooltip still does not appear reliably on macOS. An `NSTrackingArea` and an inactive always-on-top overlay are in place; the remaining window-ordering/event-routing issue is still under investigation.
 - **Windows and Linux interactive checks:** native child-view, tooltip, download, and bookmark flows still need hands-on verification on those platforms.
 
 ---
@@ -320,6 +320,7 @@ sha256sum kasumi-browser.tar.gz > kasumi-browser.tar.gz.sha256
 - **Google Meet / WebRTC calls:** bridge CEF permission callbacks into the native egui chrome, add screen-share source selection, and handle macOS camera/microphone entitlements.
 - **Tiny local AI:** explore a sub-0.4B on-device model for omnibox intent routing, tab grouping, and short structured extraction without sending page data to the cloud.
 - **Automated CEF/Chromium engine updates:** add a scheduled check that opens a review PR when a newer `cef` crate is published, instead of silently swapping the engine at runtime.
+- **Native print support:** bridge CEF's print callbacks into the native egui chrome and the platform print dialog on macOS, Windows, and Linux. Support `Cmd/Ctrl+P`, print preview, page range, copies, and landscape/orientation, plus “Save as PDF” with a native destination picker. Print jobs should capture the active tab without waking hibernated background tabs or introducing an OSR/second renderer.
 - **Picture-in-picture (PiP) out of the box:** make `<video>` PiP work without user setup on all three platforms. Prefer CEF/Chromium's built-in PiP for native child views; if a CEF milestone does not surface a PiP window, add a native always-on-top video overlay without introducing an OSR CEF view or a second renderer process.
 - **Incognito mode:** add native private windows isolated in a dedicated CEF request context with no cookies, cache, history, bookmarks, downloads, or session writes. Expose them from the rail and command palette with a clear private-window badge, and discard all in-memory state when the last private tab closes.
 - **Import from major browsers:** add a native first-run/import flow that pulls bookmarks, history, and saved passwords from Chrome, Edge, Firefox, Safari, and Brave profiles, with a preview and conflict-safe merge into Kasumi's SQLite WAL stores.

@@ -4,7 +4,33 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
-## v0.8.0 — Unreleased
+## v0.8.1 — Unreleased
+
+### Added
+
+- `Cmd/Ctrl+Shift+C` copies the active page URL and shows the native **Copied** confirmation. The shortcut works from the native shell and from the CEF web view, so it behaves the same whether the rail or the page has keyboard focus, and plain `Cmd/Ctrl+C` still copies the page's text selection.
+
+### Fixed
+
+- macOS bottom-HUD and rail tooltips now keep working after the CEF page takes keyboard focus. AppKit stops delivering `mouseMoved:` to the winit view at that point; the shell now installs a local `NSEvent` mouse monitor and polls the pointer position as a fallback, feeding `CursorMoved` back into egui.
+- Tooltips no longer hide themselves on the spurious `CursorLeft` event emitted when the click-through tooltip window is ordered front, and the browser window is re-focused after showing so page keyboard input is preserved.
+- The chrome, command palette, tooltip, and page HUD renderers now treat wgpu's `Occluded` (and `Timeout`) surface status as a normal frame skip instead of a warning. Previously a minimized or covered window logged `wgpu surface error: Occluded` on every redraw, at display refresh rate, while it was hidden. `Outdated` and `Lost` surfaces now reconfigure themselves immediately rather than waiting for a resize, so display changes and wake-from-sleep no longer leave a chrome surface blank.
+
+### Changed
+
+- Updated the dependency set to current releases: `egui`/`egui-wgpu`/`egui-winit` 0.37, `egui_material_icons` 0.9, `wgpu` 30, `rusqlite` 0.43, `sysinfo` 0.40, `objc2` 0.6, `objc2-app-kit`/`objc2-foundation` 0.3, `block2` 0.6, `windows-sys` 0.61, `x11rb` 0.14, and `pollster` 1.
+- Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.8.0` to `0.8.1`.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser` — 178 tests
+- `cargo build --release`
+
+---
+
+## v0.8.0 — 2026-11-25
 
 ### Added
 

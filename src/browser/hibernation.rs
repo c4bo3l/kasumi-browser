@@ -370,7 +370,7 @@ pub struct TabManager {
     content_rect: ContentRect,
 
     // System resource watchdog
-    sys: System,
+    sys: Option<System>,
     last_ram_check: Instant,
     last_tick: Instant,
     pub ram_used_bytes: u64,
@@ -420,6 +420,9 @@ pub struct TabManager {
 
     // Set when CEF forwards Cmd/Ctrl+Shift+B; consumed by the winit handler.
     bookmark_manager_requested: bool,
+
+    // Set when CEF forwards Cmd/Ctrl+Shift+C; consumed by the winit handler.
+    copy_url_requested: bool,
 
     // Favicon URLs already requested, and URLs seen before the browser exists.
     requested_favicons: HashSet<(u64, String)>,
@@ -474,10 +477,12 @@ impl TabManager {
         workspaces: Vec<Workspace>,
         bookmarks: Vec<BookmarkItem>,
     ) -> Self {
-        let mut sys = System::new();
-        sys.refresh_memory();
-        let total = sys.total_memory();
-        let used = sys.used_memory();
+        let mut sys = System::new().ok();
+        if let Some(system) = sys.as_mut() {
+            system.refresh_memory();
+        }
+        let total = sys.as_ref().map_or(0, System::total_memory);
+        let used = sys.as_ref().map_or(0, System::used_memory);
         let adblock_engine = adblocker::create_adblock_engine();
         let adblock_enabled = Arc::new(AtomicBool::new(preferences.adblock_enabled));
         let download_preferences = client::SharedDownloadPreferences::from_preferences(preferences);
@@ -531,6 +536,7 @@ impl TabManager {
             settings_requested: false,
             downloads_requested: false,
             bookmark_manager_requested: false,
+            copy_url_requested: false,
             requested_favicons: HashSet::new(),
             pending_favicon_urls: HashMap::new(),
             resolved_favicons: HashSet::new(),
@@ -2499,6 +2505,11 @@ impl TabManager {
         std::mem::take(&mut self.bookmark_manager_requested)
     }
 
+    /// Consume a Cmd/Ctrl+Shift+C request forwarded from the CEF web view.
+    pub fn consume_copy_url_request(&mut self) -> bool {
+        std::mem::take(&mut self.copy_url_requested)
+    }
+
     /// Consume a request to reveal the downloads bubble after a new transfer.
     pub fn consume_download_bubble_request(&mut self) -> bool {
         std::mem::take(&mut self.download_bubble_requested)
@@ -2691,6 +2702,11 @@ impl TabManager {
                 }
                 BrowserShortcut::OpenBookmarkManager => {
                     self.bookmark_manager_requested = true;
+                }
+                BrowserShortcut::CopyUrl => {
+                    // The shell owns the egui clipboard, so hand the request to
+                    // the same deferred path used by the winit shortcut.
+                    self.copy_url_requested = true;
                 }
                 BrowserShortcut::Quit => {
                     // The shell exits the event loop from its own shortcut
@@ -3106,16 +3122,17 @@ impl TabManager {
         // 1. Refresh RAM every RAM_CHECK_INTERVAL (5s)
         if now.duration_since(self.last_ram_check) >= RAM_CHECK_INTERVAL {
             self.last_ram_check = now;
-            self.sys.refresh_memory();
-            self.ram_used_bytes = self.sys.used_memory();
-            self.ram_total_bytes = self.sys.total_memory();
+            if let Some(system) = self.sys.as_mut() {
+                system.refresh_memory();
+                self.ram_used_bytes = system.used_memory();
+                self.ram_total_bytes = system.total_memory();
 
-            // Refresh current process RAM
-            if let Ok(pid) = sysinfo::get_current_pid() {
-                self.sys
-                    .refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-                if let Some(proc) = self.sys.process(pid) {
-                    self.ram_process_mb = proc.memory() / (1024 * 1024);
+                // Refresh current process RAM
+                if let Ok(pid) = sysinfo::get_current_pid() {
+                    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+                    if let Some(proc) = system.process(pid) {
+                        self.ram_process_mb = proc.memory() / (1024 * 1024);
+                    }
                 }
             }
         }

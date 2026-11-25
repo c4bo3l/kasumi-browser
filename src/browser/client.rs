@@ -236,6 +236,7 @@ const REPEAT_EVENT_FLAG: u32 = 8_192;
 
 /// Virtual key codes, using CEF's platform-independent Windows key codes.
 const VK_B: i32 = 0x42;
+const VK_C: i32 = 0x43;
 const VK_J: i32 = 0x4A;
 const VK_K: i32 = 0x4B;
 const VK_L: i32 = 0x4C;
@@ -301,6 +302,7 @@ pub(crate) fn browser_shortcut(
         VK_W if !shift => Some(BrowserShortcut::CloseTab),
         VK_L | VK_K if !shift => Some(BrowserShortcut::OpenCommandPalette),
         VK_B if shift => Some(BrowserShortcut::OpenBookmarkManager),
+        VK_C if shift => Some(BrowserShortcut::CopyUrl),
         VK_J if !shift => Some(BrowserShortcut::OpenDownloads),
         VK_OEM_COMMA | VK_OEM_PERIOD if !shift => Some(BrowserShortcut::OpenSettings),
         VK_Z if !shift => Some(BrowserShortcut::ReopenClosedTab),
@@ -348,6 +350,13 @@ fn browser_shortcut_from_char(
         c if c == 'B' as u16 || c == 'b' as u16 => {
             if shift {
                 Some(BrowserShortcut::OpenBookmarkManager)
+            } else {
+                None
+            }
+        }
+        c if c == 'C' as u16 || c == 'c' as u16 => {
+            if shift {
+                Some(BrowserShortcut::CopyUrl)
             } else {
                 None
             }
@@ -806,6 +815,10 @@ mod tests {
             Some(BrowserShortcut::OpenDevTools)
         );
         assert_eq!(
+            browser_shortcut(true, 0x43, 128 | 2),
+            Some(BrowserShortcut::CopyUrl)
+        );
+        assert_eq!(
             browser_shortcut(true, 0xBC, 128),
             Some(BrowserShortcut::OpenSettings)
         );
@@ -843,6 +856,12 @@ mod tests {
             browser_shortcut_from_char(true, 'j' as u16, 128),
             Some(BrowserShortcut::OpenDownloads)
         );
+        assert_eq!(
+            browser_shortcut_from_char(true, 'C' as u16, 128 | 2),
+            Some(BrowserShortcut::CopyUrl)
+        );
+        // Plain Cmd/Ctrl+C stays with the page so text selection copies.
+        assert_eq!(browser_shortcut_from_char(true, 'c' as u16, 128), None);
         assert_eq!(browser_shortcut_from_char(false, ',' as u16, 128), None);
         assert_eq!(
             browser_shortcut_from_char(true, ',' as u16, 128 | 8_192),
@@ -858,6 +877,8 @@ mod tests {
         assert_eq!(browser_shortcut(true, 0x54, 0), None);
         assert_eq!(browser_shortcut(true, 0x54, 2), None);
         assert_eq!(browser_shortcut(true, 0x57, 128 | 2), None);
+        // Plain Cmd/Ctrl+C belongs to the page selection, not the shell.
+        assert_eq!(browser_shortcut(true, 0x43, 128), None);
         assert_eq!(browser_shortcut(true, 0x58, 128), None);
         // Quit belongs to the shell so CEF must leave Cmd/Ctrl+Q alone; the
         // native event monitor routes it through graceful winit shutdown.
