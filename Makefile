@@ -1,4 +1,4 @@
-.PHONY: dev dev-release watch check test fmt lint build release bundle clean help
+.PHONY: dev dev-release watch check test fmt lint build release build-windows bundle clean help
 
 # Default target: same as `npm run dev`
 dev:
@@ -29,6 +29,9 @@ build: check test
 release:
 	cargo build --release
 
+build-windows:
+	cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc
+
 bundle:
 	cargo run --release --bin bundle
 
@@ -47,5 +50,6 @@ help:
 	@echo "  make lint         Verify formatting, check, and test"
 	@echo "  make build        Run checks and tests"
 	@echo "  make release      Optimized release build"
+	@echo "  make build-windows  Cross-compile a Windows app with cargo-xwin"
 	@echo "  make bundle       Build the macOS .app bundle"
 	@echo "  make clean        Remove build artifacts and CEF cache"
