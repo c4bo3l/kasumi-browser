@@ -83,6 +83,16 @@ cargo build --release
 
 On Windows use `scripts\dev.bat`.
 
+### Windows cross-build from macOS
+
+Requires `cargo-xwin` and LLVM tools (`clang-cl`, `lld-link`, `llvm-lib`) on `PATH`. Override the Makefile's `LLVM_BIN` if they live elsewhere.
+
+```bash
+make build-windows
+```
+
+This writes `target/x86_64-pc-windows-msvc/release/kasumi-browser.exe`.
+
 ### macOS app bundle
 
 ```bash

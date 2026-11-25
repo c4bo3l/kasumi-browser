@@ -30,7 +30,9 @@ use ui::chrome::{
 };
 use ui::platform_view::ContentRect;
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceId, ElementState, KeyEvent, WindowEvent};
+#[cfg(target_os = "macos")]
+use winit::event::DeviceId;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId, WindowLevel};

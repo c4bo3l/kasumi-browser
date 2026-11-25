@@ -15,7 +15,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 - Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.9.0` to `0.10.0`.
 - Condensed `README.md` into a concise overview while keeping build, signing, verification, roadmap, and filter-list instructions.
-- Added `make build-windows`, which cross-compiles with `cargo tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc`.
+- Added `make build-windows`, which cross-compiles with `cargo xwin build --release --target x86_64-pc-windows-msvc`, using a Windows-specific CEF path and local LLVM tools.
 
 ### Fixed
 
