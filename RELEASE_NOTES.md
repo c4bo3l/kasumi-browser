@@ -4,7 +4,39 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
-## v0.8.1 — Unreleased
+## v0.9.0 — Unreleased
+
+### Added
+
+- Native Incognito mode, opened with `Cmd/Ctrl+Shift+N`, the macOS **Kasumi Browser → New Incognito Window** menu item, the rail incognito buttons, or the command palette. It uses one reserved private workspace and a lazily created CEF `RequestContext` with an empty cache path and no session-cookie persistence.
+- Private tabs show a clear incognito icon and tooltip, and command-palette bookmarks and rail move actions are unavailable while incognito is active. Closing the last private tab removes the private workspace and drops the CEF request context, returning to the normal space that was active beforehand.
+
+### Changed
+
+- Reduced both bottom page HUD strips from 32 DIPs to 24 DIPs, with 18×18 icon buttons, a 2 DIP icon inset, 2 DIP vertical margin, and 9 pt numeric labels.
+- Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.8.1` to `0.9.0`.
+
+### Fixed
+
+- Long rail and page-HUD tooltip labels now wrap inside a text-sized card that grows vertically. The card width follows the longest laid-out row up to a bounded maximum, so incognito, workspace, and URL tooltips stay readable instead of running outside the translucent overlay.
+
+### Privacy
+
+- Private navigations and titles never emit `history` writes, and private tabs/workspaces are filtered from session and workspace snapshots.
+- Private bookmarks and downloads never reach SQLite. Private download IDs stay in memory so late CEF callbacks cannot leak rows after the source tab closes, and retrying a private CEF download reopens its URL inside incognito.
+- Middle-click links, foreground popups, duplicates, reopened tabs, and view-source navigations inherit the source workspace, so a private page cannot escape into a persisted browser context.
+- Session restore defensively ignores private rows from a stale or corrupt database instead of folding them into a normal workspace.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bin kasumi-browser` — 188 tests
+- `cargo build --release`
+
+---
+
+## v0.8.1 — 2026-11-25
 
 ### Added
 

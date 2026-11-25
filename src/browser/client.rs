@@ -129,6 +129,7 @@ wrap_life_span_handler! {
 
                 let background = new_tab_disposition(target_disposition).unwrap_or(false);
                 let _ = self.event_sender.send(BrowserEvent::OpenUrlFromTab {
+                    tab_id: self.tab_id,
                     url: url_str,
                     background,
                 });
@@ -240,6 +241,7 @@ const VK_C: i32 = 0x43;
 const VK_J: i32 = 0x4A;
 const VK_K: i32 = 0x4B;
 const VK_L: i32 = 0x4C;
+const VK_N: i32 = 0x4E;
 const VK_T: i32 = 0x54;
 const VK_W: i32 = 0x57;
 const VK_Z: i32 = 0x5A;
@@ -298,6 +300,7 @@ pub(crate) fn browser_shortcut(
 
     match key_code {
         VK_T if shift => Some(BrowserShortcut::ReopenClosedTab),
+        VK_N if shift => Some(BrowserShortcut::NewPrivateWindow),
         VK_T => Some(BrowserShortcut::NewTab),
         VK_W if !shift => Some(BrowserShortcut::CloseTab),
         VK_L | VK_K if !shift => Some(BrowserShortcut::OpenCommandPalette),
@@ -341,6 +344,13 @@ fn browser_shortcut_from_char(
                 Some(BrowserShortcut::ReopenClosedTab)
             } else {
                 Some(BrowserShortcut::NewTab)
+            }
+        }
+        c if c == 'N' as u16 || c == 'n' as u16 => {
+            if shift {
+                Some(BrowserShortcut::NewPrivateWindow)
+            } else {
+                None
             }
         }
         c if c == 'W' as u16 || c == 'w' as u16 => Some(BrowserShortcut::CloseTab),
@@ -791,6 +801,11 @@ mod tests {
             Some(BrowserShortcut::ReopenClosedTab)
         );
         assert_eq!(
+            browser_shortcut(true, 0x4E, 128 | 2),
+            Some(BrowserShortcut::NewPrivateWindow)
+        );
+        assert_eq!(browser_shortcut(true, 0x4E, 128), None);
+        assert_eq!(
             browser_shortcut(true, 0x5A, 128),
             Some(BrowserShortcut::ReopenClosedTab)
         );
@@ -848,6 +863,11 @@ mod tests {
             browser_shortcut_from_char(true, 'T' as u16, 128 | 2),
             Some(BrowserShortcut::ReopenClosedTab)
         );
+        assert_eq!(
+            browser_shortcut_from_char(true, 'N' as u16, 128 | 2),
+            Some(BrowserShortcut::NewPrivateWindow)
+        );
+        assert_eq!(browser_shortcut_from_char(true, 'n' as u16, 128), None);
         assert_eq!(
             browser_shortcut_from_char(true, 't' as u16, 128),
             Some(BrowserShortcut::NewTab)

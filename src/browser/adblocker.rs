@@ -171,6 +171,7 @@ wrap_request_handler! {
     pub struct TabRequestHandler {
         resource_request_handler: ResourceRequestHandler,
         event_sender: Sender<BrowserEvent>,
+        tab_id: u64,
     }
 
     impl RequestHandler {
@@ -197,6 +198,7 @@ wrap_request_handler! {
             // real Kasumi tab instead, preserving middle-click's background
             // behavior and Ctrl+click's foreground behavior.
             let _ = self.event_sender.send(BrowserEvent::OpenUrlFromTab {
+                tab_id: self.tab_id,
                 url,
                 background,
             });
@@ -225,7 +227,7 @@ pub fn create_tab_request_handler(
     enabled: Arc<AtomicBool>,
 ) -> RequestHandler {
     let res_handler = TabResourceRequestHandler::new(tab_id, event_sender.clone(), engine, enabled);
-    TabRequestHandler::new(res_handler.into(), event_sender)
+    TabRequestHandler::new(res_handler.into(), event_sender, tab_id)
 }
 
 #[cfg(test)]

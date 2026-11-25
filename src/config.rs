@@ -23,7 +23,7 @@ pub const COMMAND_PALETTE_WIDTH: f32 = 560.0;
 pub const COMMAND_PALETTE_TOP_OFFSET: f32 = 72.0;
 
 /// Height of the transparent native HUD strips painted above the CEF page.
-pub const PAGE_HUD_HEIGHT: f32 = 36.0;
+pub const PAGE_HUD_HEIGHT: f32 = 24.0;
 
 /// Gap between the CEF content edge and a bottom page HUD strip.
 pub const PAGE_HUD_MARGIN: f32 = 10.0;
@@ -266,6 +266,12 @@ impl Workspace {
     pub const DEFAULT_NAME: &'static str = "Personal";
     pub const MAX_NAME_LEN: usize = 32;
 
+    /// Reserved id for the ephemeral incognito workspace. It is deliberately
+    /// outside the range used by persisted workspaces and is never written to
+    /// SQLite.
+    pub const PRIVATE_ID: u64 = u64::MAX;
+    pub const PRIVATE_NAME: &'static str = "Incognito";
+
     pub fn default_workspace() -> Self {
         Self {
             id: Self::DEFAULT_ID,
@@ -275,6 +281,24 @@ impl Workspace {
             is_default: true,
             is_active: true,
         }
+    }
+
+    /// Ephemeral workspace used by incognito tabs. It shares the native rail
+    /// with regular workspaces but never participates in session persistence.
+    pub fn private_workspace() -> Self {
+        Self {
+            id: Self::PRIVATE_ID,
+            name: Self::PRIVATE_NAME.to_string(),
+            icon: WorkspaceIcon::Public,
+            color: WorkspaceColor::Slate,
+            is_default: false,
+            is_active: false,
+        }
+    }
+
+    /// True for the reserved incognito workspace id.
+    pub fn is_private_id(id: u64) -> bool {
+        id == Self::PRIVATE_ID
     }
 
     /// Trim and clamp names coming from the UI or persisted storage.
