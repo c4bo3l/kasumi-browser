@@ -22,7 +22,7 @@ Current version: **0.10.0**. Version bumps land in release PRs and become offici
 - Collapsible vertical workspace rail (208 px expanded / 44 px icon rail), pinned tabs, tab context menu, and per-workspace tab state.
 - Floating `Cmd/Ctrl+K` command palette for tab search, URL/search resolution, and native actions.
 - Native Workspaces, Incognito mode, Settings, downloads bubble, bookmark manager, tab menu, tooltips, and system notifications.
-- Native WebRTC media-access prompts for camera, microphone, and desktop audio/video capture, with remembered decisions for normal spaces. `getDisplayMedia` opens Kasumi's own display/window picker and passes the selected source to Chromium.
+- Native WebRTC media-access prompts for camera, microphone, and desktop audio/video capture, with remembered decisions for normal spaces. `getDisplayMedia` opens Kasumi's own display/window picker, with Material Symbols source icons, and passes the selected source to Chromium.
 - 24 DIP bottom HUDs for Command/DevTools and blocked-request/RAM status.
 - SQLite-backed history, bookmarks, downloads, pinned tabs, workspaces, preferences, and low-RAM session restore.
 - Chromium DevTools in a separate window; `F12`, rail button, tab menu, and command palette all open it.

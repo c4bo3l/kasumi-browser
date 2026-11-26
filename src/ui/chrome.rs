@@ -531,6 +531,8 @@ enum RailIcon {
     Chip,
     Private,
     Globe,
+    DisplayScreen,
+    DisplayWindow,
     Close,
     Pin,
     PinOff,
@@ -2779,10 +2781,19 @@ impl ChromeRenderer {
                             .max_height(max_height - 132.0)
                             .show(ui, |ui| {
                                 for (index, source) in picker.sources.iter().enumerate() {
-                                    let icon = if source.is_window { "🪟" } else { "🖥" };
+                                    let icon = if source.is_window {
+                                        RailIcon::DisplayWindow
+                                    } else {
+                                        RailIcon::DisplayScreen
+                                    };
                                     let response = ui.selectable_label(
                                         index == selected,
-                                        format!("{icon}  {}", source.label),
+                                        RichText::new(format!(
+                                            "{}  {}",
+                                            rail_icon_glyph(icon),
+                                            source.label
+                                        ))
+                                        .size(11.0),
                                     );
                                     if response.clicked() {
                                         state.display_media_selection = index;
@@ -5906,11 +5917,12 @@ impl PageHudRenderer {
 fn rail_icon_glyph(icon: RailIcon) -> &'static str {
     use egui_material_icons::icons::{
         ICON_ADD, ICON_BEDTIME, ICON_BOOK, ICON_BOOKMARK_ADD, ICON_CHECK, ICON_CHEVRON_LEFT,
-        ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_CODE, ICON_CONTENT_COPY, ICON_DELETE, ICON_DOWNLOAD,
-        ICON_EDIT, ICON_FOLDER_OPEN, ICON_MEMORY, ICON_MUSIC_NOTE, ICON_OPEN_IN_NEW, ICON_PALETTE,
-        ICON_PAUSE, ICON_PIN, ICON_PLAY_ARROW, ICON_PUBLIC, ICON_PUSH_PIN, ICON_REFRESH,
-        ICON_ROCKET, ICON_SCHOOL, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD, ICON_STAR,
-        ICON_VIEW_SIDEBAR, ICON_VISIBILITY_OFF, ICON_WORK,
+        ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_CODE, ICON_CONTENT_COPY, ICON_DELETE,
+        ICON_DESKTOP_WINDOWS, ICON_DOWNLOAD, ICON_EDIT, ICON_FOLDER_OPEN, ICON_MEMORY,
+        ICON_MUSIC_NOTE, ICON_NEW_WINDOW, ICON_OPEN_IN_NEW, ICON_PALETTE, ICON_PAUSE, ICON_PIN,
+        ICON_PLAY_ARROW, ICON_PUBLIC, ICON_PUSH_PIN, ICON_REFRESH, ICON_ROCKET, ICON_SCHOOL,
+        ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD, ICON_STAR, ICON_VIEW_SIDEBAR, ICON_VISIBILITY_OFF,
+        ICON_WORK,
     };
 
     match icon {
@@ -5924,6 +5936,8 @@ fn rail_icon_glyph(icon: RailIcon) -> &'static str {
         RailIcon::Chip => ICON_MEMORY.into(),
         RailIcon::Private => ICON_VISIBILITY_OFF.into(),
         RailIcon::Globe => ICON_PUBLIC.into(),
+        RailIcon::DisplayScreen => ICON_DESKTOP_WINDOWS.into(),
+        RailIcon::DisplayWindow => ICON_NEW_WINDOW.into(),
         RailIcon::Close => ICON_CLOSE.into(),
         RailIcon::Pin => ICON_PUSH_PIN.into(),
         RailIcon::PinOff => ICON_PIN.into(),

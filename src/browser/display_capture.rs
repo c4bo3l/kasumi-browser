@@ -27,10 +27,26 @@ pub const RENDERER_SHIM: &str = r#"
   const originalGetDisplayMedia =
     (proto && proto.getDisplayMedia) || (mediaDevices && mediaDevices.getDisplayMedia);
   const originalGetUserMedia = mediaDevices && mediaDevices.getUserMedia;
+  // Chromium's capture service can reject video when audio is already
+  // starting. Meet requests microphone and camera as two concurrent
+  // getUserMedia calls, so serialize them: the camera starts first and the
+  // microphone joins immediately after.
+  let getUserMediaChain = Promise.resolve();
+  const serializedGetUserMedia = typeof originalGetUserMedia === 'function'
+    ? (constraints) => {
+        const run = getUserMediaChain.then(() =>
+          originalGetUserMedia.call(mediaDevices, constraints)
+        );
+        getUserMediaChain = run.catch(() => {});
+        return run;
+      }
+    : null;
+  if (serializedGetUserMedia) {
+    if (mediaDevices) mediaDevices.getUserMedia = serializedGetUserMedia;
+    if (proto) proto.getUserMedia = serializedGetUserMedia;
+  }
   if (typeof originalGetDisplayMedia === 'function') {
-    const callOriginalGetUserMedia = typeof originalGetUserMedia === 'function'
-      ? originalGetUserMedia.bind(mediaDevices)
-      : null;
+    const callOriginalGetUserMedia = serializedGetUserMedia;
     window.__kasumiResolveDisplayMedia = (token, deviceId) => {
       const key = String(token);
       const entry = pendingDisplays.get(key);
@@ -421,5 +437,11 @@ mod tests {
     #[test]
     fn renderer_shim_retries_display_capture_without_system_audio() {
         assert!(RENDERER_SHIM.contains("capture(true).catch(() => capture(false))"));
+    }
+
+    #[test]
+    fn renderer_shim_serializes_audio_and_video_requests() {
+        assert!(RENDERER_SHIM.contains("getUserMediaChain"));
+        assert!(RENDERER_SHIM.contains("mediaDevices.getUserMedia = serializedGetUserMedia"));
     }
 }

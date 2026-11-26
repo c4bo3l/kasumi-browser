@@ -344,7 +344,15 @@ struct PendingMediaPermission {
     private: bool,
     callback: MediaPermissionCallback,
     prompt_id: Option<u64>,
+    /// A remembered audio grant waits briefly so a simultaneous video request
+    /// can start first. Chromium's capture service rejects video when audio is
+    /// already starting, but accepts audio immediately after video.
+    auto_resolve: Option<(Instant, bool)>,
 }
+
+/// Let a camera request overtake a remembered microphone grant from the same
+/// page load. Meet requests audio a few milliseconds before video.
+const AUDIO_AUTO_RESOLVE_DELAY: Duration = Duration::from_millis(150);
 
 impl std::fmt::Debug for PendingMediaPermission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -354,6 +362,7 @@ impl std::fmt::Debug for PendingMediaPermission {
             .field("permissions", &self.permissions)
             .field("private", &self.private)
             .field("prompt_id", &self.prompt_id)
+            .field("auto_resolve", &self.auto_resolve)
             .finish_non_exhaustive()
     }
 }
@@ -960,7 +969,32 @@ impl TabManager {
     }
 
     fn active_media_permission_request_id(&self) -> Option<u64> {
-        self.pending_media_permission_queue.front().copied()
+        self.pending_media_permission_queue
+            .iter()
+            .find(|id| {
+                self.pending_media_permissions
+                    .get(id)
+                    .is_some_and(|pending| pending.auto_resolve.is_none())
+            })
+            .copied()
+    }
+
+    /// Resolve remembered audio grants whose short delay expired. Called after
+    /// each event drain so a video request can start first.
+    fn resolve_ready_auto_media_permissions(&mut self) {
+        let now = Instant::now();
+        let ready: Vec<(u64, bool)> = self
+            .pending_media_permissions
+            .iter()
+            .filter_map(|(id, pending)| {
+                pending
+                    .auto_resolve
+                    .and_then(|(at, allowed)| (at <= now).then_some((*id, allowed)))
+            })
+            .collect();
+        for (request_id, allowed) in ready {
+            self.resolve_media_permission(request_id, allowed, false);
+        }
     }
 
     /// Pending requests from the same tab, origin, and permission mask belong
@@ -3104,6 +3138,7 @@ impl TabManager {
         while let Ok(event) = self.event_receiver.try_recv() {
             self.handle_browser_event(event);
         }
+        self.resolve_ready_auto_media_permissions();
     }
 
     /// Consume a Cmd/Ctrl+K request forwarded from the CEF web view.
@@ -3233,6 +3268,12 @@ impl TabManager {
                         );
                     }
                 }
+                // Meet requests audio a few milliseconds before video. Let a
+                // remembered video grant win that race so Chromium starts the
+                // camera first; audio can then start alongside the live camera.
+                let auto_resolve = (auto_decision == Some(true)
+                    && permissions == MediaAccessPermissions::AUDIO)
+                    .then(|| (Instant::now() + AUDIO_AUTO_RESOLVE_DELAY, true));
                 self.pending_media_permissions.insert(
                     request_id,
                     PendingMediaPermission {
@@ -3242,14 +3283,17 @@ impl TabManager {
                         private,
                         callback,
                         prompt_id,
+                        auto_resolve,
                     },
                 );
                 self.pending_media_permission_queue.push_back(request_id);
                 if let Some(allowed) = auto_decision {
-                    // Resolve the whole group: CEF may have delivered the
-                    // content-setting prompt and media-access callback as two
-                    // events for the same getUserMedia call.
-                    self.resolve_media_permission(request_id, allowed, false);
+                    if auto_resolve.is_none() {
+                        // Resolve the whole group: CEF may have delivered the
+                        // content-setting prompt and media-access callback as
+                        // two events for the same getUserMedia call.
+                        self.resolve_media_permission(request_id, allowed, false);
+                    }
                 }
             }
             BrowserEvent::PermissionPromptDismissed { tab_id, prompt_id } => {
@@ -4221,6 +4265,7 @@ mod tests {
                 private: false,
                 callback: MediaPermissionCallback::Test(callback.clone()),
                 prompt_id,
+                auto_resolve: None,
             },
         );
         manager.pending_media_permission_queue.push_back(request_id);
@@ -4348,6 +4393,32 @@ mod tests {
             manager.pending_media_permission_queue,
             VecDeque::from(vec![18])
         );
+    }
+
+    #[test]
+    fn remembered_audio_waits_for_a_video_request_before_resolving() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        let audio =
+            add_pending_permission_with(&mut manager, 19, 1, MediaAccessPermissions::AUDIO, None);
+        manager
+            .pending_media_permissions
+            .get_mut(&19)
+            .expect("audio request")
+            .auto_resolve = Some((Instant::now() + Duration::from_secs(60), true));
+
+        manager.resolve_ready_auto_media_permissions();
+        assert_eq!(audio.calls(), 0);
+        assert_eq!(manager.active_media_permission_request_id(), None);
+
+        manager
+            .pending_media_permissions
+            .get_mut(&19)
+            .expect("audio request")
+            .auto_resolve = Some((Instant::now() - Duration::from_millis(1), true));
+        manager.resolve_ready_auto_media_permissions();
+        assert_eq!(audio.granted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(manager.pending_media_permissions.is_empty());
     }
 
     #[test]
