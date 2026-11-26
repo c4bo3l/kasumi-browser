@@ -5,6 +5,7 @@ edition = "2021"
 
 [package.metadata.cef.bundle]
 helper_name = "kasumi-browser"
+resources_path = "assets/icons"
 
 [dependencies]
 # CEF safe bindings (v156.x; auto-fetches matching CEF binary if CEF_PATH is unset)

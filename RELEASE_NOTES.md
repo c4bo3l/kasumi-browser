@@ -10,6 +10,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 - Native WebRTC media-access prompts bridge CEF camera, microphone, and desktop audio/video capture requests into the egui chrome. Allow/Deny decisions resolve each CEF callback exactly once on the main UI thread.
 - Normal-space permission decisions are remembered in SQLite WAL by origin. Incognito requests never reach SQLite; their decisions stay in memory until the private workspace closes.
+- Added the native Kasumi app icon set. The macOS bundle uses `assets/icons/mac/kasumi-browser.icns`, the Windows executable embeds `assets/icons/windows/kasumi-browser.ico`, and Linux-ready PNG/SVG assets are included.
 
 ### Changed
 

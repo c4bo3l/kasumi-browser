@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024" fill="none">
+  <defs>
+    
+    <linearGradient id="bgOuter" x1="160" y1="80" x2="864" y2="944" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#282D4B" />
+      <stop offset="55%" stop-color="#1E223A" />
+      <stop offset="100%" stop-color="#15182B" />
+    </linearGradient>
+    <radialGradient id="bgInner" cx="512" cy="460" r="460" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#222642" />
+      <stop offset="70%" stop-color="#181B30" />
+      <stop offset="100%" stop-color="#121424" />
+    </radialGradient>
+    <linearGradient id="rimHighlight" x1="512" y1="64" x2="512" y2="960" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7B88C9" stop-opacity="0.32" />
+      <stop offset="35%" stop-color="#7B88C9" stop-opacity="0.06" />
+      <stop offset="100%" stop-color="#0A0B14" stop-opacity="0.45" />
+    </linearGradient>
+
+    
+    <radialGradient id="nexusGlow" cx="496" cy="516" r="165" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#8F6BFF" stop-opacity="0.52" />
+      <stop offset="48%" stop-color="#6F54E8" stop-opacity="0.22" />
+      <stop offset="100%" stop-color="#6F54E8" stop-opacity="0" />
+    </radialGradient>
+
+    
+    <linearGradient id="leftStemGrad" x1="320" y1="250" x2="360" y2="774" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#D4F6FC" />
+      <stop offset="42%" stop-color="#9CD7E3" />
+      <stop offset="78%" stop-color="#B9E9F2" />
+      <stop offset="100%" stop-color="#88C6D4" />
+    </linearGradient>
+
+    
+    <linearGradient id="lowerLegGrad" x1="468" y1="528" x2="732" y2="770" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#B89CFF" />
+      <stop offset="34%" stop-color="#D9F1FA" />
+      <stop offset="72%" stop-color="#B7E9F3" />
+      <stop offset="100%" stop-color="#87C6D4" />
+    </linearGradient>
+
+    
+    <linearGradient id="diagRibbonGrad" x1="715" y1="255" x2="290" y2="768" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#E8FAFD" />
+      <stop offset="28%" stop-color="#9EDAE6" />
+      <stop offset="52%" stop-color="#F5FCFE" />
+      <stop offset="64%" stop-color="#C8B4FF" />
+      <stop offset="82%" stop-color="#DDF6FA" />
+      <stop offset="100%" stop-color="#96D2DF" />
+    </linearGradient>
+
+    
+    <linearGradient id="ribbonSheen" x1="650" y1="300" x2="350" y2="680" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.55" />
+      <stop offset="50%" stop-color="#FFFFFF" stop-opacity="0.12" />
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.40" />
+    </linearGradient>
+
+    
+    <linearGradient id="shieldLeftGrad" x1="464" y1="634" x2="512" y2="776" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#D5F6FC" />
+      <stop offset="100%" stop-color="#8AC7D4" />
+    </linearGradient>
+    <linearGradient id="shieldRightGrad" x1="512" y1="634" x2="560" y2="776" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#7695B2" />
+      <stop offset="100%" stop-color="#4A5E7A" />
+    </linearGradient>
+  </defs>
+
+  
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#bgOuter)" />
+  <rect x="65" y="65" width="894" height="894" rx="207" stroke="url(#rimHighlight)" stroke-width="2" />
+
+  
+  <rect x="116" y="116" width="792" height="792" rx="164" fill="url(#bgInner)" />
+  <rect x="117" y="117" width="790" height="790" rx="163" stroke="#0C0E1A" stroke-opacity="0.55" stroke-width="2" />
+
+  
+  <circle cx="496" cy="516" r="165" fill="url(#nexusGlow)" />
+
+  
+  <g id="kasumi-mark">
+    
+    <path d="M318 250 C385 246, 432 286, 432 376 C432 475, 412 575, 392 668 C376 735, 332 774, 274 774 C312 740, 326 686, 338 608 C354 495, 376 330, 318 250 Z" fill="url(#leftStemGrad)" />
+
+    
+    <path d="M486 524 C536 504, 596 532, 632 606 C666 676, 688 742, 748 774 C676 774, 628 738, 586 666 C548 602, 506 574, 452 566 C464 548, 475 534, 486 524 Z" fill="url(#lowerLegGrad)" />
+
+    
+    <path d="M726 250 C642 248, 602 294, 566 366 C522 452, 456 488, 382 526 C326 555, 314 622, 308 696 C304 744, 290 764, 274 774 C346 774, 394 738, 416 662 C436 595, 484 572, 558 534 C626 498, 658 434, 684 344 C698 294, 710 266, 726 250 Z" fill="url(#diagRibbonGrad)" />
+    <path d="M726 250 C642 248, 602 294, 566 366 C522 452, 456 488, 382 526 C326 555, 314 622, 308 696 C304 744, 290 764, 274 774 C346 774, 394 738, 416 662 C436 595, 484 572, 558 534 C626 498, 658 434, 684 344 C698 294, 710 266, 726 250 Z" fill="url(#ribbonSheen)" />
+
+    
+    <g id="privacy-shield">
+      <path d="M512 634 L464 652 L464 712 C464 744 484 763 512 776 Z" fill="url(#shieldLeftGrad)" />
+      <path d="M512 634 L560 652 L560 712 C560 744 540 763 512 776 Z" fill="url(#shieldRightGrad)" />
+    </g>
+  </g>
+</svg>

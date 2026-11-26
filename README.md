@@ -93,6 +93,8 @@ make build-windows
 
 This writes `target/x86_64-pc-windows-msvc/release/kasumi-browser.exe`.
 
+App artwork lives in `assets/icons/source/`; platform-ready outputs are in `assets/icons/mac/`, `assets/icons/windows/`, and `assets/icons/linux/`.
+
 ### macOS app bundle
 
 ```bash
@@ -105,7 +107,7 @@ bundle-cef-app \
 open target/release/KasumiBrowser.app
 ```
 
-`cargo run --release --bin bundle` is the in-repo alternative; it writes `target/bundle/KasumiBrowser.app`.
+`cargo run --release --bin bundle` is the in-repo alternative; it writes `target/bundle/kasumi-browser.app` and includes the app icon from `assets/icons/mac/kasumi-browser.icns`.
 
 ---
 
@@ -117,7 +119,7 @@ Sign after building and bundling. Never commit certificates or credentials.
 
 ```bash
 IDENTITY="Developer ID Application: Your Name (TEAMID)"
-APP="target/bundle/KasumiBrowser.app"
+APP="target/bundle/kasumi-browser.app"
 find "$APP" -type f -perm +111 -print0 | while IFS= read -r -d '' file; do
   case "$file" in
     *.framework/*|*Helper*|*.app/Contents/MacOS/*)

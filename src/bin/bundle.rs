@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let output_dir = PathBuf::from("target/bundle");
         std::fs::create_dir_all(&output_dir)?;
 
+        let resources_path = Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icons"));
         let version = semver::Version::new(0, 10, 0);
         let bundle_info = BundleInfo::new(
             "KasumiBrowser",
@@ -17,13 +18,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             version,
         );
 
-        println!("Bundling KasumiBrowser.app for macOS...");
+        println!("Bundling kasumi-browser.app for macOS...");
         let bundle_path = bundle(
             &output_dir,
             &target_dir,
             "kasumi-browser",
             "kasumi-browser",
-            None,
+            resources_path,
             bundle_info,
         )?;
 
