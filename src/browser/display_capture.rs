@@ -74,13 +74,20 @@ pub const RENDERER_SHIM: &str = r#"
 
       const audioRequested = constraints.audio === true ||
         (constraints.audio && typeof constraints.audio === 'object');
-      const gumConstraints = {
-        audio: audioRequested
+      const capture = (withAudio) => callOriginalGetUserMedia({
+        audio: withAudio
           ? { mandatory: { chromeMediaSource: 'desktop' } }
           : false,
         video: { mandatory }
-      };
-      entry.resolve(callOriginalGetUserMedia(gumConstraints));
+      });
+      // macOS can deny system-audio capture while still allowing the screen
+      // video. Retrying video-only keeps presentation working instead of
+      // failing the whole getDisplayMedia promise when a site asks for audio.
+      entry.resolve(
+        audioRequested
+          ? capture(true).catch(() => capture(false))
+          : capture(false)
+      );
     };
     const requestDisplaySource = (constraints) => {
       const token = 'kdm-' + Date.now() + '-' + Math.random().toString(36).slice(2);
@@ -409,5 +416,10 @@ mod tests {
         assert!(RENDERER_SHIM.contains("chromeMediaSourceId: String(deviceId)"));
         assert!(!RENDERER_SHIM.contains("deviceId: { ideal"));
         assert!(RENDERER_SHIM.contains("__KASUMI_DISPLAY_MEDIA_REQUEST__"));
+    }
+
+    #[test]
+    fn renderer_shim_retries_display_capture_without_system_audio() {
+        assert!(RENDERER_SHIM.contains("capture(true).catch(() => capture(false))"));
     }
 }
