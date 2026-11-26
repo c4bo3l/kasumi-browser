@@ -34,12 +34,12 @@ use crate::config::{
 use crate::events::{
     normalize_permission_origin, BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo,
     DownloadNotification, DownloadNotificationKind, DownloadState, MediaAccessPermissions,
-    MediaPermissionCallback, ParallelDownloadEvent, UiAction,
+    MediaPermissionCallback, ParallelDownloadEvent, UiAction, WebNotification,
 };
 use crate::storage::db::{BookmarkItem, SessionTabSnapshot, SitePermission, StorageHandle};
 use crate::ui::chrome::{
-    BookmarkInfo, ChromeState, DisplayMediaPicker, Favicon, PermissionPrompt, TabDisplayState,
-    TabInfo, WorkspaceInfo,
+    BookmarkInfo, ChromeState, DisplayMediaPicker, Favicon, PermissionPrompt, PermissionPromptKind,
+    TabDisplayState, TabInfo, WorkspaceInfo,
 };
 use crate::ui::platform_view::{self, ContentRect};
 
@@ -367,6 +367,16 @@ impl std::fmt::Debug for PendingMediaPermission {
     }
 }
 
+/// One unresolved native Notification API permission prompt. The renderer token
+/// identifies the page promise that must be resolved after the user decides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingNotificationPermission {
+    tab_id: u64,
+    origin: String,
+    token: String,
+    private: bool,
+}
+
 /// A native display picker awaiting a user choice. The renderer's pending
 /// Promise is resolved by executing JavaScript back in the originating tab.
 #[derive(Debug, Clone)]
@@ -416,8 +426,30 @@ fn remembered_permission_decision(
     decision
 }
 
-/// Record an explicit Allow/Deny decision. Private decisions only touch the
-/// in-memory incognito map; `storage` is deliberately not called for them.
+/// Record one explicit site-permission decision. Private decisions only touch
+/// the in-memory incognito map; `storage` is deliberately not called for them.
+fn record_site_permission_decision(
+    saved: &mut BTreeMap<(String, String), bool>,
+    private_saved: &mut BTreeMap<(String, String), bool>,
+    storage: Option<&StorageHandle>,
+    origin: &str,
+    kind: &str,
+    is_private: bool,
+    granted: bool,
+) {
+    if kind.is_empty() || origin.is_empty() {
+        return;
+    }
+    let target = if is_private { private_saved } else { saved };
+    target.insert((origin.to_string(), kind.to_string()), granted);
+    if !is_private {
+        if let Some(storage) = storage {
+            storage.save_site_permission(origin.to_string(), kind.to_string(), granted);
+        }
+    }
+}
+
+/// Record an explicit Allow/Deny decision for every recognized media bit.
 fn record_media_permission(
     saved: &mut BTreeMap<(String, String), bool>,
     private_saved: &mut BTreeMap<(String, String), bool>,
@@ -431,14 +463,16 @@ fn record_media_permission(
     if kinds.is_empty() || origin.is_empty() {
         return;
     }
-    let target = if is_private { private_saved } else { saved };
     for kind in kinds {
-        target.insert((origin.to_string(), kind.to_string()), granted);
-        if !is_private {
-            if let Some(storage) = storage {
-                storage.save_site_permission(origin.to_string(), kind.to_string(), granted);
-            }
-        }
+        record_site_permission_decision(
+            saved,
+            private_saved,
+            storage,
+            origin,
+            kind,
+            is_private,
+            granted,
+        );
     }
 }
 
@@ -563,8 +597,14 @@ pub struct TabManager {
     // on the main UI thread; CEF handlers send plain events over crossbeam.
     pending_media_permissions: HashMap<u64, PendingMediaPermission>,
     pending_media_permission_queue: VecDeque<u64>,
+    pending_notification_permissions: HashMap<u64, PendingNotificationPermission>,
+    pending_notification_permission_queue: VecDeque<u64>,
     pending_display_media_pickers: HashMap<String, PendingDisplayMediaPicker>,
     pending_display_media_queue: VecDeque<String>,
+    /// Native web notifications waiting for the shell to surface them.
+    web_notifications: VecDeque<WebNotification>,
+    /// Notification ids a page closed before the shell could dismiss them.
+    closed_web_notifications: Vec<String>,
     saved_site_permissions: BTreeMap<(String, String), bool>,
     private_site_permissions: BTreeMap<(String, String), bool>,
 
@@ -710,8 +750,12 @@ impl TabManager {
             private_download_ids: HashSet::new(),
             pending_media_permissions: HashMap::new(),
             pending_media_permission_queue: VecDeque::new(),
+            pending_notification_permissions: HashMap::new(),
+            pending_notification_permission_queue: VecDeque::new(),
             pending_display_media_pickers: HashMap::new(),
             pending_display_media_queue: VecDeque::new(),
+            web_notifications: VecDeque::new(),
+            closed_web_notifications: Vec::new(),
             saved_site_permissions: BTreeMap::new(),
             private_site_permissions: BTreeMap::new(),
             pending_browser_closes: 0,
@@ -761,22 +805,27 @@ impl TabManager {
         self.saved_site_permissions.clear();
         let mut content_masks: BTreeMap<String, (u32, u32)> = BTreeMap::new();
         for permission in permissions {
-            let bit = MediaAccessPermissions::bits_for_kind(&permission.permission);
-            if bit == 0 {
-                continue;
-            }
             let origin = normalize_permission_origin(&permission.origin);
             if origin.is_empty() {
                 continue;
             }
-            // Web apps such as Google Meet inspect Chromium's own
-            // content-setting state before requesting media. Restored decisions
-            // must be visible there too, not only in Kasumi's callback cache.
-            let entry = content_masks.entry(origin.clone()).or_insert((0, 0));
-            if permission.allowed {
-                entry.0 |= bit;
-            } else {
-                entry.1 |= bit;
+            // Notification decisions live in the same table but do not map to a
+            // CEF media bit, so they skip the Chromium content-setting sync.
+            if permission.permission != "notifications" {
+                let bit = MediaAccessPermissions::bits_for_kind(&permission.permission);
+                if bit == 0 {
+                    continue;
+                }
+                // Web apps such as Google Meet inspect Chromium's own
+                // content-setting state before requesting media. Restored
+                // decisions must be visible there too, not only in Kasumi's
+                // callback cache.
+                let entry = content_masks.entry(origin.clone()).or_insert((0, 0));
+                if permission.allowed {
+                    entry.0 |= bit;
+                } else {
+                    entry.1 |= bit;
+                }
             }
             self.saved_site_permissions
                 .insert((origin, permission.permission), permission.allowed);
@@ -1091,6 +1140,130 @@ impl TabManager {
         }
     }
 
+    fn active_notification_permission_request_id(&self) -> Option<u64> {
+        self.pending_notification_permission_queue
+            .iter()
+            .find(|id| self.pending_notification_permissions.contains_key(id))
+            .copied()
+    }
+
+    /// Resolve the renderer's `Notification.requestPermission()` promise. The
+    /// pending entry is removed first so navigation or a duplicate action can
+    /// never resolve the same request twice.
+    fn resolve_notification_permission(&mut self, request_id: u64, granted: bool, persist: bool) {
+        let Some(pending) = take_pending_permission(
+            &mut self.pending_notification_permissions,
+            &mut self.pending_notification_permission_queue,
+            request_id,
+        ) else {
+            tracing::warn!("Ignoring stale notification permission resolution {request_id}");
+            return;
+        };
+        if persist {
+            record_site_permission_decision(
+                &mut self.saved_site_permissions,
+                &mut self.private_site_permissions,
+                self.storage.as_ref(),
+                &pending.origin,
+                "notifications",
+                pending.private,
+                granted,
+            );
+        }
+        // A transient dismissal leaves the page in the askable "default" state;
+        // only an explicit Allow/Deny becomes a remembered permission.
+        let decision = if granted {
+            "granted"
+        } else if persist {
+            "denied"
+        } else {
+            "default"
+        };
+        self.evaluate_notification_permission(pending.tab_id, &pending.token, decision);
+    }
+
+    /// Execute a small script in the originating tab. A missing frame means the
+    /// page navigated or closed while the prompt was open; the renderer promise
+    /// died with the frame, so there is nothing left to resolve.
+    fn evaluate_notification_permission(&self, tab_id: u64, token: &str, decision: &str) {
+        let token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
+        let decision_json =
+            serde_json::to_string(decision).unwrap_or_else(|_| "\"denied\"".to_string());
+        let script = format!(
+            "window.__kasumiResolveNotificationPermission && window.__kasumiResolveNotificationPermission({token_json}, {decision_json});"
+        );
+        let resolved = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.browser.as_ref())
+            .and_then(|browser| browser.main_frame())
+            .map(|frame| {
+                frame.execute_java_script(Some(&CefString::from(script.as_str())), None, 0);
+            })
+            .is_some();
+        if !resolved {
+            tracing::warn!(
+                "Could not resolve notification permission for tab {tab_id}: no live frame"
+            );
+        }
+    }
+
+    /// Dispatch a click/close event into the page that owns the notification.
+    fn dispatch_web_notification_event(&self, tab_id: u64, notification_id: &str, event: &str) {
+        let id_json = serde_json::to_string(notification_id).unwrap_or_else(|_| "\"\"".to_string());
+        let event_json = serde_json::to_string(event).unwrap_or_else(|_| "\"close\"".to_string());
+        let script = format!(
+            "window.__kasumiNotificationEvent && window.__kasumiNotificationEvent({id_json}, {event_json});"
+        );
+        let dispatched = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.browser.as_ref())
+            .and_then(|browser| browser.main_frame())
+            .map(|frame| {
+                frame.execute_java_script(Some(&CefString::from(script.as_str())), None, 0);
+            })
+            .is_some();
+        if !dispatched {
+            tracing::debug!(
+                "Notification {notification_id} event {event} skipped: tab {tab_id} has no live frame"
+            );
+        }
+    }
+
+    fn discard_notification_permissions_for_tab(&mut self, tab_id: u64) {
+        let ids: Vec<u64> = self
+            .pending_notification_permissions
+            .iter()
+            .filter(|(_, pending)| pending.tab_id == tab_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let _ = take_pending_permission(
+                &mut self.pending_notification_permissions,
+                &mut self.pending_notification_permission_queue,
+                id,
+            );
+        }
+    }
+
+    fn discard_all_notification_permissions(&mut self) {
+        self.pending_notification_permissions.clear();
+        self.pending_notification_permission_queue.clear();
+    }
+
+    /// Drain notifications that arrived since the last UI frame. Closed ids are
+    /// also returned so a page-initiated `close()` can dismiss a visible toast.
+    pub fn consume_web_notifications(&mut self) -> Vec<WebNotification> {
+        self.web_notifications.drain(..).collect()
+    }
+
+    pub fn consume_closed_web_notifications(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.closed_web_notifications)
+    }
+
     /// Drop prompts whose browser is going away. Calling a CEF permission
     /// callback during navigation or teardown can run against a destroyed
     /// `PermissionRequestManager` and trap inside Chromium. Since the page is
@@ -1110,6 +1283,7 @@ impl TabManager {
                 id,
             );
         }
+        self.discard_notification_permissions_for_tab(tab_id);
         self.discard_display_media_for_tab(tab_id);
     }
 
@@ -1122,6 +1296,7 @@ impl TabManager {
                 id,
             );
         }
+        self.discard_all_notification_permissions();
         self.discard_all_display_media();
     }
 
@@ -3352,6 +3527,93 @@ impl TabManager {
                 );
                 self.pending_display_media_queue.push_back(token);
             }
+            BrowserEvent::NotificationPermissionRequested {
+                request_id,
+                tab_id,
+                origin,
+                token,
+            } => {
+                // A request from a tab that closed while the console message
+                // was in flight has no page left to answer.
+                let Some(private) = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| Self::is_private_workspace(tab.workspace_id))
+                else {
+                    return;
+                };
+                let origin = normalize_permission_origin(&origin);
+                if origin.is_empty() || origin == "null" || token.is_empty() {
+                    return;
+                }
+                let saved = if private {
+                    &self.private_site_permissions
+                } else {
+                    &self.saved_site_permissions
+                };
+                let decision = saved
+                    .get(&(origin.clone(), "notifications".to_string()))
+                    .copied();
+                if let Some(allowed) = decision {
+                    let text = if allowed { "granted" } else { "denied" };
+                    self.evaluate_notification_permission(tab_id, &token, text);
+                    return;
+                }
+                self.pending_notification_permissions.insert(
+                    request_id,
+                    PendingNotificationPermission {
+                        tab_id,
+                        origin,
+                        token,
+                        private,
+                    },
+                );
+                self.pending_notification_permission_queue
+                    .push_back(request_id);
+            }
+            BrowserEvent::WebNotificationShown(mut notification) => {
+                let Some(private) = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == notification.tab_id)
+                    .map(|tab| Self::is_private_workspace(tab.workspace_id))
+                else {
+                    return;
+                };
+                let origin = normalize_permission_origin(&notification.origin);
+                let saved = if private {
+                    &self.private_site_permissions
+                } else {
+                    &self.saved_site_permissions
+                };
+                if origin.is_empty()
+                    || origin == "null"
+                    || saved.get(&(origin.clone(), "notifications".to_string())) != Some(&true)
+                {
+                    tracing::warn!(
+                        "Dropping notification for tab {}: origin has no notification grant",
+                        notification.tab_id
+                    );
+                    return;
+                }
+                notification.origin = origin;
+                // A tag replaces the previous notification from the same tab,
+                // matching the Web Notification API's replacement semantics.
+                if !notification.tag.is_empty() {
+                    self.web_notifications.retain(|existing| {
+                        !(existing.tab_id == notification.tab_id
+                            && existing.tag == notification.tag)
+                    });
+                }
+                self.web_notifications.push_back(notification);
+            }
+            BrowserEvent::WebNotificationClosed { id, .. } => {
+                const MAX_CLOSED_IDS: usize = 64;
+                if self.closed_web_notifications.len() < MAX_CLOSED_IDS {
+                    self.closed_web_notifications.push(id);
+                }
+            }
             BrowserEvent::BrowserCreated { tab_id, browser } => {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.browser = Some(browser);
@@ -3951,6 +4213,24 @@ impl TabManager {
             UiAction::ResolveDisplayMediaPicker { token, device_id } => {
                 self.resolve_display_media_picker(token, device_id);
             }
+            UiAction::ResolveNotificationPermission {
+                request_id,
+                granted,
+                persist,
+            } => self.resolve_notification_permission(request_id, granted, persist),
+            UiAction::ActivateWebNotification {
+                tab_id,
+                notification_id,
+            } => {
+                self.focus_tab(tab_id);
+                self.dispatch_web_notification_event(tab_id, &notification_id, "click");
+            }
+            UiAction::DismissWebNotification {
+                tab_id,
+                notification_id,
+            } => {
+                self.dispatch_web_notification_event(tab_id, &notification_id, "close");
+            }
             // The winit handler persists the live rail toggle; tab state needs
             // no change for a chrome width update.
             UiAction::SetRailExpanded(_) => {}
@@ -4136,20 +4416,40 @@ impl TabManager {
             state.last_synced_url.clear();
         }
 
-        state.permission_prompt = match self.active_media_permission_request_id().and_then(|id| {
-            self.pending_media_permissions
-                .get(&id)
-                .map(|pending| (id, pending))
-        }) {
-            Some((request_id, pending)) => Some(PermissionPrompt {
+        // A live media prompt always wins; notification prompts queue behind it
+        // so two modal requests can never fight over the shared overlay.
+        state.permission_prompt = if let Some((request_id, pending)) = self
+            .active_media_permission_request_id()
+            .and_then(|id| self.pending_media_permissions.get(&id).map(|p| (id, p)))
+        {
+            Some(PermissionPrompt {
+                kind: PermissionPromptKind::Media,
                 request_id,
                 tab_id: pending.tab_id,
                 origin: pending.origin.clone(),
                 permissions: pending.permissions,
                 label: MediaAccessPermissions::from_bits(pending.permissions).label(),
                 private: pending.private,
-            }),
-            None => None,
+            })
+        } else if let Some((request_id, pending)) = self
+            .active_notification_permission_request_id()
+            .and_then(|id| {
+                self.pending_notification_permissions
+                    .get(&id)
+                    .map(|p| (id, p))
+            })
+        {
+            Some(PermissionPrompt {
+                kind: PermissionPromptKind::Notifications,
+                request_id,
+                tab_id: pending.tab_id,
+                origin: pending.origin.clone(),
+                permissions: 0,
+                label: "notifications".to_string(),
+                private: pending.private,
+            })
+        } else {
+            None
         };
         state.display_media_picker = self
             .active_display_media_token()
@@ -4165,9 +4465,9 @@ mod tests {
         is_blank_navigation_url, is_critical_pressure, needs_initial_navigation,
         next_navigation_retry_delay, normalize_workspace_selection, pinned_insert_index,
         preferred_favicon_url, ram_pressure, record_media_permission,
-        remembered_permission_decision, restore_insert_index, should_hibernate_tab,
-        should_sync_omnibox, take_pending_permission, BrowserSpawnMode, PendingMediaPermission,
-        Tab, TabManager, TabState,
+        record_site_permission_decision, remembered_permission_decision, restore_insert_index,
+        should_hibernate_tab, should_sync_omnibox, take_pending_permission, BrowserSpawnMode,
+        PendingMediaPermission, Tab, TabManager, TabState,
     };
     use crate::config::{
         BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
@@ -4176,8 +4476,10 @@ mod tests {
     use crate::events::{
         BrowserEvent, DownloadEngine, DownloadInfo, DownloadNotificationKind, DownloadState,
         MediaAccessPermissions, MediaPermissionCallback, TestPermissionCallback, UiAction,
+        WebNotification,
     };
     use crate::storage::db::{BookmarkItem, DbCommand, SessionTabSnapshot, StorageHandle};
+    use crate::ui::chrome::{ChromeState, PermissionPromptKind};
     use crate::ui::platform_view::ContentRect;
     use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::time::{Duration, Instant};
@@ -4232,6 +4534,133 @@ mod tests {
             browser: None,
             favicon: None,
         });
+    }
+
+    #[test]
+    fn notification_permission_requests_queue_a_native_prompt() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 7);
+        manager
+            .event_sender
+            .send(BrowserEvent::NotificationPermissionRequested {
+                request_id: 11,
+                tab_id: 7,
+                origin: "https://chat.example/".to_string(),
+                token: "token-1".to_string(),
+            })
+            .expect("send notification permission");
+        manager.pump_events();
+
+        assert_eq!(manager.pending_notification_permissions.len(), 1);
+        assert_eq!(
+            manager.active_notification_permission_request_id(),
+            Some(11)
+        );
+        let mut state = ChromeState::default();
+        manager.update_chrome_state(&mut state);
+        let prompt = state.permission_prompt.expect("notification prompt");
+        assert_eq!(prompt.kind, PermissionPromptKind::Notifications);
+        assert_eq!(prompt.origin, "https://chat.example");
+        assert_eq!(prompt.label, "notifications");
+
+        manager.handle_ui_action(UiAction::ResolveNotificationPermission {
+            request_id: 11,
+            granted: true,
+            persist: true,
+        });
+        assert!(manager.pending_notification_permissions.is_empty());
+        assert_eq!(
+            manager.saved_site_permissions.get(&(
+                "https://chat.example".to_string(),
+                "notifications".to_string()
+            )),
+            Some(&true)
+        );
+    }
+
+    #[test]
+    fn saved_notification_permission_resolves_without_a_prompt() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 7);
+        manager.saved_site_permissions.insert(
+            (
+                "https://chat.example".to_string(),
+                "notifications".to_string(),
+            ),
+            true,
+        );
+        manager
+            .event_sender
+            .send(BrowserEvent::NotificationPermissionRequested {
+                request_id: 12,
+                tab_id: 7,
+                origin: "https://chat.example".to_string(),
+                token: "token-2".to_string(),
+            })
+            .expect("send notification permission");
+        manager.pump_events();
+
+        assert!(manager.pending_notification_permissions.is_empty());
+    }
+
+    #[test]
+    fn notifications_without_a_saved_grant_are_dropped() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 7);
+        let notification = WebNotification {
+            id: "kn-1".to_string(),
+            tab_id: 7,
+            origin: "https://chat.example".to_string(),
+            title: "Build finished".to_string(),
+            body: String::new(),
+            tag: String::new(),
+            require_interaction: false,
+        };
+        manager
+            .event_sender
+            .send(BrowserEvent::WebNotificationShown(notification.clone()))
+            .expect("send notification");
+        manager.pump_events();
+        assert!(manager.consume_web_notifications().is_empty());
+
+        manager.saved_site_permissions.insert(
+            (
+                "https://chat.example".to_string(),
+                "notifications".to_string(),
+            ),
+            true,
+        );
+        manager
+            .event_sender
+            .send(BrowserEvent::WebNotificationShown(notification))
+            .expect("send granted notification");
+        manager.pump_events();
+        let shown = manager.consume_web_notifications();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].origin, "https://chat.example");
+    }
+
+    #[test]
+    fn notification_permission_record_respects_private_spaces() {
+        let mut saved = BTreeMap::new();
+        let mut private = BTreeMap::new();
+        record_site_permission_decision(
+            &mut saved,
+            &mut private,
+            None,
+            "https://chat.example",
+            "notifications",
+            true,
+            true,
+        );
+        assert!(saved.is_empty());
+        assert_eq!(
+            private.get(&(
+                "https://chat.example".to_string(),
+                "notifications".to_string()
+            )),
+            Some(&true)
+        );
     }
 
     fn add_pending_permission(

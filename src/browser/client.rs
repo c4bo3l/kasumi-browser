@@ -1,6 +1,11 @@
+use crate::browser::notifications::{
+    parse_close_message, parse_permission_message, parse_show_message,
+    NOTIFICATION_CLOSE_CONSOLE_PREFIX, NOTIFICATION_PERMISSION_CONSOLE_PREFIX,
+    NOTIFICATION_SHOW_CONSOLE_PREFIX,
+};
 use crate::events::{
     BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadState,
-    MediaAccessPermissions, MediaPermissionCallback, DISPLAY_MEDIA_CONSOLE_PREFIX,
+    MediaAccessPermissions, MediaPermissionCallback, WebNotification, DISPLAY_MEDIA_CONSOLE_PREFIX,
 };
 use cef::*;
 use crossbeam_channel::Sender;
@@ -149,6 +154,14 @@ static NEXT_MEDIA_PERMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_media_permission_request_id() -> u64 {
     NEXT_MEDIA_PERMISSION_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Monotonic ids for Web Notification permission prompts. Kept separate from
+/// media prompts so the UI can route a resolution to the right queue.
+static NEXT_NOTIFICATION_PERMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_notification_permission_request_id() -> u64 {
+    NEXT_NOTIFICATION_PERMISSION_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Translate Chrome-runtime permission request types into Kasumi's media bits.
@@ -357,6 +370,16 @@ wrap_load_handler! {
                 None,
                 0,
             );
+            // CEF has no native Web Notification presenter. Replace the API
+            // with a shim that forwards permission requests and payloads to the
+            // native chrome through the same internal console channel.
+            frame.execute_java_script(
+                Some(&CefString::from(
+                    crate::browser::notifications::RENDERER_SHIM,
+                )),
+                None,
+                0,
+            );
         }
     }
 }
@@ -437,19 +460,68 @@ wrap_display_handler! {
                 return 0;
             };
             let message = message.to_string();
-            let Some(token) = message.strip_prefix(DISPLAY_MEDIA_CONSOLE_PREFIX) else {
-                return 0;
-            };
-            let token = token.trim().to_string();
-            if token.is_empty() {
-                return 0;
+
+            if message.starts_with(DISPLAY_MEDIA_CONSOLE_PREFIX) {
+                let Some(token) = message.strip_prefix(DISPLAY_MEDIA_CONSOLE_PREFIX) else {
+                    return 0;
+                };
+                let token = token.trim().to_string();
+                if token.is_empty() {
+                    return 0;
+                }
+                let _ = self.event_sender.send(BrowserEvent::DisplayMediaPickerRequested {
+                    tab_id: self.tab_id,
+                    token,
+                });
+                // This is an internal control message, not useful page logging.
+                return 1;
             }
-            let _ = self.event_sender.send(BrowserEvent::DisplayMediaPickerRequested {
-                tab_id: self.tab_id,
-                token,
-            });
-            // This is an internal control message, not useful page logging.
-            1
+
+            if message.starts_with(NOTIFICATION_PERMISSION_CONSOLE_PREFIX) {
+                let Some(payload) = parse_permission_message(&message) else {
+                    return 0;
+                };
+                let _ =
+                    self.event_sender
+                        .send(BrowserEvent::NotificationPermissionRequested {
+                            request_id: next_notification_permission_request_id(),
+                            tab_id: self.tab_id,
+                            origin: payload.origin,
+                            token: payload.token,
+                        });
+                return 1;
+            }
+
+            if message.starts_with(NOTIFICATION_SHOW_CONSOLE_PREFIX) {
+                let Some(payload) = parse_show_message(&message) else {
+                    return 0;
+                };
+                let _ = self.event_sender.send(BrowserEvent::WebNotificationShown(
+                    WebNotification {
+                        id: payload.id,
+                        tab_id: self.tab_id,
+                        origin: payload.origin,
+                        title: payload.title,
+                        body: payload.body,
+                        tag: payload.tag,
+                        require_interaction: payload.require_interaction,
+                    },
+                ));
+                return 1;
+            }
+
+            if message.starts_with(NOTIFICATION_CLOSE_CONSOLE_PREFIX) {
+                let Some(payload) = parse_close_message(&message) else {
+                    return 0;
+                };
+                let _ = self.event_sender.send(BrowserEvent::WebNotificationClosed {
+                    tab_id: self.tab_id,
+                    id: payload.id,
+                });
+                return 1;
+            }
+
+            0
         }
     }
 }

@@ -59,7 +59,7 @@ Use these exact crate versions and release profile settings:
 ```toml
 [package]
 name = "kasumi-browser"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 
 [dependencies]
@@ -143,6 +143,7 @@ kasumi-browser/
     │   ├── mod.rs
     │   ├── client.rs             # TabClient (LifeSpanHandler, LoadHandler, DisplayHandler, RequestHandler)
     │   ├── adblocker.rs          # Arc<adblock::Engine> wrapper & ResourceRequestHandler
+    │   ├── notifications.rs      # Web Notification API renderer shim & native bridge
     │   └── hibernation.rs        # TabManager, TabState machine, sysinfo RAM watchdog
     ├── storage/
     │   ├── mod.rs
@@ -229,6 +230,7 @@ pub struct Tab {
 - **UI Elements in `egui`:**
   - **Vertical Workspace Rail:** Collapsible left rail with workspace label, Command button, New tab, vertically scrollable tabs (title, loading/hibernated badge, middle-click close, plus a hover-only × button on the row right in expanded mode and top-right in collapsed mode), shield badge, RAM readout, and Hibernate All button. Rail tooltips are visible in both modes, use high-contrast text, and render above the page beside the hovered row via a click-through overlay.
   - **Floating Command Palette:** `Cmd/Ctrl+K` or `Cmd/Ctrl+L` opens a centered command bar in a transparent overlay window with tab search, address/search resolution, keyboard selection (`↑`/`↓`, `Enter`, `Esc`), quick actions, immediate input focus, and click-outside dismissal.
+  - **Website Notifications:** The Web Notification API permission prompt uses the shared native modal surface. Notifications render in a small always-on-top clickable window so activating a card focuses the source tab and dispatches `click`, while dismissal dispatches `close`. Incognito decisions stay in memory; normal-space decisions persist in `site_permissions`.
   - **Omnibox Resolution:**
     - If input parses via `url::Url::parse` -> navigate directly.
     - Else if input has no spaces and contains `.` (e.g., `github.com/rust-lang`) -> prepend `https://` and navigate.
