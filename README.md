@@ -109,7 +109,7 @@ open target/release/KasumiBrowser.app
 
 `cargo run --release --bin bundle` is the in-repo alternative; it writes `target/bundle/kasumi-browser.app`, includes the app icon from `assets/icons/mac/kasumi-browser.icns`, and adds camera, microphone, screen-recording, and system-audio usage descriptions to `Info.plist`.
 
-For WebRTC tests on macOS, launch the bundled app rather than the bare `target/release/kasumi-browser` binary from a terminal. macOS attributes TCC camera, microphone, screen, and system-audio permissions to the responsible app bundle; running the bare binary can make macOS prompt the terminal or IDE instead. Kasumi's Allow/Deny prompt grants web access, and Chromium's own picker still handles the final screen, window, or tab choice.
+For WebRTC tests on macOS, launch the bundled app rather than the bare `target/release/kasumi-browser` binary from a terminal. macOS attributes TCC camera, microphone, screen, and system-audio permissions to the responsible app bundle; running the bare binary can make macOS prompt the terminal or IDE instead. Kasumi's Allow/Deny prompt records the origin decision and releases the CEF media request; Chromium's own picker still handles the final screen, window, or tab choice.
 
 ---
 

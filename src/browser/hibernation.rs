@@ -15,8 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cef::{
-    CefString, ImplBrowser, ImplBrowserHost, ImplDownloadItemCallback, ImplFrame,
-    ImplMediaAccessCallback, ImplPermissionPromptCallback, ImplUrlrequest, PermissionRequestResult,
+    CefString, ImplBrowser, ImplBrowserHost, ImplDownloadItemCallback, ImplFrame, ImplUrlrequest,
 };
 use crossbeam_channel::{Receiver, Sender};
 use sysinfo::{ProcessesToUpdate, System};
@@ -358,23 +357,12 @@ impl std::fmt::Debug for PendingMediaPermission {
 }
 
 /// Resolve a one-shot CEF callback on the UI thread. MediaAccess callbacks need
-/// the exact requested bitmask; Chrome-runtime prompt callbacks take an accept
-/// or deny result instead.
+/// the exact requested bitmask. Chrome-runtime prompt callbacks are dismissed
+/// rather than accepted/denied because Chromium's Accept/Deny paths move each
+/// request callback unconditionally and CHECK when a prompt outlived its
+/// request; Dismiss uses the guarded cancellation path.
 fn resolve_permission_callback(callback: MediaPermissionCallback, granted: bool, permissions: u32) {
-    match callback {
-        MediaPermissionCallback::MediaAccess(callback) => {
-            if granted {
-                callback.cont(permissions);
-            } else {
-                callback.cancel();
-            }
-        }
-        MediaPermissionCallback::PermissionPrompt(callback) => callback.cont(if granted {
-            PermissionRequestResult::ACCEPT
-        } else {
-            PermissionRequestResult::DENY
-        }),
-    }
+    callback.resolve(granted, permissions);
 }
 
 /// Remove a pending item and its queue position atomically. Returning the removed
@@ -935,7 +923,12 @@ impl TabManager {
         );
     }
 
-    fn cancel_media_permissions_for_tab(&mut self, tab_id: u64) {
+    /// Drop prompts whose browser is going away. Calling a CEF permission
+    /// callback during navigation or teardown can run against a destroyed
+    /// `PermissionRequestManager` and trap inside Chromium. Since the page is
+    /// already gone, releasing the callback without invoking it is safer; CEF
+    /// disposes the request with its browser.
+    fn discard_media_permissions_for_tab(&mut self, tab_id: u64) {
         let ids: Vec<u64> = self
             .pending_media_permissions
             .iter()
@@ -943,14 +936,22 @@ impl TabManager {
             .map(|(id, _)| *id)
             .collect();
         for id in ids {
-            self.resolve_media_permission(id, false, false);
+            let _ = take_pending_permission(
+                &mut self.pending_media_permissions,
+                &mut self.pending_media_permission_queue,
+                id,
+            );
         }
     }
 
-    fn cancel_all_media_permissions(&mut self) {
+    fn discard_all_media_permissions(&mut self) {
         let ids: Vec<u64> = self.pending_media_permissions.keys().copied().collect();
         for id in ids {
-            self.resolve_media_permission(id, false, false);
+            let _ = take_pending_permission(
+                &mut self.pending_media_permissions,
+                &mut self.pending_media_permission_queue,
+                id,
+            );
         }
     }
 
@@ -1895,7 +1896,7 @@ impl TabManager {
 
     /// Close every live browser while preserving tab metadata for session restore.
     pub fn close_all_browsers(&mut self) {
-        self.cancel_all_media_permissions();
+        self.discard_all_media_permissions();
         for tab in &mut self.tabs {
             if let Some(browser) = tab.browser.take() {
                 if let Some(host) = browser.host() {
@@ -2157,7 +2158,7 @@ impl TabManager {
             self.active_tab_by_workspace.remove(&tab.workspace_id);
         }
         self.pending_navigation_checks.remove(&id);
-        self.cancel_media_permissions_for_tab(id);
+        self.discard_media_permissions_for_tab(id);
         self.requested_favicons.retain(|(tab_id, _)| *tab_id != id);
         self.pending_favicon_urls.remove(&id);
         self.resolved_favicons.remove(&id);
@@ -2234,7 +2235,7 @@ impl TabManager {
         }
 
         self.pending_navigation_checks.remove(&id);
-        self.cancel_media_permissions_for_tab(id);
+        self.discard_media_permissions_for_tab(id);
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tracing::info!("Hibernating tab {} ({})", id, tab.title);
             if let Some(browser) = tab.browser.take() {
@@ -3121,9 +3122,9 @@ impl TabManager {
             }
             BrowserEvent::AddressChange { tab_id, url } => {
                 // A committed navigation invalidates any prompt from the page
-                // that was showing before it. The callback is cancelled here
-                // rather than lingering behind a prompt for a different site.
-                self.cancel_media_permissions_for_tab(tab_id);
+                // that was showing before it. Drop the callback here instead of
+                // running it while Chromium is tearing down the prompt.
+                self.discard_media_permissions_for_tab(tab_id);
                 let committed_initial = !is_blank_navigation_url(&url)
                     && self.pending_navigation_checks.remove(&tab_id).is_some();
                 if committed_initial {
@@ -3179,7 +3180,7 @@ impl TabManager {
             }
             BrowserEvent::BrowserClosed { tab_id } => {
                 self.pending_navigation_checks.remove(&tab_id);
-                self.cancel_media_permissions_for_tab(tab_id);
+                self.discard_media_permissions_for_tab(tab_id);
                 // CEF browser is gone (user tab close, hibernation, or app shutdown).
                 // Never remove the tab metadata here — only release the handle.
                 tracing::info!(
@@ -3876,7 +3877,8 @@ mod tests {
         next_navigation_retry_delay, normalize_workspace_selection, pinned_insert_index,
         preferred_favicon_url, ram_pressure, record_media_permission,
         remembered_permission_decision, restore_insert_index, should_hibernate_tab,
-        should_sync_omnibox, take_pending_permission, BrowserSpawnMode, Tab, TabManager, TabState,
+        should_sync_omnibox, take_pending_permission, BrowserSpawnMode, PendingMediaPermission,
+        Tab, TabManager, TabState,
     };
     use crate::config::{
         BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
@@ -3884,7 +3886,7 @@ mod tests {
     };
     use crate::events::{
         BrowserEvent, DownloadEngine, DownloadInfo, DownloadNotificationKind, DownloadState,
-        UiAction,
+        MediaAccessPermissions, MediaPermissionCallback, TestPermissionCallback, UiAction,
     };
     use crate::storage::db::{BookmarkItem, DbCommand, SessionTabSnapshot, StorageHandle};
     use crate::ui::platform_view::ContentRect;
@@ -3904,6 +3906,145 @@ mod tests {
         );
         assert_eq!(queue, VecDeque::from(vec![8, 10]));
         assert_eq!(take_pending_permission(&mut pending, &mut queue, 9), None);
+    }
+
+    fn permission_test_manager() -> TabManager {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        TabManager::new(
+            tx,
+            rx,
+            std::ptr::null_mut(),
+            ContentRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                scale_factor: 1.0,
+            },
+            None,
+            &BrowserPreferences::default(),
+            vec![Workspace::default_workspace()],
+            vec![],
+        )
+    }
+
+    fn add_permission_test_tab(manager: &mut TabManager, id: u64) {
+        manager.tabs.push(Tab {
+            id,
+            workspace_id: Workspace::DEFAULT_ID,
+            url: "https://meet.example".to_string(),
+            title: "Meet".to_string(),
+            is_loading: false,
+            can_go_back: false,
+            can_go_forward: false,
+            blocked_requests: 0,
+            pinned: false,
+            state: TabState::Active,
+            browser: None,
+            favicon: None,
+        });
+    }
+
+    fn add_pending_permission(
+        manager: &mut TabManager,
+        request_id: u64,
+        tab_id: u64,
+    ) -> TestPermissionCallback {
+        let callback = TestPermissionCallback::default();
+        manager.pending_media_permissions.insert(
+            request_id,
+            PendingMediaPermission {
+                tab_id,
+                origin: "https://meet.example".to_string(),
+                permissions: MediaAccessPermissions::AUDIO | MediaAccessPermissions::VIDEO,
+                private: false,
+                callback: MediaPermissionCallback::Test(callback.clone()),
+                prompt_id: None,
+            },
+        );
+        manager.pending_media_permission_queue.push_back(request_id);
+        callback
+    }
+
+    fn assert_permission_discarded(manager: &TabManager, callback: &TestPermissionCallback) {
+        assert_eq!(callback.calls(), 0);
+        assert!(manager.pending_media_permissions.is_empty());
+        assert!(manager.pending_media_permission_queue.is_empty());
+    }
+
+    #[test]
+    fn committed_navigation_discards_permission_callback() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        let callback = add_pending_permission(&mut manager, 10, 1);
+
+        manager.handle_browser_event(BrowserEvent::AddressChange {
+            tab_id: 1,
+            url: "https://meet.example/call".to_string(),
+        });
+
+        assert_permission_discarded(&manager, &callback);
+    }
+
+    #[test]
+    fn browser_closed_discards_permission_callback() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        let callback = add_pending_permission(&mut manager, 11, 1);
+
+        manager.handle_browser_event(BrowserEvent::BrowserClosed { tab_id: 1 });
+
+        assert_permission_discarded(&manager, &callback);
+    }
+
+    #[test]
+    fn hibernation_discards_permission_callback() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        let callback = add_pending_permission(&mut manager, 12, 1);
+
+        manager.hibernate_tab(1);
+
+        assert_permission_discarded(&manager, &callback);
+    }
+
+    #[test]
+    fn shutdown_and_tab_close_discard_permission_callbacks() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        add_permission_test_tab(&mut manager, 2);
+        let first = add_pending_permission(&mut manager, 13, 1);
+        let second = add_pending_permission(&mut manager, 14, 2);
+
+        manager.close_tab(1);
+        assert_eq!(first.calls(), 0);
+        assert!(manager
+            .pending_media_permissions
+            .values()
+            .all(|pending| pending.tab_id != 1));
+
+        manager.close_all_browsers();
+        assert_eq!(second.calls(), 0);
+        assert!(manager.pending_media_permissions.is_empty());
+        assert!(manager.pending_media_permission_queue.is_empty());
+    }
+
+    #[test]
+    fn explicit_permission_resolution_invokes_callback_once() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        let callback = add_pending_permission(&mut manager, 15, 1);
+
+        manager.resolve_media_permission(15, true, true);
+        assert_eq!(
+            callback.granted.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(callback.calls(), 1);
+
+        manager.resolve_media_permission(15, false, true);
+        assert_eq!(callback.calls(), 1);
+        assert!(manager.pending_media_permissions.is_empty());
     }
 
     #[test]

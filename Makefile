@@ -19,7 +19,7 @@ check:
 	cargo check --bins
 
 test:
-	cargo test --bin kasumi-browser
+	cargo test --bins
 
 fmt:
 	cargo fmt --all
@@ -27,7 +27,7 @@ fmt:
 lint:
 	cargo fmt --all -- --check
 	cargo check --bins
-	cargo test --bin kasumi-browser
+	cargo test --bins
 
 build: check test
 

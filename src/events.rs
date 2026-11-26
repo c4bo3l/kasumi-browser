@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::config::{BrowserPreferences, WorkspaceColor, WorkspaceIcon};
+use cef::{ImplMediaAccessCallback, ImplPermissionPromptCallback};
 
 /// CEF media-access bit values (`cef_media_access_permission_types_t`).
 ///
@@ -112,6 +113,59 @@ impl MediaAccessPermissions {
 pub enum MediaPermissionCallback {
     MediaAccess(cef::MediaAccessCallback),
     PermissionPrompt(cef::PermissionPromptCallback),
+    #[cfg(test)]
+    Test(TestPermissionCallback),
+}
+
+/// Test-only callback whose invocations can be counted without loading CEF.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct TestPermissionCallback {
+    pub granted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub denied: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl TestPermissionCallback {
+    pub fn calls(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        self.granted.load(Ordering::SeqCst) + self.denied.load(Ordering::SeqCst)
+    }
+}
+
+impl MediaPermissionCallback {
+    /// Resolve a one-shot callback. Callers must remove it from pending state
+    /// before invoking this so CEF never sees the same callback twice.
+    pub fn resolve(self, granted: bool, permissions: u32) {
+        match self {
+            Self::MediaAccess(callback) => {
+                if granted {
+                    callback.cont(permissions);
+                } else {
+                    callback.cancel();
+                }
+            }
+            // Chromium's Accept/Deny paths move each request's one-shot
+            // callback unconditionally and CHECK if a prompt outlived its
+            // request (navigation, preemption, or a duplicate decision).
+            // Dismiss uses the guarded cancellation path, so it resolves the
+            // prompt without risking that trap. Kasumi's own saved decision
+            // and the media-access callback carry the real allow/deny result.
+            Self::PermissionPrompt(callback) => {
+                callback.cont(cef::PermissionRequestResult::DISMISS);
+            }
+            #[cfg(test)]
+            Self::Test(callback) => {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                let counter: &AtomicUsize = if granted {
+                    &callback.granted
+                } else {
+                    &callback.denied
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for MediaPermissionCallback {
@@ -119,6 +173,8 @@ impl std::fmt::Debug for MediaPermissionCallback {
         match self {
             Self::MediaAccess(_) => f.write_str("MediaAccessCallback"),
             Self::PermissionPrompt(_) => f.write_str("PermissionPromptCallback"),
+            #[cfg(test)]
+            Self::Test(_) => f.write_str("TestPermissionCallback"),
         }
     }
 }

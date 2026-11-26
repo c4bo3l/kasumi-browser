@@ -211,12 +211,7 @@ fn send_media_permission_request(
             "UI receiver dropped before media permission {} could be shown",
             request_id
         );
-        match callback {
-            MediaPermissionCallback::MediaAccess(callback) => callback.cancel(),
-            MediaPermissionCallback::PermissionPrompt(callback) => {
-                callback.cont(PermissionRequestResult::DENY)
-            }
-        }
+        callback.resolve(false, permissions);
     }
     1
 }
