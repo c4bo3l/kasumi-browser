@@ -16,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cef::{
     CefString, ImplBrowser, ImplBrowserHost, ImplDownloadItemCallback, ImplFrame,
-    ImplMediaAccessCallback, ImplUrlrequest,
+    ImplMediaAccessCallback, ImplPermissionPromptCallback, ImplUrlrequest, PermissionRequestResult,
 };
 use crossbeam_channel::{Receiver, Sender};
 use sysinfo::{ProcessesToUpdate, System};
@@ -34,7 +34,7 @@ use crate::config::{
 use crate::events::{
     normalize_permission_origin, BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo,
     DownloadNotification, DownloadNotificationKind, DownloadState, MediaAccessPermissions,
-    ParallelDownloadEvent, UiAction,
+    MediaPermissionCallback, ParallelDownloadEvent, UiAction,
 };
 use crate::storage::db::{BookmarkItem, SessionTabSnapshot, SitePermission, StorageHandle};
 use crate::ui::chrome::{
@@ -341,7 +341,8 @@ struct PendingMediaPermission {
     origin: String,
     permissions: u32,
     private: bool,
-    callback: cef::MediaAccessCallback,
+    callback: MediaPermissionCallback,
+    prompt_id: Option<u64>,
 }
 
 impl std::fmt::Debug for PendingMediaPermission {
@@ -351,7 +352,28 @@ impl std::fmt::Debug for PendingMediaPermission {
             .field("origin", &self.origin)
             .field("permissions", &self.permissions)
             .field("private", &self.private)
+            .field("prompt_id", &self.prompt_id)
             .finish_non_exhaustive()
+    }
+}
+
+/// Resolve a one-shot CEF callback on the UI thread. MediaAccess callbacks need
+/// the exact requested bitmask; Chrome-runtime prompt callbacks take an accept
+/// or deny result instead.
+fn resolve_permission_callback(callback: MediaPermissionCallback, granted: bool, permissions: u32) {
+    match callback {
+        MediaPermissionCallback::MediaAccess(callback) => {
+            if granted {
+                callback.cont(permissions);
+            } else {
+                callback.cancel();
+            }
+        }
+        MediaPermissionCallback::PermissionPrompt(callback) => callback.cont(if granted {
+            PermissionRequestResult::ACCEPT
+        } else {
+            PermissionRequestResult::DENY
+        }),
     }
 }
 
@@ -891,17 +913,14 @@ impl TabManager {
             tracing::warn!("Ignoring stale media permission resolution {request_id}");
             return;
         };
-        // CEF requires getUserMedia callbacks to grant exactly the requested
-        // mask. Unknown future bits are still passed through on explicit Allow;
-        // only persistence is limited to permissions Kasumi can describe.
-        if granted {
-            pending.callback.cont(pending.permissions);
-        } else {
-            pending.callback.cancel();
-        }
+        // Persist before moving the one-shot callback out of `pending`.
         if persist {
             self.remember_media_permission(&pending, granted);
         }
+        // CEF requires getUserMedia callbacks to grant exactly the requested
+        // mask. Unknown future bits are still passed through on explicit Allow;
+        // only persistence is limited to permissions Kasumi can describe.
+        resolve_permission_callback(pending.callback, granted, pending.permissions);
     }
 
     fn remember_media_permission(&mut self, pending: &PendingMediaPermission, granted: bool) {
@@ -2734,6 +2753,12 @@ impl TabManager {
         let parent_handle = platform_view::ptr_as_cef_handle(self.parent_window_view);
         let mut window_info = cef::WindowInfo::default().set_as_child(parent_handle, &bounds);
         window_info.windowless_rendering_enabled = 0;
+        // Keep the embedded child view on Alloy style. Chrome style is the
+        // CEF 156 default, but its display-capture flow can capture the whole
+        // desktop without offering the screen/window picker. Alloy style is
+        // supported with a client-provided parent view and preserves native
+        // child-window compositing plus CEF's media callbacks.
+        window_info.runtime_style = cef::RuntimeStyle::ALLOY;
 
         #[cfg(target_os = "macos")]
         {
@@ -2968,6 +2993,7 @@ impl TabManager {
                 origin,
                 permissions,
                 callback,
+                prompt_id,
             } => {
                 let Some(private) = self
                     .tabs
@@ -2977,7 +3003,7 @@ impl TabManager {
                 else {
                     // A prompt from a browser whose tab metadata is gone must
                     // still be resolved, but must never open an orphan dialog.
-                    callback.cancel();
+                    resolve_permission_callback(callback, false, permissions);
                     return;
                 };
                 if let Some(previous) = take_pending_permission(
@@ -2986,7 +3012,7 @@ impl TabManager {
                     request_id,
                 ) {
                     tracing::warn!("Replacing duplicate media permission request {request_id}");
-                    previous.callback.cancel();
+                    resolve_permission_callback(previous.callback, false, previous.permissions);
                 }
                 let origin = normalize_permission_origin(&origin);
                 let saved = if private {
@@ -2999,11 +3025,7 @@ impl TabManager {
                     if let Some(allowed) =
                         remembered_permission_decision(saved, &origin, permissions)
                     {
-                        if allowed {
-                            callback.cont(permissions);
-                        } else {
-                            callback.cancel();
-                        }
+                        resolve_permission_callback(callback, allowed, permissions);
                         return;
                     }
                 }
@@ -3015,9 +3037,37 @@ impl TabManager {
                         permissions,
                         private,
                         callback,
+                        prompt_id,
                     },
                 );
                 self.pending_media_permission_queue.push_back(request_id);
+            }
+            BrowserEvent::PermissionPromptDismissed { tab_id, prompt_id } => {
+                // CEF has already completed a prompt when it reports dismissal
+                // (either with our result or with IGNORE after a navigation).
+                // Clear the matching Kasumi prompt without calling the callback
+                // a second time.
+                let stale: Vec<u64> = self
+                    .pending_media_permissions
+                    .iter()
+                    .filter(|(_, pending)| {
+                        pending.tab_id == tab_id && pending.prompt_id == Some(prompt_id)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in stale {
+                    if take_pending_permission(
+                        &mut self.pending_media_permissions,
+                        &mut self.pending_media_permission_queue,
+                        id,
+                    )
+                    .is_some()
+                    {
+                        tracing::info!(
+                            "CEF dismissed media permission prompt {prompt_id} for tab {tab_id}"
+                        );
+                    }
+                }
             }
             BrowserEvent::BrowserCreated { tab_id, browser } => {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {

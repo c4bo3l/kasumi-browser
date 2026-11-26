@@ -21,6 +21,17 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 ### Fixed
 
 - “Close other tabs” now preserves pinned tabs and disables itself when there are no unpinned tabs to close.
+- Camera/microphone grants no longer rely on the wrong CEF callback: embedded browsers stay on Alloy style, while Chrome-style permission prompts are mapped from CEF's permission-type bitmask and dismissed exactly once.
+- `getDisplayMedia` now enables CEF's screen-capture path and uses the native screen/window picker, including a second display or a specific window, instead of being denied by the browser shell.
+- The macOS bundle now carries `NSScreenCaptureUsageDescription` and `NSAudioCaptureUsageDescription`, so Chromium can request screen and system-audio capture from the app bundle.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bins` — 202 tests
+- `cargo build --release`
+- `make build-windows`
 
 ---
 

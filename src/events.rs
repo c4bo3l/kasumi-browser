@@ -102,6 +102,27 @@ impl MediaAccessPermissions {
     }
 }
 
+/// One-shot CEF callback owned by the UI thread until a native prompt resolves.
+///
+/// Chrome-style CEF windows deliver camera/microphone requests through
+/// `on_show_permission_prompt`; Kasumi's Alloy-style embedded tabs use
+/// `on_request_media_access_permission` for all media bits. Both paths feed the
+/// same Kasumi prompt, so the callback variant is kept next to the event.
+#[derive(Clone)]
+pub enum MediaPermissionCallback {
+    MediaAccess(cef::MediaAccessCallback),
+    PermissionPrompt(cef::PermissionPromptCallback),
+}
+
+impl std::fmt::Debug for MediaPermissionCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MediaAccess(_) => f.write_str("MediaAccessCallback"),
+            Self::PermissionPrompt(_) => f.write_str("PermissionPromptCallback"),
+        }
+    }
+}
+
 /// Normalize a CEF requesting origin into the key used by `site_permissions`.
 /// CEF may supply either `https://example.com` or `https://example.com/`; both
 /// must resolve to the same saved decision.
@@ -415,15 +436,24 @@ pub enum BrowserEvent {
     },
     /// Native segmented downloader event. Always consumed on the main UI thread.
     ParallelDownload(ParallelDownloadEvent),
-    /// A page asked for camera/microphone access. The CEF callback is retained
-    /// only on the main UI thread until the native prompt is resolved, so the
-    /// permission decision can never be made on a Chromium handler thread.
+    /// A page asked for camera/microphone/desktop capture access. The CEF
+    /// callback is retained only on the main UI thread until the native prompt
+    /// is resolved, so the decision can never be made on a Chromium thread.
     MediaAccessPermissionRequested {
         request_id: u64,
         tab_id: u64,
         origin: String,
         permissions: u32,
-        callback: cef::MediaAccessCallback,
+        callback: MediaPermissionCallback,
+        /// Present for Chrome-runtime `on_show_permission_prompt` requests so
+        /// CEF-initiated dismissals can cancel the matching Kasumi prompt.
+        prompt_id: Option<u64>,
+    },
+    /// CEF dismissed a Chrome-runtime permission prompt before Kasumi resolved
+    /// it. No site rule is saved for this case.
+    PermissionPromptDismissed {
+        tab_id: u64,
+        prompt_id: u64,
     },
 }
 
@@ -550,12 +580,19 @@ impl std::fmt::Debug for BrowserEvent {
                 origin,
                 permissions,
                 callback: _,
+                prompt_id,
             } => f
                 .debug_struct("MediaAccessPermissionRequested")
                 .field("request_id", request_id)
                 .field("tab_id", tab_id)
                 .field("origin", origin)
                 .field("permissions", permissions)
+                .field("prompt_id", prompt_id)
+                .finish(),
+            Self::PermissionPromptDismissed { tab_id, prompt_id } => f
+                .debug_struct("PermissionPromptDismissed")
+                .field("tab_id", tab_id)
+                .field("prompt_id", prompt_id)
                 .finish(),
             Self::ParallelDownload(event) => {
                 f.debug_tuple("ParallelDownload").field(event).finish()
