@@ -357,10 +357,9 @@ impl std::fmt::Debug for PendingMediaPermission {
 }
 
 /// Resolve a one-shot CEF callback on the UI thread. MediaAccess callbacks need
-/// the exact requested bitmask. Chrome-runtime prompt callbacks are dismissed
-/// rather than accepted/denied because Chromium's Accept/Deny paths move each
-/// request callback unconditionally and CHECK when a prompt outlived its
-/// request; Dismiss uses the guarded cancellation path.
+/// the exact requested bitmask; Chrome-runtime prompt callbacks grant or deny
+/// the content setting. Pending entries are removed before this runs, so CEF
+/// never sees the same callback twice.
 fn resolve_permission_callback(callback: MediaPermissionCallback, granted: bool, permissions: u32) {
     callback.resolve(granted, permissions);
 }
@@ -889,38 +888,86 @@ impl TabManager {
         self.pending_media_permission_queue.front().copied()
     }
 
-    /// Resolve one prompt exactly once: remove it first, then call the one-shot
-    /// callback only if removal succeeded. Explicit Allow/Deny are remembered;
-    /// Escape/click-outside dismisses the current request without saving a rule.
+    /// Pending requests from the same tab, origin, and permission mask belong
+    /// to one browser request. CEF can deliver both a Chrome-style content
+    /// prompt and an Alloy media-access callback for the same getUserMedia
+    /// call; one Allow/Deny must resolve both or the camera stays blocked.
+    fn media_permission_group_ids(&self, request_id: u64) -> Vec<u64> {
+        let Some(active) = self.pending_media_permissions.get(&request_id) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<u64> = self
+            .pending_media_permissions
+            .iter()
+            .filter(|(_, pending)| {
+                pending.tab_id == active.tab_id
+                    && pending.origin == active.origin
+                    && pending.permissions == active.permissions
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Resolve one logical prompt exactly once: remove every callback in its
+    /// group first, then call each one-shot callback only if removal succeeded.
+    /// Explicit Allow/Deny are remembered; Escape/click-outside dismisses the
+    /// current request without saving a rule.
     fn resolve_media_permission(&mut self, request_id: u64, granted: bool, persist: bool) {
-        let Some(pending) = take_pending_permission(
-            &mut self.pending_media_permissions,
-            &mut self.pending_media_permission_queue,
-            request_id,
-        ) else {
+        let ids = self.media_permission_group_ids(request_id);
+        if ids.is_empty() {
             tracing::warn!("Ignoring stale media permission resolution {request_id}");
             return;
-        };
-        // Persist before moving the one-shot callback out of `pending`.
-        if persist {
-            self.remember_media_permission(&pending, granted);
         }
+        let pendings: Vec<PendingMediaPermission> = ids
+            .into_iter()
+            .filter_map(|id| {
+                take_pending_permission(
+                    &mut self.pending_media_permissions,
+                    &mut self.pending_media_permission_queue,
+                    id,
+                )
+            })
+            .collect();
+        if pendings.is_empty() {
+            return;
+        }
+
+        // Persist before moving the one-shot callbacks out of `pending`.
+        if persist {
+            let mut permissions = 0;
+            let mut origin = String::new();
+            let mut private = false;
+            for pending in &pendings {
+                permissions |= pending.permissions;
+                if origin.is_empty() {
+                    origin = pending.origin.clone();
+                    private = pending.private;
+                }
+            }
+            record_media_permission(
+                &mut self.saved_site_permissions,
+                &mut self.private_site_permissions,
+                self.storage.as_ref(),
+                &origin,
+                permissions,
+                private,
+                granted,
+            );
+        }
+        tracing::info!(
+            "Resolving {} media callback(s) for tab {} as {}",
+            pendings.len(),
+            request_id,
+            if granted { "allow" } else { "deny" }
+        );
         // CEF requires getUserMedia callbacks to grant exactly the requested
         // mask. Unknown future bits are still passed through on explicit Allow;
         // only persistence is limited to permissions Kasumi can describe.
-        resolve_permission_callback(pending.callback, granted, pending.permissions);
-    }
-
-    fn remember_media_permission(&mut self, pending: &PendingMediaPermission, granted: bool) {
-        record_media_permission(
-            &mut self.saved_site_permissions,
-            &mut self.private_site_permissions,
-            self.storage.as_ref(),
-            &pending.origin,
-            pending.permissions,
-            pending.private,
-            granted,
-        );
+        for pending in pendings {
+            resolve_permission_callback(pending.callback, granted, pending.permissions);
+        }
     }
 
     /// Drop prompts whose browser is going away. Calling a CEF permission
@@ -3003,18 +3050,12 @@ impl TabManager {
                     .map(|tab| Self::is_private_workspace(tab.workspace_id))
                 else {
                     // A prompt from a browser whose tab metadata is gone must
-                    // still be resolved, but must never open an orphan dialog.
-                    resolve_permission_callback(callback, false, permissions);
+                    // never open an orphan dialog. Dropping our callback lets
+                    // CEF dispose the request with its browser; invoking DENY
+                    // here could run against an already torn-down prompt.
+                    drop(callback);
                     return;
                 };
-                if let Some(previous) = take_pending_permission(
-                    &mut self.pending_media_permissions,
-                    &mut self.pending_media_permission_queue,
-                    request_id,
-                ) {
-                    tracing::warn!("Replacing duplicate media permission request {request_id}");
-                    resolve_permission_callback(previous.callback, false, previous.permissions);
-                }
                 let origin = normalize_permission_origin(&origin);
                 let saved = if private {
                     &self.private_site_permissions
@@ -3022,14 +3063,11 @@ impl TabManager {
                     &self.saved_site_permissions
                 };
                 let requested = MediaAccessPermissions::from_bits(permissions);
-                if !requested.has_unrecognized_bits() {
-                    if let Some(allowed) =
-                        remembered_permission_decision(saved, &origin, permissions)
-                    {
-                        resolve_permission_callback(callback, allowed, permissions);
-                        return;
-                    }
-                }
+                let auto_decision = if requested.has_unrecognized_bits() {
+                    None
+                } else {
+                    remembered_permission_decision(saved, &origin, permissions)
+                };
                 self.pending_media_permissions.insert(
                     request_id,
                     PendingMediaPermission {
@@ -3042,6 +3080,12 @@ impl TabManager {
                     },
                 );
                 self.pending_media_permission_queue.push_back(request_id);
+                if let Some(allowed) = auto_decision {
+                    // Resolve the whole group: CEF may have delivered the
+                    // content-setting prompt and media-access callback as two
+                    // events for the same getUserMedia call.
+                    self.resolve_media_permission(request_id, allowed, false);
+                }
             }
             BrowserEvent::PermissionPromptDismissed { tab_id, prompt_id } => {
                 // CEF has already completed a prompt when it reports dismissal
@@ -3950,16 +3994,32 @@ mod tests {
         request_id: u64,
         tab_id: u64,
     ) -> TestPermissionCallback {
+        add_pending_permission_with(
+            manager,
+            request_id,
+            tab_id,
+            MediaAccessPermissions::AUDIO | MediaAccessPermissions::VIDEO,
+            None,
+        )
+    }
+
+    fn add_pending_permission_with(
+        manager: &mut TabManager,
+        request_id: u64,
+        tab_id: u64,
+        permissions: u32,
+        prompt_id: Option<u64>,
+    ) -> TestPermissionCallback {
         let callback = TestPermissionCallback::default();
         manager.pending_media_permissions.insert(
             request_id,
             PendingMediaPermission {
                 tab_id,
                 origin: "https://meet.example".to_string(),
-                permissions: MediaAccessPermissions::AUDIO | MediaAccessPermissions::VIDEO,
+                permissions,
                 private: false,
                 callback: MediaPermissionCallback::Test(callback.clone()),
-                prompt_id: None,
+                prompt_id,
             },
         );
         manager.pending_media_permission_queue.push_back(request_id);
@@ -4045,6 +4105,48 @@ mod tests {
         manager.resolve_media_permission(15, false, true);
         assert_eq!(callback.calls(), 1);
         assert!(manager.pending_media_permissions.is_empty());
+    }
+
+    #[test]
+    fn one_decision_resolves_the_matching_permission_group() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        let content_prompt = add_pending_permission_with(
+            &mut manager,
+            16,
+            1,
+            MediaAccessPermissions::AUDIO | MediaAccessPermissions::VIDEO,
+            Some(7),
+        );
+        let media_access = add_pending_permission_with(
+            &mut manager,
+            17,
+            1,
+            MediaAccessPermissions::AUDIO | MediaAccessPermissions::VIDEO,
+            None,
+        );
+        let unrelated =
+            add_pending_permission_with(&mut manager, 18, 1, MediaAccessPermissions::VIDEO, None);
+
+        manager.resolve_media_permission(16, true, true);
+
+        assert_eq!(
+            content_prompt
+                .granted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            media_access
+                .granted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(unrelated.calls(), 0);
+        assert_eq!(
+            manager.pending_media_permission_queue,
+            VecDeque::from(vec![18])
+        );
     }
 
     #[test]

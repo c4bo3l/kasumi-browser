@@ -145,15 +145,15 @@ impl MediaPermissionCallback {
                     callback.cancel();
                 }
             }
-            // Chromium's Accept/Deny paths move each request's one-shot
-            // callback unconditionally and CHECK if a prompt outlived its
-            // request (navigation, preemption, or a duplicate decision).
-            // Dismiss uses the guarded cancellation path, so it resolves the
-            // prompt without risking that trap. Kasumi's own saved decision
-            // and the media-access callback carry the real allow/deny result.
-            Self::PermissionPrompt(callback) => {
-                callback.cont(cef::PermissionRequestResult::DISMISS);
-            }
+            // Chrome-style prompts need the real content-setting grant. The
+            // caller removes the pending entry before resolving, and teardown
+            // paths discard callbacks instead of invoking them, so this only
+            // runs while CEF's prompt is still alive.
+            Self::PermissionPrompt(callback) => callback.cont(if granted {
+                cef::PermissionRequestResult::ACCEPT
+            } else {
+                cef::PermissionRequestResult::DENY
+            }),
             #[cfg(test)]
             Self::Test(callback) => {
                 use std::sync::atomic::{AtomicUsize, Ordering};

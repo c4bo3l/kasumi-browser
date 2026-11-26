@@ -157,18 +157,22 @@ fn next_media_permission_request_id() -> u64 {
 /// `cef_media_access_permission_types_t` passed to
 /// `on_request_media_access_permission`. Treating the two as the same bitmask
 /// made camera/microphone prompts unreadable and caused grants that Chromium
-/// later discarded. Non-media prompts are left to CEF's default handling.
+/// later discarded. Google Meet can also request camera pan/tilt/zoom together
+/// with the camera stream; that is still a camera permission and must not send
+/// the whole prompt to CEF's default IGNORE handling. Non-media prompts are
+/// left to CEF's default handling.
 fn media_permissions_for_prompt_types(requested: u32) -> Option<u32> {
     let camera = PermissionRequestTypes::CAMERA_STREAM.get_raw() as u32;
+    let camera_ptz = PermissionRequestTypes::CAMERA_PAN_TILT_ZOOM.get_raw() as u32;
     let microphone = PermissionRequestTypes::MIC_STREAM.get_raw() as u32;
-    let supported = camera | microphone;
+    let supported = camera | camera_ptz | microphone;
 
     if requested == 0 || requested & !supported != 0 {
         return None;
     }
 
     let mut permissions = 0;
-    if requested & camera != 0 {
+    if requested & (camera | camera_ptz) != 0 {
         permissions |= MediaAccessPermissions::VIDEO;
     }
     if requested & microphone != 0 {
@@ -901,9 +905,14 @@ mod tests {
     #[test]
     fn chrome_runtime_prompt_types_map_to_media_permissions() {
         let camera = PermissionRequestTypes::CAMERA_STREAM.get_raw() as u32;
+        let camera_ptz = PermissionRequestTypes::CAMERA_PAN_TILT_ZOOM.get_raw() as u32;
         let microphone = PermissionRequestTypes::MIC_STREAM.get_raw() as u32;
         assert_eq!(
             media_permissions_for_prompt_types(camera),
+            Some(MediaAccessPermissions::VIDEO)
+        );
+        assert_eq!(
+            media_permissions_for_prompt_types(camera_ptz),
             Some(MediaAccessPermissions::VIDEO)
         );
         assert_eq!(
@@ -911,7 +920,7 @@ mod tests {
             Some(MediaAccessPermissions::AUDIO)
         );
         assert_eq!(
-            media_permissions_for_prompt_types(camera | microphone),
+            media_permissions_for_prompt_types(camera | camera_ptz | microphone),
             Some(MediaAccessPermissions::AUDIO | MediaAccessPermissions::VIDEO)
         );
     }
