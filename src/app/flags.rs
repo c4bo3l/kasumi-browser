@@ -9,6 +9,9 @@ use cef::{CefString, CommandLine, ImplCommandLine};
 pub const BROWSER_SWITCHES: &[&str] = &[
     // Process consolidation
     "process-per-site",
+    // WebRTC display capture. This only enables getDisplayMedia; it does not
+    // auto-grant camera, microphone, or desktop access.
+    "enable-usermedia-screen-capturing",
     // Telemetry/background service removal
     "disable-background-networking",
     "disable-component-update",
@@ -74,6 +77,7 @@ mod tests {
     fn browser_switches_cover_process_consolidation_and_telemetry() {
         for expected in [
             "process-per-site",
+            "enable-usermedia-screen-capturing",
             "disable-background-networking",
             "disable-component-update",
             "disable-domain-reliability",

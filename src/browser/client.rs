@@ -1,8 +1,11 @@
-use crate::events::{BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadState};
+use crate::events::{
+    BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadState,
+    MediaAccessPermissions, MediaPermissionCallback, DISPLAY_MEDIA_CONSOLE_PREFIX,
+};
 use cef::*;
 use crossbeam_channel::Sender;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -139,6 +142,169 @@ wrap_life_span_handler! {
     }
 }
 
+/// Monotonic ids for media-access prompts. CEF handlers are per browser, so a
+/// process-wide counter is the simplest way to keep concurrent prompts distinct
+/// without sharing any mutable state across Chromium threads.
+static NEXT_MEDIA_PERMISSION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_media_permission_request_id() -> u64 {
+    NEXT_MEDIA_PERMISSION_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Translate Chrome-runtime permission request types into Kasumi's media bits.
+///
+/// `on_show_permission_prompt` uses `cef_permission_request_types_t`, not the
+/// `cef_media_access_permission_types_t` passed to
+/// `on_request_media_access_permission`. Treating the two as the same bitmask
+/// made camera/microphone prompts unreadable and caused grants that Chromium
+/// later discarded. Google Meet can also request camera pan/tilt/zoom together
+/// with the camera stream; that is still a camera permission and must not send
+/// the whole prompt to CEF's default IGNORE handling. Non-media prompts are
+/// left to CEF's default handling.
+fn media_permissions_for_prompt_types(requested: u32) -> Option<u32> {
+    let camera = PermissionRequestTypes::CAMERA_STREAM.get_raw() as u32;
+    let camera_ptz = PermissionRequestTypes::CAMERA_PAN_TILT_ZOOM.get_raw() as u32;
+    let microphone = PermissionRequestTypes::MIC_STREAM.get_raw() as u32;
+    let supported = camera | camera_ptz | microphone;
+
+    if requested == 0 || requested & !supported != 0 {
+        return None;
+    }
+
+    let mut permissions = 0;
+    if requested & (camera | camera_ptz) != 0 {
+        permissions |= MediaAccessPermissions::VIDEO;
+    }
+    if requested & microphone != 0 {
+        permissions |= MediaAccessPermissions::AUDIO;
+    }
+    (permissions != 0).then_some(permissions)
+}
+
+/// Hand a CEF permission callback to the main UI thread. Returning 1 tells CEF
+/// that Kasumi owns the prompt, so no Chrome-runtime or Alloy fallback UI runs.
+fn send_media_permission_request(
+    tab_id: u64,
+    event_sender: &Sender<BrowserEvent>,
+    origin: String,
+    permissions: u32,
+    callback: MediaPermissionCallback,
+    prompt_id: Option<u64>,
+) -> i32 {
+    let request_id = next_media_permission_request_id();
+    tracing::info!(
+        "Media access request {} from {} for tab {} (permissions={}, prompt_id={:?})",
+        request_id,
+        origin,
+        tab_id,
+        permissions,
+        prompt_id
+    );
+    let event = BrowserEvent::MediaAccessPermissionRequested {
+        request_id,
+        tab_id,
+        origin,
+        permissions,
+        callback: callback.clone(),
+        prompt_id,
+    };
+    if event_sender.send(event).is_err() {
+        // Taking ownership means the callback must still be resolved if the UI
+        // thread disappeared before it could show the prompt.
+        tracing::warn!(
+            "UI receiver dropped before media permission {} could be shown",
+            request_id
+        );
+        callback.resolve(false, permissions);
+    }
+    1
+}
+
+wrap_permission_handler! {
+    pub struct TabPermissionHandler {
+        tab_id: u64,
+        event_sender: Sender<BrowserEvent>,
+    }
+
+    impl PermissionHandler {
+        fn on_request_media_access_permission(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut MediaAccessCallback>,
+        ) -> i32 {
+            let Some(callback) = callback else {
+                return 0;
+            };
+            // Kasumi's embedded browsers use Alloy style, where this is the
+            // only media permission callback. Chrome-style windows (for
+            // example DevTools) use on_show_permission_prompt instead; both
+            // paths feed the same native prompt.
+            let requested = MediaAccessPermissions::from_bits(requested_permissions);
+            if requested.bits() == 0 {
+                return 0;
+            }
+            let origin = requesting_origin
+                .map(|origin| origin.to_string())
+                .unwrap_or_default();
+            send_media_permission_request(
+                self.tab_id,
+                &self.event_sender,
+                origin,
+                requested_permissions,
+                MediaPermissionCallback::MediaAccess(callback.clone()),
+                None,
+            )
+        }
+
+        fn on_show_permission_prompt(
+            &self,
+            _browser: Option<&mut Browser>,
+            prompt_id: u64,
+            requesting_origin: Option<&CefString>,
+            requested_permissions: u32,
+            callback: Option<&mut PermissionPromptCallback>,
+        ) -> i32 {
+            let Some(callback) = callback else {
+                return 0;
+            };
+            let Some(permissions) = media_permissions_for_prompt_types(requested_permissions) else {
+                tracing::debug!(
+                    "Leaving non-media permission prompt {} (types={}) to CEF",
+                    prompt_id,
+                    requested_permissions
+                );
+                return 0;
+            };
+            let origin = requesting_origin
+                .map(|origin| origin.to_string())
+                .unwrap_or_default();
+            send_media_permission_request(
+                self.tab_id,
+                &self.event_sender,
+                origin,
+                permissions,
+                MediaPermissionCallback::PermissionPrompt(callback.clone()),
+                Some(prompt_id),
+            )
+        }
+
+        fn on_dismiss_permission_prompt(
+            &self,
+            _browser: Option<&mut Browser>,
+            prompt_id: u64,
+            _result: PermissionRequestResult,
+        ) {
+            let _ = self.event_sender.send(BrowserEvent::PermissionPromptDismissed {
+                tab_id: self.tab_id,
+                prompt_id,
+            });
+        }
+    }
+}
+
 wrap_load_handler! {
     pub struct TabLoadHandler {
         tab_id: u64,
@@ -159,6 +325,38 @@ wrap_load_handler! {
                 can_go_back: can_go_back != 0,
                 can_go_forward: can_go_forward != 0,
             });
+        }
+
+        fn on_load_end(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _http_status_code: i32,
+        ) {
+            let Some(frame) = frame else {
+                return;
+            };
+            if frame.is_main() == 0 {
+                return;
+            }
+            let url = CefStringUtf16::from(&frame.url()).to_string();
+            if !(url.starts_with("http://")
+                || url.starts_with("https://")
+                || url.starts_with("file://"))
+            {
+                return;
+            }
+            // Install the display-source shim on the browser's UI thread after
+            // the document is ready. Doing this from a renderer context hook
+            // made CEF's initial navigation fail and could re-enter V8 when
+            // DevTools attached.
+            frame.execute_java_script(
+                Some(&CefString::from(
+                    crate::browser::display_capture::RENDERER_SHIM,
+                )),
+                None,
+                0,
+            );
         }
     }
 }
@@ -225,6 +423,33 @@ wrap_display_handler! {
                 tab_id: self.tab_id,
                 progress,
             });
+        }
+
+        fn on_console_message(
+            &self,
+            _browser: Option<&mut Browser>,
+            _level: LogSeverity,
+            message: Option<&CefString>,
+            _source: Option<&CefString>,
+            _line: i32,
+        ) -> i32 {
+            let Some(message) = message else {
+                return 0;
+            };
+            let message = message.to_string();
+            let Some(token) = message.strip_prefix(DISPLAY_MEDIA_CONSOLE_PREFIX) else {
+                return 0;
+            };
+            let token = token.trim().to_string();
+            if token.is_empty() {
+                return 0;
+            }
+            let _ = self.event_sender.send(BrowserEvent::DisplayMediaPickerRequested {
+                tab_id: self.tab_id,
+                token,
+            });
+            // This is an internal control message, not useful page logging.
+            1
         }
     }
 }
@@ -661,6 +886,7 @@ wrap_client! {
         download_handler: DownloadHandler,
         keyboard_handler: KeyboardHandler,
         context_menu_handler: ContextMenuHandler,
+        permission_handler: PermissionHandler,
     }
 
     impl Client {
@@ -685,6 +911,9 @@ wrap_client! {
         fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
             Some(self.context_menu_handler.clone())
         }
+        fn permission_handler(&self) -> Option<PermissionHandler> {
+            Some(self.permission_handler.clone())
+        }
     }
 }
 
@@ -700,6 +929,7 @@ pub fn create_tab_client(
     let display_handler = TabDisplayHandler::new(tab_id, event_sender.clone());
     let keyboard_handler = TabKeyboardHandler::new(tab_id, event_sender.clone());
     let context_menu_handler = TabContextMenuHandler::new(tab_id, event_sender.clone());
+    let permission_handler = TabPermissionHandler::new(tab_id, event_sender.clone());
     let download_handler =
         TabDownloadHandler::new(tab_id, event_sender.clone(), download_preferences);
     let request_handler = super::adblocker::create_tab_request_handler(
@@ -717,17 +947,60 @@ pub fn create_tab_client(
         download_handler.into(),
         keyboard_handler.into(),
         context_menu_handler.into(),
+        permission_handler.into(),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::download_target_path;
+    use super::media_permissions_for_prompt_types;
     use super::new_tab_disposition;
     use super::{browser_shortcut, browser_shortcut_from_char, is_internal_view_url};
-    use crate::events::BrowserShortcut;
-    use cef::WindowOpenDisposition;
+    use crate::events::{BrowserShortcut, MediaAccessPermissions};
+    use cef::{PermissionRequestTypes, WindowOpenDisposition};
     use std::path::Path;
+
+    #[test]
+    fn chrome_runtime_prompt_types_map_to_media_permissions() {
+        let camera = PermissionRequestTypes::CAMERA_STREAM.get_raw() as u32;
+        let camera_ptz = PermissionRequestTypes::CAMERA_PAN_TILT_ZOOM.get_raw() as u32;
+        let microphone = PermissionRequestTypes::MIC_STREAM.get_raw() as u32;
+        assert_eq!(
+            media_permissions_for_prompt_types(camera),
+            Some(MediaAccessPermissions::VIDEO)
+        );
+        assert_eq!(
+            media_permissions_for_prompt_types(camera_ptz),
+            Some(MediaAccessPermissions::VIDEO)
+        );
+        assert_eq!(
+            media_permissions_for_prompt_types(microphone),
+            Some(MediaAccessPermissions::AUDIO)
+        );
+        assert_eq!(
+            media_permissions_for_prompt_types(camera | camera_ptz | microphone),
+            Some(MediaAccessPermissions::AUDIO | MediaAccessPermissions::VIDEO)
+        );
+    }
+
+    #[test]
+    fn non_media_and_mixed_prompts_are_left_to_cef() {
+        let camera = PermissionRequestTypes::CAMERA_STREAM.get_raw() as u32;
+        assert_eq!(media_permissions_for_prompt_types(0), None);
+        assert_eq!(
+            media_permissions_for_prompt_types(
+                PermissionRequestTypes::GEOLOCATION.get_raw() as u32,
+            ),
+            None
+        );
+        assert_eq!(
+            media_permissions_for_prompt_types(
+                camera | PermissionRequestTypes::GEOLOCATION.get_raw() as u32
+            ),
+            None
+        );
+    }
 
     #[test]
     fn download_target_keeps_suggested_filename_and_extension() {

@@ -67,3 +67,12 @@ CREATE TABLE IF NOT EXISTS preferences (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- Remembered camera/microphone decisions. Private tabs never write here.
+CREATE TABLE IF NOT EXISTS site_permissions (
+    origin TEXT NOT NULL,
+    permission TEXT NOT NULL,
+    allowed INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (origin, permission)
+);

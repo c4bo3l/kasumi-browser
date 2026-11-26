@@ -30,7 +30,9 @@ use ui::chrome::{
 };
 use ui::platform_view::ContentRect;
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceId, ElementState, KeyEvent, WindowEvent};
+#[cfg(target_os = "macos")]
+use winit::event::DeviceId;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId, WindowLevel};
@@ -586,7 +588,7 @@ fn install_macos_main_menu() {
     let app_menu = NSMenu::new(mtm);
     let app_version = NSMenuItem::new(mtm);
     unsafe {
-        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.9.0"));
+        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.10.0"));
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
@@ -1673,6 +1675,8 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
         let restored_workspaces = StorageManager::load_workspaces(&db_path).unwrap_or_default();
         let restored_bookmarks = StorageManager::load_bookmarks(&db_path).unwrap_or_default();
         let restored_downloads = StorageManager::load_downloads(&db_path).unwrap_or_default();
+        let restored_permissions =
+            StorageManager::load_site_permissions(&db_path).unwrap_or_default();
 
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut tab_manager = TabManager::new(
@@ -1686,6 +1690,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             restored_bookmarks,
         );
         tab_manager.seed_downloads(restored_downloads);
+        tab_manager.seed_site_permissions(restored_permissions);
         tab_manager.restore_session(restored_tabs);
 
         self.window = Some(Arc::clone(&window));
@@ -1727,7 +1732,13 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
 
             match event {
                 WindowEvent::CloseRequested => {
-                    self.chrome_state.close_active_overlay();
+                    let mut actions = Vec::new();
+                    self.chrome_state.dismiss_permission_prompt(&mut actions);
+                    if actions.is_empty() {
+                        self.chrome_state.close_active_overlay();
+                    } else {
+                        self.handle_ui_actions(actions);
+                    }
                     self.sync_chrome_overlay(event_loop);
                 }
                 WindowEvent::Resized(new_size) => {

@@ -49,6 +49,16 @@ pub struct HistoryItem {
     pub last_visited: u64,
 }
 
+/// A remembered media permission decision for one origin. `permission` is a
+/// stable key such as `microphone` or `camera`; `allowed` is the user's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SitePermission {
+    pub origin: String,
+    pub permission: String,
+    pub allowed: bool,
+    pub updated_at: u64,
+}
+
 #[derive(Debug)]
 pub enum DbCommand {
     RecordVisit {
@@ -94,6 +104,15 @@ pub enum DbCommand {
         download_id: u32,
     },
     ClearCompletedDownloads,
+    SaveSitePermission {
+        origin: String,
+        permission: String,
+        allowed: bool,
+    },
+    ClearSitePermission {
+        origin: String,
+        permission: String,
+    },
     FlushWal,
 }
 
@@ -180,6 +199,18 @@ impl StorageHandle {
 
     pub fn clear_completed_downloads(&self) {
         self.send(DbCommand::ClearCompletedDownloads);
+    }
+
+    pub fn save_site_permission(&self, origin: String, permission: String, allowed: bool) {
+        self.send(DbCommand::SaveSitePermission {
+            origin,
+            permission,
+            allowed,
+        });
+    }
+
+    pub fn clear_site_permission(&self, origin: String, permission: String) {
+        self.send(DbCommand::ClearSitePermission { origin, permission });
     }
 
     pub fn flush_wal(&self) {
@@ -490,6 +521,31 @@ impl StorageManager {
         }
     }
 
+    /// Load remembered site permission decisions. A missing database yields an
+    /// empty list; the schema creates the table on `init_db`.
+    pub fn load_site_permissions(db_path: &Path) -> Result<Vec<SitePermission>, rusqlite::Error> {
+        let conn = Self::init_db(db_path)?;
+        let mut stmt = conn.prepare(
+            "SELECT origin, permission, allowed, updated_at
+             FROM site_permissions ORDER BY origin ASC, permission ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SitePermission {
+                origin: row.get(0)?,
+                permission: row.get(1)?,
+                allowed: row.get::<_, i32>(2)? != 0,
+                updated_at: row.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        let mut permissions = Vec::new();
+        for row in rows {
+            if let Ok(permission) = row {
+                permissions.push(permission);
+            }
+        }
+        Ok(permissions)
+    }
+
     /// Search history by prefix for omnibox autocomplete.
     pub fn query_history_prefix(
         db_path: &Path,
@@ -780,6 +836,33 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
                 tracing::warn!("Failed to clear completed downloads: {}", e);
             }
         }
+        DbCommand::SaveSitePermission {
+            origin,
+            permission,
+            allowed,
+        } => {
+            let now = now_epoch_secs();
+            let res = conn.execute(
+                "INSERT INTO site_permissions (origin, permission, allowed, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(origin, permission) DO UPDATE SET
+                     allowed = excluded.allowed,
+                     updated_at = excluded.updated_at",
+                params![origin, permission, if allowed { 1 } else { 0 }, now as i64],
+            );
+            if let Err(e) = res {
+                tracing::warn!("Failed to save site permission: {}", e);
+            }
+        }
+        DbCommand::ClearSitePermission { origin, permission } => {
+            let res = conn.execute(
+                "DELETE FROM site_permissions WHERE origin = ?1 AND permission = ?2",
+                params![origin, permission],
+            );
+            if let Err(e) = res {
+                tracing::warn!("Failed to clear site permission: {}", e);
+            }
+        }
         DbCommand::FlushWal => {
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         }
@@ -807,7 +890,7 @@ fn run_worker_loop(db_path: PathBuf, mut rx: UnboundedReceiver<DbCommand>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_command, DbCommand, SessionTabSnapshot, StorageManager};
+    use super::{apply_command, DbCommand, SessionTabSnapshot, SitePermission, StorageManager};
     use crate::config::{BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon};
     use crate::events::{DownloadEngine, DownloadInfo, DownloadState};
     use rusqlite::params;
@@ -866,6 +949,7 @@ mod tests {
                 "history",
                 "preferences",
                 "session_tabs",
+                "site_permissions",
                 "workspaces",
             ]
         );
@@ -1443,6 +1527,73 @@ mod tests {
         let loaded = StorageManager::load_downloads(&path).expect("load downloads");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, 1);
+
+        apply_command(&mut conn, DbCommand::FlushWal);
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn site_permissions_upsert_load_and_clear() {
+        let (path, mut conn) = fresh_db("site-permissions");
+        apply_command(
+            &mut conn,
+            DbCommand::SaveSitePermission {
+                origin: "https://example.com".to_string(),
+                permission: "camera".to_string(),
+                allowed: true,
+            },
+        );
+        apply_command(
+            &mut conn,
+            DbCommand::SaveSitePermission {
+                origin: "https://example.com".to_string(),
+                permission: "microphone".to_string(),
+                allowed: false,
+            },
+        );
+
+        let loaded = StorageManager::load_site_permissions(&path).expect("load permissions");
+        assert_eq!(
+            loaded,
+            vec![
+                SitePermission {
+                    origin: "https://example.com".to_string(),
+                    permission: "camera".to_string(),
+                    allowed: true,
+                    updated_at: loaded[0].updated_at,
+                },
+                SitePermission {
+                    origin: "https://example.com".to_string(),
+                    permission: "microphone".to_string(),
+                    allowed: false,
+                    updated_at: loaded[1].updated_at,
+                },
+            ]
+        );
+
+        apply_command(
+            &mut conn,
+            DbCommand::SaveSitePermission {
+                origin: "https://example.com".to_string(),
+                permission: "camera".to_string(),
+                allowed: false,
+            },
+        );
+        let loaded = StorageManager::load_site_permissions(&path).expect("load permissions");
+        assert_eq!(loaded.len(), 2);
+        assert!(!loaded[0].allowed);
+
+        apply_command(
+            &mut conn,
+            DbCommand::ClearSitePermission {
+                origin: "https://example.com".to_string(),
+                permission: "camera".to_string(),
+            },
+        );
+        let loaded = StorageManager::load_site_permissions(&path).expect("load permissions");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].permission, "microphone");
 
         apply_command(&mut conn, DbCommand::FlushWal);
         drop(conn);

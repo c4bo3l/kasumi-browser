@@ -4,7 +4,55 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
-## v0.9.0 — Unreleased
+## v0.10.0 — Unreleased
+
+### Added
+
+- Native WebRTC media-access prompts bridge CEF camera, microphone, and desktop audio/video capture requests into the egui chrome. Allow/Deny decisions resolve each CEF callback exactly once on the main UI thread.
+- Normal-space permission decisions are remembered in SQLite WAL by origin. Incognito requests never reach SQLite; their decisions stay in memory until the private workspace closes.
+- `getDisplayMedia` opens a native Kasumi display/window picker. CoreGraphics enumerates connected displays and on-screen application windows, and the selection is passed to Chromium through legacy mandatory desktop-capture constraints carrying the exact `DesktopMediaID`, so second displays and individual apps can be shared from an Alloy embedded browser.
+- Added the native Kasumi app icon set. The macOS bundle uses `assets/icons/mac/kasumi-browser.icns`, the Windows executable embeds `assets/icons/windows/kasumi-browser.ico`, and Linux-ready PNG/SVG assets are included.
+
+### Changed
+
+- Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.9.0` to `0.10.0`.
+- Condensed `README.md` into a concise overview while keeping build, signing, verification, roadmap, and filter-list instructions.
+- Added `make build-windows`, which cross-compiles with `cargo xwin build --release --target x86_64-pc-windows-msvc`, using a Windows-specific CEF path and local LLVM tools.
+
+### Fixed
+
+- “Close other tabs” now preserves pinned tabs and disables itself when there are no unpinned tabs to close.
+- Camera/microphone grants use the correct CEF callback: embedded browsers stay on Alloy style, Chrome-style permission prompts are mapped from CEF's permission-type bitmask (including camera pan/tilt/zoom), and one Allow/Deny resolves the prompt together with the matching media-access callback so the camera is actually granted.
+- Chrome-runtime permission prompt callbacks now use CEF's guarded `DISMISS` result instead of `ACCEPT`/`DENY`. Chromium's `Accept`/`Deny` paths consume every request callback unconditionally and trapped when Google Meet's prompt outlived its request. Kasumi grants the live WebRTC request through the media-access callback and writes the camera/microphone content settings separately, so future requests are auto-approved without creating another fragile one-shot prompt callback.
+- Pending permission callbacks are dropped during committed navigation, browser close, hibernation, tab close, and shutdown instead of being invoked against torn-down Chromium state. This addresses the bundled macOS force-close after choosing **Use mic and camera** in Google Meet without leaving the camera blocked.
+- `getDisplayMedia` now enables CEF's screen-capture path and uses Kasumi's own native screen/window picker, including a second display or a specific window, instead of falling back to Chromium's first-screen-only `TYPE_SCREEN, -1` source. Chrome style cannot be used with a native parent on macOS, so the picker is implemented in the Rust shell. Standard `getDisplayMedia` drops content-capture device IDs in Chromium 156; the page-facing shim therefore resolves the chosen source with Chromium's legacy `getUserMedia` mandatory desktop-capture constraints.
+- Screen sharing retries video-only when macOS denies system-audio capture. Sites that request display audio now still receive the selected display or window instead of having the entire `getDisplayMedia` promise fail with `NotAllowedError: Permission denied by system`.
+- Meet requests microphone and camera as separate concurrent `getUserMedia` calls. Chromium's capture service rejects video when audio is already starting, which left Meet stuck on **Camera is starting**. Remembered microphone grants now wait 150 ms so a simultaneous camera request can start first, and the renderer shim serializes later audio/video requests. Meet prejoin now receives live microphone and camera tracks.
+- The native display/window picker uses Material Symbols screen and window glyphs instead of emoji, so source rows no longer show missing-glyph boxes.
+- Saved camera/microphone decisions are restored into Chromium's content settings at startup as well as when a new request is auto-resolved. Sites such as Google Meet now see the persisted decision instead of treating the origin as still in the "ask" state.
+- The macOS bundle now carries `NSScreenCaptureUsageDescription` and `NSAudioCaptureUsageDescription` in the main app and every CEF helper app, so Chromium can request screen and system-audio capture from the process macOS holds responsible. It also declares `CFBundleIconName` alongside `CFBundleIconFile` so Finder and the Dock resolve the bundled `.icns` artwork instead of falling back to a generic icon.
+- Documented the macOS TCC difference between `make dev` and the Finder-launched bundle. Terminal may already hold camera, microphone, and screen-recording approval, while `target/bundle/kasumi-browser.app` needs its own **Screen & System Audio Recording**, **Camera**, and **Microphone** approvals before Meet can use them. Quitting and reopening the bundle after granting access is required.
+- `make bundle` now ad-hoc signs the app by default. Unsigned bundles no longer reliably produced Camera/Microphone TCC prompts, so the app could fail with `NotReadableError` despite the usage descriptions. `CODESIGN_IDENTITY` selects a Developer ID Application identity and adds hardened-runtime camera/audio entitlements from `assets/macos/KasumiBrowser.entitlements`. Ad-hoc signatures change on rebuild, so TCC approval must be repeated after replacing a development bundle.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bins` — 211 browser tests plus 4 bundle tests
+- `cargo build --release`
+- Windows `cargo xwin check --target x86_64-pc-windows-msvc` and `make build-windows`
+- `make bundle` with `CFBundleIconName`, `CFBundleIconFile`, and matching source/bundled `.icns` hashes
+- Bundled-app CDP probe on a never-seen HTTP origin showed the native camera/microphone prompt, accepted Allow, and returned live camera and microphone tracks
+- Bundled-app CDP probes on fresh HTTP origins showed the display/window picker, accepted the native screen-recording prompt, and returned live streams for the second display (`screen:1489838273:0`, 3440×1440) and an individual app window (`window:1354:0`, 1720×1440), with matching `deviceId` settings
+- A display-audio request was confirmed to fail at the macOS system-audio layer; the video-only retry returned a live selected-display stream
+- Finder-launched bundle reproduced the TCC screen-recording prompt; all main and helper `Info.plist` files carry screen/audio usage keys, and bundled `getUserMedia` returned live camera/microphone tracks after a clean relaunch
+- Finder-launched Meet room `https://meet.google.com/goo-rkhj-xze` now returns live microphone and FaceTime camera tracks for Meet's concurrent prejoin requests
+- Native display picker source rows render Material Symbols screen/window icons without missing-glyph boxes
+- Ad-hoc signed bundle presented the macOS microphone prompt; after Allow, bundled `getUserMedia({audio:true, video:true})` returned live built-in microphone and FaceTime camera tracks
+
+---
+
+## v0.9.0 — 2026-11-25
 
 ### Added
 

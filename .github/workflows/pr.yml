@@ -55,4 +55,4 @@ jobs:
         run: cargo check --bins
 
       - name: Run unit tests
-        run: cargo test --bin kasumi-browser
+        run: cargo test --bins

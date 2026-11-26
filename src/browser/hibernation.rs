@@ -8,14 +8,15 @@
 
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cef::{
-    CefString, ImplBrowser, ImplBrowserHost, ImplDownloadItemCallback, ImplFrame, ImplUrlrequest,
+    CefString, ContentSettingTypes, ContentSettingValues, ImplBrowser, ImplBrowserHost,
+    ImplDownloadItemCallback, ImplFrame, ImplRequestContext, ImplUrlrequest,
 };
 use crossbeam_channel::{Receiver, Sender};
 use sysinfo::{ProcessesToUpdate, System};
@@ -24,19 +25,21 @@ use crate::browser::favicon::create_favicon_download_callback;
 use crate::browser::parallel_download::{
     self, part_path_for, safe_file_name, DownloadWriter, SegmentRange,
 };
-use crate::browser::{adblocker, client};
+use crate::browser::{adblocker, client, display_capture};
 use crate::config::{
     BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
     PARALLEL_DOWNLOAD_SEGMENTS, RAM_CHECK_INTERVAL, RAM_CRITICAL_PRESSURE_THRESHOLD,
     RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_PRESSURE, TAB_WATCHDOG_TICK_INTERVAL,
 };
 use crate::events::{
-    BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadNotification,
-    DownloadNotificationKind, DownloadState, ParallelDownloadEvent, UiAction,
+    normalize_permission_origin, BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo,
+    DownloadNotification, DownloadNotificationKind, DownloadState, MediaAccessPermissions,
+    MediaPermissionCallback, ParallelDownloadEvent, UiAction,
 };
-use crate::storage::db::{BookmarkItem, SessionTabSnapshot, StorageHandle};
+use crate::storage::db::{BookmarkItem, SessionTabSnapshot, SitePermission, StorageHandle};
 use crate::ui::chrome::{
-    BookmarkInfo, ChromeState, Favicon, TabDisplayState, TabInfo, WorkspaceInfo,
+    BookmarkInfo, ChromeState, DisplayMediaPicker, Favicon, PermissionPrompt, TabDisplayState,
+    TabInfo, WorkspaceInfo,
 };
 use crate::ui::platform_view::{self, ContentRect};
 
@@ -331,6 +334,154 @@ struct ParallelRuntime {
     started_at: u64,
 }
 
+/// One unresolved native media-access prompt. The CEF callback is moved to the
+/// main UI thread and kept here until Allow/Deny/dismiss removes this entry,
+/// which makes every callback callable at most once.
+struct PendingMediaPermission {
+    tab_id: u64,
+    origin: String,
+    permissions: u32,
+    private: bool,
+    callback: MediaPermissionCallback,
+    prompt_id: Option<u64>,
+    /// A remembered audio grant waits briefly so a simultaneous video request
+    /// can start first. Chromium's capture service rejects video when audio is
+    /// already starting, but accepts audio immediately after video.
+    auto_resolve: Option<(Instant, bool)>,
+}
+
+/// Let a camera request overtake a remembered microphone grant from the same
+/// page load. Meet requests audio a few milliseconds before video.
+const AUDIO_AUTO_RESOLVE_DELAY: Duration = Duration::from_millis(150);
+
+impl std::fmt::Debug for PendingMediaPermission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingMediaPermission")
+            .field("tab_id", &self.tab_id)
+            .field("origin", &self.origin)
+            .field("permissions", &self.permissions)
+            .field("private", &self.private)
+            .field("prompt_id", &self.prompt_id)
+            .field("auto_resolve", &self.auto_resolve)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A native display picker awaiting a user choice. The renderer's pending
+/// Promise is resolved by executing JavaScript back in the originating tab.
+#[derive(Debug, Clone)]
+struct PendingDisplayMediaPicker {
+    tab_id: u64,
+    picker: DisplayMediaPicker,
+}
+
+/// Resolve a one-shot CEF callback on the UI thread. MediaAccess callbacks need
+/// the exact requested bitmask; Chrome-runtime prompt callbacks are dismissed
+/// because CEF's Accept/Deny paths unconditionally consume request callbacks.
+/// Content settings are kept in sync separately. Pending entries are removed
+/// before this runs, so CEF never sees the same callback twice.
+fn resolve_permission_callback(callback: MediaPermissionCallback, granted: bool, permissions: u32) {
+    callback.resolve(granted, permissions);
+}
+
+/// Remove a pending item and its queue position atomically. Returning the removed
+/// value is what guarantees a one-shot callback cannot be resolved twice.
+fn take_pending_permission<T>(
+    pending: &mut HashMap<u64, T>,
+    queue: &mut VecDeque<u64>,
+    request_id: u64,
+) -> Option<T> {
+    let value = pending.remove(&request_id)?;
+    queue.retain(|id| *id != request_id);
+    Some(value)
+}
+
+/// A saved decision only auto-resolves when every recognized permission in the
+/// request has the same answer. Mixed rules are shown to the user instead.
+fn remembered_permission_decision(
+    saved: &BTreeMap<(String, String), bool>,
+    origin: &str,
+    permissions: u32,
+) -> Option<bool> {
+    let kinds = MediaAccessPermissions::from_bits(permissions).kinds();
+    let mut decision = None;
+    for kind in kinds {
+        let allowed = *saved.get(&(origin.to_string(), kind.to_string()))?;
+        match decision {
+            None => decision = Some(allowed),
+            Some(previous) if previous != allowed => return None,
+            Some(_) => {}
+        }
+    }
+    decision
+}
+
+/// Record an explicit Allow/Deny decision. Private decisions only touch the
+/// in-memory incognito map; `storage` is deliberately not called for them.
+fn record_media_permission(
+    saved: &mut BTreeMap<(String, String), bool>,
+    private_saved: &mut BTreeMap<(String, String), bool>,
+    storage: Option<&StorageHandle>,
+    origin: &str,
+    permissions: u32,
+    is_private: bool,
+    granted: bool,
+) {
+    let kinds = MediaAccessPermissions::from_bits(permissions).kinds();
+    if kinds.is_empty() || origin.is_empty() {
+        return;
+    }
+    let target = if is_private { private_saved } else { saved };
+    for kind in kinds {
+        target.insert((origin.to_string(), kind.to_string()), granted);
+        if !is_private {
+            if let Some(storage) = storage {
+                storage.save_site_permission(origin.to_string(), kind.to_string(), granted);
+            }
+        }
+    }
+}
+
+/// Keep Chromium's own camera/microphone content settings aligned with the
+/// decision Kasumi just showed. Letting Chromium auto-approve future requests
+/// avoids creating a `PermissionPromptCallback` for them at all, which is the
+/// only safe way to grant a content setting without risking CEF's one-shot
+/// prompt callback path.
+fn sync_media_content_settings(
+    context: Option<&cef::RequestContext>,
+    origin: &str,
+    permissions: u32,
+    granted: bool,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    if origin.is_empty() {
+        return;
+    }
+
+    let value = if granted {
+        ContentSettingValues::ALLOW
+    } else {
+        ContentSettingValues::BLOCK
+    };
+    let requesting_url = CefString::from(origin);
+    for (bit, content_type) in [
+        (
+            MediaAccessPermissions::AUDIO,
+            ContentSettingTypes::MEDIASTREAM_MIC,
+        ),
+        (
+            MediaAccessPermissions::VIDEO,
+            ContentSettingTypes::MEDIASTREAM_CAMERA,
+        ),
+    ] {
+        if MediaAccessPermissions::from_bits(permissions).contains(bit) {
+            context.set_content_setting(Some(&requesting_url), None, content_type, value.clone());
+        }
+    }
+}
+
 pub struct TabManager {
     pub tabs: Vec<Tab>,
     pub active_tab_id: Option<u64>,
@@ -407,6 +558,15 @@ pub struct TabManager {
     // Download ids originating from incognito tabs. They stay in memory even
     // after the source tab closes so late CEF updates cannot reach SQLite.
     private_download_ids: HashSet<u32>,
+
+    // Unresolved WebRTC permission prompts. Both maps and callbacks live only
+    // on the main UI thread; CEF handlers send plain events over crossbeam.
+    pending_media_permissions: HashMap<u64, PendingMediaPermission>,
+    pending_media_permission_queue: VecDeque<u64>,
+    pending_display_media_pickers: HashMap<String, PendingDisplayMediaPicker>,
+    pending_display_media_queue: VecDeque<String>,
+    saved_site_permissions: BTreeMap<(String, String), bool>,
+    private_site_permissions: BTreeMap<(String, String), bool>,
 
     // Number of `host.close_browser(1)` calls awaiting an `on_before_close` event.
     pending_browser_closes: u32,
@@ -548,6 +708,12 @@ impl TabManager {
             private_context: None,
             last_normal_workspace_id: active_workspace_id,
             private_download_ids: HashSet::new(),
+            pending_media_permissions: HashMap::new(),
+            pending_media_permission_queue: VecDeque::new(),
+            pending_display_media_pickers: HashMap::new(),
+            pending_display_media_queue: VecDeque::new(),
+            saved_site_permissions: BTreeMap::new(),
+            private_site_permissions: BTreeMap::new(),
             pending_browser_closes: 0,
             pending_browser_spawns: VecDeque::new(),
             pending_navigation_checks: HashMap::new(),
@@ -586,6 +752,45 @@ impl TabManager {
         }
         downloads.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then(b.id.cmp(&a.id)));
         self.downloads = downloads;
+    }
+
+    /// Seed remembered Allow/Deny answers from SQLite. Normal-space requests
+    /// can then resolve without showing a prompt; Incognito keeps its own
+    /// in-memory map and never reads or writes this cache.
+    pub fn seed_site_permissions(&mut self, permissions: Vec<SitePermission>) {
+        self.saved_site_permissions.clear();
+        let mut content_masks: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+        for permission in permissions {
+            let bit = MediaAccessPermissions::bits_for_kind(&permission.permission);
+            if bit == 0 {
+                continue;
+            }
+            let origin = normalize_permission_origin(&permission.origin);
+            if origin.is_empty() {
+                continue;
+            }
+            // Web apps such as Google Meet inspect Chromium's own
+            // content-setting state before requesting media. Restored decisions
+            // must be visible there too, not only in Kasumi's callback cache.
+            let entry = content_masks.entry(origin.clone()).or_insert((0, 0));
+            if permission.allowed {
+                entry.0 |= bit;
+            } else {
+                entry.1 |= bit;
+            }
+            self.saved_site_permissions
+                .insert((origin, permission.permission), permission.allowed);
+        }
+
+        let global_context = cef::request_context_get_global_context();
+        for (origin, (allowed, blocked)) in content_masks {
+            if allowed != 0 {
+                sync_media_content_settings(global_context.as_ref(), &origin, allowed, true);
+            }
+            if blocked != 0 {
+                sync_media_content_settings(global_context.as_ref(), &origin, blocked, false);
+            }
+        }
     }
 
     /// Copy a download snapshot for shell actions that must not borrow
@@ -763,6 +968,224 @@ impl TabManager {
                 .any(|info| info.id == download_id && self.is_private_tab(info.tab_id))
     }
 
+    fn active_media_permission_request_id(&self) -> Option<u64> {
+        self.pending_media_permission_queue
+            .iter()
+            .find(|id| {
+                self.pending_media_permissions
+                    .get(id)
+                    .is_some_and(|pending| pending.auto_resolve.is_none())
+            })
+            .copied()
+    }
+
+    /// Resolve remembered audio grants whose short delay expired. Called after
+    /// each event drain so a video request can start first.
+    fn resolve_ready_auto_media_permissions(&mut self) {
+        let now = Instant::now();
+        let ready: Vec<(u64, bool)> = self
+            .pending_media_permissions
+            .iter()
+            .filter_map(|(id, pending)| {
+                pending
+                    .auto_resolve
+                    .and_then(|(at, allowed)| (at <= now).then_some((*id, allowed)))
+            })
+            .collect();
+        for (request_id, allowed) in ready {
+            self.resolve_media_permission(request_id, allowed, false);
+        }
+    }
+
+    /// Pending requests from the same tab, origin, and permission mask belong
+    /// to one browser request. CEF can deliver both a Chrome-style content
+    /// prompt and an Alloy media-access callback for the same getUserMedia
+    /// call; one Allow/Deny must resolve both or the camera stays blocked.
+    fn media_permission_group_ids(&self, request_id: u64) -> Vec<u64> {
+        let Some(active) = self.pending_media_permissions.get(&request_id) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<u64> = self
+            .pending_media_permissions
+            .iter()
+            .filter(|(_, pending)| {
+                pending.tab_id == active.tab_id
+                    && pending.origin == active.origin
+                    && pending.permissions == active.permissions
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Resolve one logical prompt exactly once: remove every callback in its
+    /// group first, then call each one-shot callback only if removal succeeded.
+    /// Explicit Allow/Deny are remembered; Escape/click-outside dismisses the
+    /// current request without saving a rule.
+    fn resolve_media_permission(&mut self, request_id: u64, granted: bool, persist: bool) {
+        let ids = self.media_permission_group_ids(request_id);
+        if ids.is_empty() {
+            tracing::warn!("Ignoring stale media permission resolution {request_id}");
+            return;
+        }
+        let pendings: Vec<PendingMediaPermission> = ids
+            .into_iter()
+            .filter_map(|id| {
+                take_pending_permission(
+                    &mut self.pending_media_permissions,
+                    &mut self.pending_media_permission_queue,
+                    id,
+                )
+            })
+            .collect();
+        if pendings.is_empty() {
+            return;
+        }
+
+        let mut permissions = 0;
+        let mut origin = String::new();
+        let mut private = false;
+        let mut tab_id = None;
+        for pending in &pendings {
+            permissions |= pending.permissions;
+            if origin.is_empty() {
+                origin = pending.origin.clone();
+                private = pending.private;
+                tab_id = Some(pending.tab_id);
+            }
+        }
+
+        // Persist before moving the one-shot callbacks out of `pending`.
+        if persist {
+            record_media_permission(
+                &mut self.saved_site_permissions,
+                &mut self.private_site_permissions,
+                self.storage.as_ref(),
+                &origin,
+                permissions,
+                private,
+                granted,
+            );
+        }
+
+        // Incognito decisions stay in memory and never reach the shared CEF
+        // content settings either. For normal tabs, update Chromium's content
+        // settings so the next request for this origin is auto-approved and
+        // never produces another one-shot permission prompt callback.
+        if !private {
+            let context = tab_id.and_then(|id| self.request_context_for_tab(id));
+            sync_media_content_settings(context.as_ref(), &origin, permissions, granted);
+        }
+        tracing::info!(
+            "Resolving {} media callback(s) for tab {} as {}",
+            pendings.len(),
+            request_id,
+            if granted { "allow" } else { "deny" }
+        );
+        // CEF requires getUserMedia callbacks to grant exactly the requested
+        // mask. Unknown future bits are still passed through on explicit Allow;
+        // only persistence is limited to permissions Kasumi can describe.
+        for pending in pendings {
+            resolve_permission_callback(pending.callback, granted, pending.permissions);
+        }
+    }
+
+    /// Drop prompts whose browser is going away. Calling a CEF permission
+    /// callback during navigation or teardown can run against a destroyed
+    /// `PermissionRequestManager` and trap inside Chromium. Since the page is
+    /// already gone, releasing the callback without invoking it is safer; CEF
+    /// disposes the request with its browser.
+    fn discard_media_permissions_for_tab(&mut self, tab_id: u64) {
+        let ids: Vec<u64> = self
+            .pending_media_permissions
+            .iter()
+            .filter(|(_, pending)| pending.tab_id == tab_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let _ = take_pending_permission(
+                &mut self.pending_media_permissions,
+                &mut self.pending_media_permission_queue,
+                id,
+            );
+        }
+        self.discard_display_media_for_tab(tab_id);
+    }
+
+    fn discard_all_media_permissions(&mut self) {
+        let ids: Vec<u64> = self.pending_media_permissions.keys().copied().collect();
+        for id in ids {
+            let _ = take_pending_permission(
+                &mut self.pending_media_permissions,
+                &mut self.pending_media_permission_queue,
+                id,
+            );
+        }
+        self.discard_all_display_media();
+    }
+
+    fn active_display_media_token(&self) -> Option<String> {
+        self.pending_display_media_queue.front().cloned()
+    }
+
+    /// Drop picker state when its page is closing or navigating. No JavaScript is
+    /// sent here: the renderer's pending Promise dies with the frame.
+    fn discard_display_media_for_tab(&mut self, tab_id: u64) {
+        let tokens: Vec<String> = self
+            .pending_display_media_pickers
+            .iter()
+            .filter(|(_, pending)| pending.tab_id == tab_id)
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in tokens {
+            self.pending_display_media_pickers.remove(&token);
+            self.pending_display_media_queue
+                .retain(|value| value != &token);
+        }
+    }
+
+    fn discard_all_display_media(&mut self) {
+        self.pending_display_media_pickers.clear();
+        self.pending_display_media_queue.clear();
+    }
+
+    /// Resolve the renderer's `getDisplayMedia` Promise with the selected
+    /// Chromium `DesktopMediaID`, or reject it when the user cancels.
+    fn resolve_display_media_picker(&mut self, token: String, device_id: Option<String>) {
+        let Some(pending) = self.pending_display_media_pickers.remove(&token) else {
+            tracing::warn!("Ignoring stale display media picker {token}");
+            return;
+        };
+        self.pending_display_media_queue
+            .retain(|value| value != &token);
+
+        let token_json = serde_json::to_string(&token).unwrap_or_else(|_| "\"\"".to_string());
+        let device_json = device_id
+            .as_deref()
+            .and_then(|value| serde_json::to_string(value).ok())
+            .unwrap_or_else(|| "null".to_string());
+        let script = format!(
+            "window.__kasumiResolveDisplayMedia && window.__kasumiResolveDisplayMedia({token_json}, {device_json});"
+        );
+        let resolved = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == pending.tab_id)
+            .and_then(|tab| tab.browser.as_ref())
+            .and_then(|browser| browser.main_frame())
+            .map(|frame| {
+                frame.execute_java_script(Some(&CefString::from(script.as_str())), None, 0);
+            })
+            .is_some();
+        if !resolved {
+            tracing::warn!(
+                "Could not resolve display media picker {token}: tab {} has no live frame",
+                pending.tab_id
+            );
+        }
+    }
+
     /// Single storage boundary for download snapshots. Private downloads are
     /// shown in the native bubble for the session but never reach the WAL.
     fn persist_download(&self, info: DownloadInfo) {
@@ -822,6 +1245,7 @@ impl TabManager {
         self.workspaces
             .retain(|workspace| !Self::is_private_workspace(workspace.id));
         self.private_context = None;
+        self.private_site_permissions.clear();
         if Self::is_private_workspace(self.active_workspace_id) {
             self.active_workspace_id = self.normal_workspace_fallback();
         }
@@ -1703,6 +2127,7 @@ impl TabManager {
 
     /// Close every live browser while preserving tab metadata for session restore.
     pub fn close_all_browsers(&mut self) {
+        self.discard_all_media_permissions();
         for tab in &mut self.tabs {
             if let Some(browser) = tab.browser.take() {
                 if let Some(host) = browser.host() {
@@ -1964,6 +2389,7 @@ impl TabManager {
             self.active_tab_by_workspace.remove(&tab.workspace_id);
         }
         self.pending_navigation_checks.remove(&id);
+        self.discard_media_permissions_for_tab(id);
         self.requested_favicons.retain(|(tab_id, _)| *tab_id != id);
         self.pending_favicon_urls.remove(&id);
         self.resolved_favicons.remove(&id);
@@ -2040,6 +2466,7 @@ impl TabManager {
         }
 
         self.pending_navigation_checks.remove(&id);
+        self.discard_media_permissions_for_tab(id);
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
             tracing::info!("Hibernating tab {} ({})", id, tab.title);
             if let Some(browser) = tab.browser.take() {
@@ -2558,6 +2985,12 @@ impl TabManager {
         let parent_handle = platform_view::ptr_as_cef_handle(self.parent_window_view);
         let mut window_info = cef::WindowInfo::default().set_as_child(parent_handle, &bounds);
         window_info.windowless_rendering_enabled = 0;
+        // Keep the embedded child view on Alloy style. Chrome style is the
+        // CEF 156 default, but its display-capture flow can capture the whole
+        // desktop without offering the screen/window picker. Alloy style is
+        // supported with a client-provided parent view and preserves native
+        // child-window compositing plus CEF's media callbacks.
+        window_info.runtime_style = cef::RuntimeStyle::ALLOY;
 
         #[cfg(target_os = "macos")]
         {
@@ -2705,6 +3138,7 @@ impl TabManager {
         while let Ok(event) = self.event_receiver.try_recv() {
             self.handle_browser_event(event);
         }
+        self.resolve_ready_auto_media_permissions();
     }
 
     /// Consume a Cmd/Ctrl+K request forwarded from the CEF web view.
@@ -2786,6 +3220,138 @@ impl TabManager {
                 }
             }
             BrowserEvent::ParallelDownload(event) => self.handle_parallel_event(event),
+            BrowserEvent::MediaAccessPermissionRequested {
+                request_id,
+                tab_id,
+                origin,
+                permissions,
+                callback,
+                prompt_id,
+            } => {
+                let Some(private) = self
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| Self::is_private_workspace(tab.workspace_id))
+                else {
+                    // A prompt from a browser whose tab metadata is gone must
+                    // never open an orphan dialog. Dropping our callback lets
+                    // CEF dispose the request with its browser; invoking DENY
+                    // here could run against an already torn-down prompt.
+                    drop(callback);
+                    return;
+                };
+                let origin = normalize_permission_origin(&origin);
+                let saved = if private {
+                    &self.private_site_permissions
+                } else {
+                    &self.saved_site_permissions
+                };
+                let requested = MediaAccessPermissions::from_bits(permissions);
+                let auto_decision = if requested.has_unrecognized_bits() {
+                    None
+                } else {
+                    remembered_permission_decision(saved, &origin, permissions)
+                };
+                // A remembered decision resolves the CEF callback directly, but
+                // web apps also inspect Chromium's own content-setting state.
+                // Sync it here so a restart does not leave Google Meet believing
+                // camera/microphone access is still in the "prompt" state.
+                if !private {
+                    if let Some(allowed) = auto_decision {
+                        let context = self.request_context_for_tab(tab_id);
+                        sync_media_content_settings(
+                            context.as_ref(),
+                            &origin,
+                            permissions,
+                            allowed,
+                        );
+                    }
+                }
+                // Meet requests audio a few milliseconds before video. Let a
+                // remembered video grant win that race so Chromium starts the
+                // camera first; audio can then start alongside the live camera.
+                let auto_resolve = (auto_decision == Some(true)
+                    && permissions == MediaAccessPermissions::AUDIO)
+                    .then(|| (Instant::now() + AUDIO_AUTO_RESOLVE_DELAY, true));
+                self.pending_media_permissions.insert(
+                    request_id,
+                    PendingMediaPermission {
+                        tab_id,
+                        origin,
+                        permissions,
+                        private,
+                        callback,
+                        prompt_id,
+                        auto_resolve,
+                    },
+                );
+                self.pending_media_permission_queue.push_back(request_id);
+                if let Some(allowed) = auto_decision {
+                    if auto_resolve.is_none() {
+                        // Resolve the whole group: CEF may have delivered the
+                        // content-setting prompt and media-access callback as
+                        // two events for the same getUserMedia call.
+                        self.resolve_media_permission(request_id, allowed, false);
+                    }
+                }
+            }
+            BrowserEvent::PermissionPromptDismissed { tab_id, prompt_id } => {
+                // CEF has already completed a prompt when it reports dismissal
+                // (either with our result or with IGNORE after a navigation).
+                // Clear the matching Kasumi prompt without calling the callback
+                // a second time.
+                let stale: Vec<u64> = self
+                    .pending_media_permissions
+                    .iter()
+                    .filter(|(_, pending)| {
+                        pending.tab_id == tab_id && pending.prompt_id == Some(prompt_id)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in stale {
+                    if take_pending_permission(
+                        &mut self.pending_media_permissions,
+                        &mut self.pending_media_permission_queue,
+                        id,
+                    )
+                    .is_some()
+                    {
+                        tracing::info!(
+                            "CEF dismissed media permission prompt {prompt_id} for tab {tab_id}"
+                        );
+                    }
+                }
+            }
+            BrowserEvent::DisplayMediaPickerRequested { tab_id, token } => {
+                if self.pending_display_media_pickers.contains_key(&token)
+                    || !self.tabs.iter().any(|tab| tab.id == tab_id)
+                {
+                    return;
+                }
+                let sources = display_capture::available_sources();
+                tracing::info!(
+                    "Display media request from tab {} found {} source(s)",
+                    tab_id,
+                    sources.len()
+                );
+                if sources.is_empty() {
+                    self.resolve_display_media_picker(token, None);
+                    return;
+                }
+                self.pending_display_media_pickers.insert(
+                    token.clone(),
+                    PendingDisplayMediaPicker {
+                        tab_id,
+                        picker: DisplayMediaPicker {
+                            tab_id,
+                            token: token.clone(),
+                            sources,
+                        },
+                    },
+                );
+                self.pending_display_media_queue.push_back(token);
+            }
             BrowserEvent::BrowserCreated { tab_id, browser } => {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
                     tab.browser = Some(browser);
@@ -2837,6 +3403,10 @@ impl TabManager {
                 self.sync_session();
             }
             BrowserEvent::AddressChange { tab_id, url } => {
+                // A committed navigation invalidates any prompt from the page
+                // that was showing before it. Drop the callback here instead of
+                // running it while Chromium is tearing down the prompt.
+                self.discard_media_permissions_for_tab(tab_id);
                 let committed_initial = !is_blank_navigation_url(&url)
                     && self.pending_navigation_checks.remove(&tab_id).is_some();
                 if committed_initial {
@@ -2892,6 +3462,7 @@ impl TabManager {
             }
             BrowserEvent::BrowserClosed { tab_id } => {
                 self.pending_navigation_checks.remove(&tab_id);
+                self.discard_media_permissions_for_tab(tab_id);
                 // CEF browser is gone (user tab close, hibernation, or app shutdown).
                 // Never remove the tab metadata here — only release the handle.
                 tracing::info!(
@@ -3118,7 +3689,9 @@ impl TabManager {
                     .tabs
                     .iter()
                     .rev()
-                    .filter(|tab| tab.workspace_id == workspace_id && tab.id != tab_id)
+                    .filter(|tab| {
+                        tab.workspace_id == workspace_id && tab.id != tab_id && !tab.pinned
+                    })
                     .map(|tab| tab.id)
                     .collect();
                 for id in ids {
@@ -3370,6 +3943,14 @@ impl TabManager {
             UiAction::ApplyPreferences(preferences) => {
                 self.apply_preferences(&preferences);
             }
+            UiAction::ResolveMediaAccessPermission {
+                request_id,
+                granted,
+                persist,
+            } => self.resolve_media_permission(request_id, granted, persist),
+            UiAction::ResolveDisplayMediaPicker { token, device_id } => {
+                self.resolve_display_media_picker(token, device_id);
+            }
             // The winit handler persists the live rail toggle; tab state needs
             // no change for a chrome width update.
             UiAction::SetRailExpanded(_) => {}
@@ -3554,6 +4135,26 @@ impl TabManager {
             state.last_synced_tab_id = None;
             state.last_synced_url.clear();
         }
+
+        state.permission_prompt = match self.active_media_permission_request_id().and_then(|id| {
+            self.pending_media_permissions
+                .get(&id)
+                .map(|pending| (id, pending))
+        }) {
+            Some((request_id, pending)) => Some(PermissionPrompt {
+                request_id,
+                tab_id: pending.tab_id,
+                origin: pending.origin.clone(),
+                permissions: pending.permissions,
+                label: MediaAccessPermissions::from_bits(pending.permissions).label(),
+                private: pending.private,
+            }),
+            None => None,
+        };
+        state.display_media_picker = self
+            .active_display_media_token()
+            .and_then(|token| self.pending_display_media_pickers.get(&token))
+            .map(|pending| pending.picker.clone());
     }
 }
 
@@ -3563,8 +4164,10 @@ mod tests {
         closed_tab_from, fallback_favicon_url, idle_timeout_for_pressure, insertion_index,
         is_blank_navigation_url, is_critical_pressure, needs_initial_navigation,
         next_navigation_retry_delay, normalize_workspace_selection, pinned_insert_index,
-        preferred_favicon_url, ram_pressure, restore_insert_index, should_hibernate_tab,
-        should_sync_omnibox, BrowserSpawnMode, Tab, TabManager, TabState,
+        preferred_favicon_url, ram_pressure, record_media_permission,
+        remembered_permission_decision, restore_insert_index, should_hibernate_tab,
+        should_sync_omnibox, take_pending_permission, BrowserSpawnMode, PendingMediaPermission,
+        Tab, TabManager, TabState,
     };
     use crate::config::{
         BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
@@ -3572,12 +4175,334 @@ mod tests {
     };
     use crate::events::{
         BrowserEvent, DownloadEngine, DownloadInfo, DownloadNotificationKind, DownloadState,
-        UiAction,
+        MediaAccessPermissions, MediaPermissionCallback, TestPermissionCallback, UiAction,
     };
     use crate::storage::db::{BookmarkItem, DbCommand, SessionTabSnapshot, StorageHandle};
     use crate::ui::platform_view::ContentRect;
+    use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc::UnboundedReceiver;
+
+    #[test]
+    fn pending_permission_is_taken_once_and_removed_from_queue() {
+        let mut pending = HashMap::new();
+        pending.insert(9, "callback");
+        let mut queue = VecDeque::from(vec![8, 9, 10]);
+
+        assert_eq!(
+            take_pending_permission(&mut pending, &mut queue, 9),
+            Some("callback")
+        );
+        assert_eq!(queue, VecDeque::from(vec![8, 10]));
+        assert_eq!(take_pending_permission(&mut pending, &mut queue, 9), None);
+    }
+
+    fn permission_test_manager() -> TabManager {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        TabManager::new(
+            tx,
+            rx,
+            std::ptr::null_mut(),
+            ContentRect {
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                scale_factor: 1.0,
+            },
+            None,
+            &BrowserPreferences::default(),
+            vec![Workspace::default_workspace()],
+            vec![],
+        )
+    }
+
+    fn add_permission_test_tab(manager: &mut TabManager, id: u64) {
+        manager.tabs.push(Tab {
+            id,
+            workspace_id: Workspace::DEFAULT_ID,
+            url: "https://meet.example".to_string(),
+            title: "Meet".to_string(),
+            is_loading: false,
+            can_go_back: false,
+            can_go_forward: false,
+            blocked_requests: 0,
+            pinned: false,
+            state: TabState::Active,
+            browser: None,
+            favicon: None,
+        });
+    }
+
+    fn add_pending_permission(
+        manager: &mut TabManager,
+        request_id: u64,
+        tab_id: u64,
+    ) -> TestPermissionCallback {
+        add_pending_permission_with(
+            manager,
+            request_id,
+            tab_id,
+            MediaAccessPermissions::AUDIO | MediaAccessPermissions::VIDEO,
+            None,
+        )
+    }
+
+    fn add_pending_permission_with(
+        manager: &mut TabManager,
+        request_id: u64,
+        tab_id: u64,
+        permissions: u32,
+        prompt_id: Option<u64>,
+    ) -> TestPermissionCallback {
+        let callback = TestPermissionCallback::default();
+        manager.pending_media_permissions.insert(
+            request_id,
+            PendingMediaPermission {
+                tab_id,
+                origin: "https://meet.example".to_string(),
+                permissions,
+                private: false,
+                callback: MediaPermissionCallback::Test(callback.clone()),
+                prompt_id,
+                auto_resolve: None,
+            },
+        );
+        manager.pending_media_permission_queue.push_back(request_id);
+        callback
+    }
+
+    fn assert_permission_discarded(manager: &TabManager, callback: &TestPermissionCallback) {
+        assert_eq!(callback.calls(), 0);
+        assert!(manager.pending_media_permissions.is_empty());
+        assert!(manager.pending_media_permission_queue.is_empty());
+    }
+
+    #[test]
+    fn committed_navigation_discards_permission_callback() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        let callback = add_pending_permission(&mut manager, 10, 1);
+
+        manager.handle_browser_event(BrowserEvent::AddressChange {
+            tab_id: 1,
+            url: "https://meet.example/call".to_string(),
+        });
+
+        assert_permission_discarded(&manager, &callback);
+    }
+
+    #[test]
+    fn browser_closed_discards_permission_callback() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        let callback = add_pending_permission(&mut manager, 11, 1);
+
+        manager.handle_browser_event(BrowserEvent::BrowserClosed { tab_id: 1 });
+
+        assert_permission_discarded(&manager, &callback);
+    }
+
+    #[test]
+    fn hibernation_discards_permission_callback() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        let callback = add_pending_permission(&mut manager, 12, 1);
+
+        manager.hibernate_tab(1);
+
+        assert_permission_discarded(&manager, &callback);
+    }
+
+    #[test]
+    fn shutdown_and_tab_close_discard_permission_callbacks() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        add_permission_test_tab(&mut manager, 2);
+        let first = add_pending_permission(&mut manager, 13, 1);
+        let second = add_pending_permission(&mut manager, 14, 2);
+
+        manager.close_tab(1);
+        assert_eq!(first.calls(), 0);
+        assert!(manager
+            .pending_media_permissions
+            .values()
+            .all(|pending| pending.tab_id != 1));
+
+        manager.close_all_browsers();
+        assert_eq!(second.calls(), 0);
+        assert!(manager.pending_media_permissions.is_empty());
+        assert!(manager.pending_media_permission_queue.is_empty());
+    }
+
+    #[test]
+    fn explicit_permission_resolution_invokes_callback_once() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        let callback = add_pending_permission(&mut manager, 15, 1);
+
+        manager.resolve_media_permission(15, true, true);
+        assert_eq!(
+            callback.granted.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(callback.calls(), 1);
+
+        manager.resolve_media_permission(15, false, true);
+        assert_eq!(callback.calls(), 1);
+        assert!(manager.pending_media_permissions.is_empty());
+    }
+
+    #[test]
+    fn one_decision_resolves_the_matching_permission_group() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        let content_prompt = add_pending_permission_with(
+            &mut manager,
+            16,
+            1,
+            MediaAccessPermissions::AUDIO | MediaAccessPermissions::VIDEO,
+            Some(7),
+        );
+        let media_access = add_pending_permission_with(
+            &mut manager,
+            17,
+            1,
+            MediaAccessPermissions::AUDIO | MediaAccessPermissions::VIDEO,
+            None,
+        );
+        let unrelated =
+            add_pending_permission_with(&mut manager, 18, 1, MediaAccessPermissions::VIDEO, None);
+
+        manager.resolve_media_permission(16, true, true);
+
+        assert_eq!(
+            content_prompt
+                .granted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            media_access
+                .granted
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(unrelated.calls(), 0);
+        assert_eq!(
+            manager.pending_media_permission_queue,
+            VecDeque::from(vec![18])
+        );
+    }
+
+    #[test]
+    fn remembered_audio_waits_for_a_video_request_before_resolving() {
+        let mut manager = permission_test_manager();
+        add_permission_test_tab(&mut manager, 1);
+        let audio =
+            add_pending_permission_with(&mut manager, 19, 1, MediaAccessPermissions::AUDIO, None);
+        manager
+            .pending_media_permissions
+            .get_mut(&19)
+            .expect("audio request")
+            .auto_resolve = Some((Instant::now() + Duration::from_secs(60), true));
+
+        manager.resolve_ready_auto_media_permissions();
+        assert_eq!(audio.calls(), 0);
+        assert_eq!(manager.active_media_permission_request_id(), None);
+
+        manager
+            .pending_media_permissions
+            .get_mut(&19)
+            .expect("audio request")
+            .auto_resolve = Some((Instant::now() - Duration::from_millis(1), true));
+        manager.resolve_ready_auto_media_permissions();
+        assert_eq!(audio.granted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(manager.pending_media_permissions.is_empty());
+    }
+
+    #[test]
+    fn saved_permission_decision_requires_a_uniform_answer() {
+        let mut saved = BTreeMap::new();
+        saved.insert(
+            ("https://example.com".to_string(), "camera".to_string()),
+            true,
+        );
+        saved.insert(
+            ("https://example.com".to_string(), "microphone".to_string()),
+            true,
+        );
+
+        assert_eq!(
+            remembered_permission_decision(&saved, "https://example.com", 3),
+            Some(true)
+        );
+        assert_eq!(
+            remembered_permission_decision(&saved, "https://other.example", 3),
+            None
+        );
+        assert_eq!(
+            remembered_permission_decision(&saved, "https://example.com", 0),
+            None
+        );
+
+        saved.insert(
+            ("https://example.com".to_string(), "microphone".to_string()),
+            false,
+        );
+        assert_eq!(
+            remembered_permission_decision(&saved, "https://example.com", 3),
+            None
+        );
+    }
+
+    #[test]
+    fn incognito_media_permissions_bypass_sqlite() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let storage = StorageHandle::from_sender(tx);
+        let mut saved = BTreeMap::new();
+        let mut private = BTreeMap::new();
+
+        record_media_permission(
+            &mut saved,
+            &mut private,
+            Some(&storage),
+            "https://meet.example",
+            3,
+            true,
+            true,
+        );
+        assert!(saved.is_empty());
+        assert_eq!(private.len(), 2);
+        assert!(rx.try_recv().is_err());
+
+        record_media_permission(
+            &mut saved,
+            &mut private,
+            Some(&storage),
+            "https://meet.example",
+            3,
+            false,
+            true,
+        );
+        assert_eq!(saved.len(), 2);
+        let mut written = Vec::new();
+        for _ in 0..2 {
+            match rx.try_recv().expect("site permission command") {
+                DbCommand::SaveSitePermission {
+                    origin,
+                    permission,
+                    allowed,
+                } => {
+                    assert_eq!(origin, "https://meet.example");
+                    assert!(allowed);
+                    written.push(permission);
+                }
+                other => panic!("unexpected command: {other:?}"),
+            }
+        }
+        assert_eq!(written, vec!["microphone", "camera"]);
+    }
 
     fn test_download_info_with_id(id: u32, state: DownloadState) -> DownloadInfo {
         DownloadInfo {
@@ -3959,6 +4884,29 @@ mod tests {
         assert_eq!(insertion_index(&tabs, 1, Some(99), true), 2);
         assert_eq!(insertion_index(&tabs, 1, None, false), 3);
         assert_eq!(insertion_index(&tabs, 1, Some(0), false), 2);
+    }
+
+    #[test]
+    fn close_other_tabs_never_closes_pinned_tabs() {
+        let (mut manager, mut db_rx, active_id) = test_manager_with_storage();
+        let pinned_id = manager.create_tab(Some("https://pinned.example".to_string()), false);
+        manager.toggle_pin_tab(pinned_id);
+        let other_id = manager.create_tab(Some("https://other.example".to_string()), false);
+        let _ = drain_db_commands(&mut db_rx);
+
+        manager.handle_ui_action(UiAction::CloseOtherTabs { tab_id: active_id });
+
+        let mut remaining: Vec<u64> = manager.tabs.iter().map(|tab| tab.id).collect();
+        remaining.sort_unstable();
+        let mut expected = vec![active_id, pinned_id];
+        expected.sort_unstable();
+        assert_eq!(remaining, expected, "pinned tab must survive close-other");
+        assert!(!remaining.contains(&other_id));
+
+        // A pinned source tab may still close the other unpinned tabs.
+        manager.handle_ui_action(UiAction::CloseOtherTabs { tab_id: pinned_id });
+        let remaining: Vec<u64> = manager.tabs.iter().map(|tab| tab.id).collect();
+        assert_eq!(remaining, vec![pinned_id]);
     }
 
     #[test]

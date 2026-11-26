@@ -1,6 +1,215 @@
 #![allow(dead_code)]
 
 use crate::config::{BrowserPreferences, WorkspaceColor, WorkspaceIcon};
+use cef::{ImplMediaAccessCallback, ImplPermissionPromptCallback};
+
+/// CEF media-access bit values (`cef_media_access_permission_types_t`).
+///
+/// Keeping them here lets the UI and persistence layer describe a WebRTC
+/// request without depending on CEF's generated enum in every module.
+pub const MEDIA_PERMISSION_AUDIO: u32 = 1;
+pub const MEDIA_PERMISSION_VIDEO: u32 = 2;
+pub const MEDIA_PERMISSION_DESKTOP_AUDIO: u32 = 4;
+pub const MEDIA_PERMISSION_DESKTOP_VIDEO: u32 = 8;
+
+/// Console marker used by the renderer shim to request Kasumi's native
+/// screen/window picker before CEF builds a `getDisplayMedia` stream.
+pub const DISPLAY_MEDIA_CONSOLE_PREFIX: &str = "__KASUMI_DISPLAY_MEDIA_REQUEST__:";
+
+/// A CEF media permission bitmask with small helpers shared by the permission
+/// handler, the native prompt, and SQLite persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaAccessPermissions(pub u32);
+
+impl MediaAccessPermissions {
+    pub const AUDIO: u32 = MEDIA_PERMISSION_AUDIO;
+    pub const VIDEO: u32 = MEDIA_PERMISSION_VIDEO;
+    pub const DESKTOP_AUDIO: u32 = MEDIA_PERMISSION_DESKTOP_AUDIO;
+    pub const DESKTOP_VIDEO: u32 = MEDIA_PERMISSION_DESKTOP_VIDEO;
+    const KNOWN_BITS: u32 = Self::AUDIO | Self::VIDEO | Self::DESKTOP_AUDIO | Self::DESKTOP_VIDEO;
+
+    pub fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub fn contains(self, bit: u32) -> bool {
+        self.0 & bit != 0
+    }
+
+    /// Remove CEF bits this browser does not know how to describe or persist.
+    /// Unknown bits are never granted from a saved decision.
+    pub fn recognized_bits(self) -> u32 {
+        self.0 & Self::KNOWN_BITS
+    }
+
+    /// True when a newer CEF milestone requested a bit Kasumi cannot describe.
+    /// Such a request is always shown to the user instead of auto-resolving.
+    pub fn has_unrecognized_bits(self) -> bool {
+        self.0 & !Self::KNOWN_BITS != 0
+    }
+
+    /// Storage keys for every recognized requested permission, in a stable
+    /// order. Unknown bits are deliberately ignored: they cannot be described
+    /// in the prompt and therefore must not be auto-granted from SQLite.
+    pub fn kinds(self) -> Vec<&'static str> {
+        let mut kinds = Vec::new();
+        for (bit, kind) in [
+            (Self::AUDIO, "microphone"),
+            (Self::VIDEO, "camera"),
+            (Self::DESKTOP_AUDIO, "desktop-audio"),
+            (Self::DESKTOP_VIDEO, "desktop-video"),
+        ] {
+            if self.contains(bit) {
+                kinds.push(kind);
+            }
+        }
+        kinds
+    }
+
+    /// Bit value belonging to a persisted permission key.
+    pub fn bits_for_kind(kind: &str) -> u32 {
+        match kind {
+            "microphone" => Self::AUDIO,
+            "camera" => Self::VIDEO,
+            "desktop-audio" => Self::DESKTOP_AUDIO,
+            "desktop-video" => Self::DESKTOP_VIDEO,
+            _ => 0,
+        }
+    }
+
+    /// Human-readable prompt text, for example "microphone and camera".
+    pub fn label(self) -> String {
+        let mut parts = Vec::new();
+        if self.contains(Self::AUDIO) {
+            parts.push("microphone");
+        }
+        if self.contains(Self::VIDEO) {
+            parts.push("camera");
+        }
+        if self.contains(Self::DESKTOP_AUDIO) {
+            parts.push("system audio");
+        }
+        if self.contains(Self::DESKTOP_VIDEO) {
+            parts.push("screen recording");
+        }
+        match parts.len() {
+            0 => "media access".to_string(),
+            1 => parts[0].to_string(),
+            _ => {
+                let last = parts.pop().unwrap_or("");
+                format!("{} and {last}", parts.join(", "))
+            }
+        }
+    }
+}
+
+/// One-shot CEF callback owned by the UI thread until a native prompt resolves.
+///
+/// Chrome-style CEF windows deliver camera/microphone requests through
+/// `on_show_permission_prompt`; Kasumi's Alloy-style embedded tabs use
+/// `on_request_media_access_permission` for all media bits. Both paths feed the
+/// same Kasumi prompt, so the callback variant is kept next to the event.
+#[derive(Clone)]
+pub enum MediaPermissionCallback {
+    MediaAccess(cef::MediaAccessCallback),
+    PermissionPrompt(cef::PermissionPromptCallback),
+    #[cfg(test)]
+    Test(TestPermissionCallback),
+}
+
+/// Test-only callback whose invocations can be counted without loading CEF.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct TestPermissionCallback {
+    pub granted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub denied: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl TestPermissionCallback {
+    pub fn calls(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        self.granted.load(Ordering::SeqCst) + self.denied.load(Ordering::SeqCst)
+    }
+}
+
+/// Result used for Chrome-runtime permission prompts.
+///
+/// CEF's `PermissionPromptCallback` routes ACCEPT/DENY through
+/// `PermissionRequestManager::Accept/Deny`, which unconditionally moves every
+/// request's one-shot callback and traps when a prompt has already been
+/// decided (navigation, preemption, duplicate request, or a content-setting
+/// grant). `DISMISS` uses the guarded cancellation path instead. Kasumi grants
+/// the actual camera/microphone access through `MediaAccessCallback` and keeps
+/// Chromium's content settings in sync separately, so dismissing this prompt
+/// cannot leave WebRTC blocked.
+fn permission_prompt_result_for_decision(_granted: bool) -> cef::PermissionRequestResult {
+    cef::PermissionRequestResult::DISMISS
+}
+
+impl MediaPermissionCallback {
+    /// Resolve a one-shot callback. Callers must remove it from pending state
+    /// before invoking this so CEF never sees the same callback twice.
+    pub fn resolve(self, granted: bool, permissions: u32) {
+        match self {
+            Self::MediaAccess(callback) => {
+                if granted {
+                    callback.cont(permissions);
+                } else {
+                    callback.cancel();
+                }
+            }
+            // Dismiss the prompt wrapper instead of accepting/denying it.
+            // The real WebRTC grant comes from `MediaAccessCallback`, and
+            // `TabManager` updates the request context's content settings so
+            // future requests are auto-approved by Chromium itself.
+            Self::PermissionPrompt(callback) => {
+                callback.cont(permission_prompt_result_for_decision(granted))
+            }
+            #[cfg(test)]
+            Self::Test(callback) => {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                let counter: &AtomicUsize = if granted {
+                    &callback.granted
+                } else {
+                    &callback.denied
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for MediaPermissionCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MediaAccess(_) => f.write_str("MediaAccessCallback"),
+            Self::PermissionPrompt(_) => f.write_str("PermissionPromptCallback"),
+            #[cfg(test)]
+            Self::Test(_) => f.write_str("TestPermissionCallback"),
+        }
+    }
+}
+
+/// Normalize a CEF requesting origin into the key used by `site_permissions`.
+/// CEF may supply either `https://example.com` or `https://example.com/`; both
+/// must resolve to the same saved decision.
+pub fn normalize_permission_origin(origin: &str) -> String {
+    let trimmed = origin.trim();
+    if let Ok(parsed) = url::Url::parse(trimmed) {
+        if matches!(parsed.scheme(), "http" | "https") {
+            let serialized = parsed.origin().ascii_serialization();
+            if serialized != "null" && !serialized.is_empty() {
+                return serialized;
+            }
+        }
+    }
+    trimmed.trim_end_matches('/').to_ascii_lowercase()
+}
 
 /// Which engine owns a download. CEF handles non-HTTP downloads and the brief
 /// path-resolution handshake; Kasumi's native segmented engine owns HTTP(S)
@@ -299,6 +508,31 @@ pub enum BrowserEvent {
     },
     /// Native segmented downloader event. Always consumed on the main UI thread.
     ParallelDownload(ParallelDownloadEvent),
+    /// A page asked for camera/microphone/desktop capture access. The CEF
+    /// callback is retained only on the main UI thread until the native prompt
+    /// is resolved, so the decision can never be made on a Chromium thread.
+    MediaAccessPermissionRequested {
+        request_id: u64,
+        tab_id: u64,
+        origin: String,
+        permissions: u32,
+        callback: MediaPermissionCallback,
+        /// Present for Chrome-runtime `on_show_permission_prompt` requests so
+        /// CEF-initiated dismissals can cancel the matching Kasumi prompt.
+        prompt_id: Option<u64>,
+    },
+    /// CEF dismissed a Chrome-runtime permission prompt before Kasumi resolved
+    /// it. No site rule is saved for this case.
+    PermissionPromptDismissed {
+        tab_id: u64,
+        prompt_id: u64,
+    },
+    /// Renderer shim reported a `getDisplayMedia` call. The main UI thread owns
+    /// the native source picker and later resolves the page promise by token.
+    DisplayMediaPickerRequested {
+        tab_id: u64,
+        token: String,
+    },
 }
 
 /// Native browser shortcuts mirrored from CEF's `on_pre_key_event`.
@@ -417,6 +651,31 @@ impl std::fmt::Debug for BrowserEvent {
                 .field("tab_id", &info.tab_id)
                 .field("state", &info.state)
                 .field("percent_complete", &info.percent_complete)
+                .finish(),
+            Self::MediaAccessPermissionRequested {
+                request_id,
+                tab_id,
+                origin,
+                permissions,
+                callback: _,
+                prompt_id,
+            } => f
+                .debug_struct("MediaAccessPermissionRequested")
+                .field("request_id", request_id)
+                .field("tab_id", tab_id)
+                .field("origin", origin)
+                .field("permissions", permissions)
+                .field("prompt_id", prompt_id)
+                .finish(),
+            Self::PermissionPromptDismissed { tab_id, prompt_id } => f
+                .debug_struct("PermissionPromptDismissed")
+                .field("tab_id", tab_id)
+                .field("prompt_id", prompt_id)
+                .finish(),
+            Self::DisplayMediaPickerRequested { tab_id, token } => f
+                .debug_struct("DisplayMediaPickerRequested")
+                .field("tab_id", tab_id)
+                .field("token", token)
                 .finish(),
             Self::ParallelDownload(event) => {
                 f.debug_tuple("ParallelDownload").field(event).finish()
@@ -564,11 +823,29 @@ pub enum UiAction {
     SetRailExpanded(bool),
     /// Apply preferences changed in the native Settings overlay.
     ApplyPreferences(BrowserPreferences),
+    /// Resolve a native media-access prompt. `TabManager` owns the one-shot CEF
+    /// callback; this action carries only its request id so UI state stays Clone.
+    /// `persist` is false for Escape/click-outside dismissal so a transient
+    /// dismissal never becomes a permanent site rule.
+    ResolveMediaAccessPermission {
+        request_id: u64,
+        granted: bool,
+        persist: bool,
+    },
+    /// Resolve the native source picker. `device_id` is a Chromium
+    /// `DesktopMediaID`; `None` rejects the pending `getDisplayMedia` promise.
+    ResolveDisplayMediaPicker {
+        token: String,
+        device_id: Option<String>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DownloadEngine, DownloadInfo, DownloadState};
+    use super::{
+        normalize_permission_origin, permission_prompt_result_for_decision, DownloadEngine,
+        DownloadInfo, DownloadState, MediaAccessPermissions,
+    };
 
     fn info(state: DownloadState) -> DownloadInfo {
         DownloadInfo {
@@ -622,5 +899,58 @@ mod tests {
         assert!(info(DownloadState::Completed).is_finished());
         assert!(info(DownloadState::Canceled).is_finished());
         assert!(info(DownloadState::Interrupted).is_finished());
+    }
+
+    #[test]
+    fn media_permission_labels_and_storage_keys_match_cef_bits() {
+        assert_eq!(MediaAccessPermissions::AUDIO, 1);
+        assert_eq!(MediaAccessPermissions::VIDEO, 2);
+        assert_eq!(MediaAccessPermissions::DESKTOP_AUDIO, 4);
+        assert_eq!(MediaAccessPermissions::DESKTOP_VIDEO, 8);
+
+        let combined = MediaAccessPermissions::from_bits(3);
+        assert_eq!(combined.label(), "microphone and camera");
+        assert_eq!(combined.kinds(), vec!["microphone", "camera"]);
+        assert_eq!(
+            MediaAccessPermissions::from_bits(MediaAccessPermissions::DESKTOP_VIDEO).label(),
+            "screen recording"
+        );
+        assert_eq!(MediaAccessPermissions::bits_for_kind("camera"), 2);
+        assert_eq!(MediaAccessPermissions::bits_for_kind("unknown"), 0);
+        assert!(MediaAccessPermissions::from_bits(0).kinds().is_empty());
+        assert!(!combined.has_unrecognized_bits());
+        assert!(MediaAccessPermissions::from_bits(1 << 12).has_unrecognized_bits());
+        assert_eq!(
+            MediaAccessPermissions::from_bits(1 << 12).recognized_bits(),
+            0
+        );
+    }
+
+    #[test]
+    fn permission_prompt_callback_is_always_dismissed() {
+        // Accept/Deny run Chromium's unconditional callback path and have
+        // already trapped on a consumed one-shot callback. Dismiss is the only
+        // guarded result; real media access is granted separately.
+        assert_eq!(
+            permission_prompt_result_for_decision(true),
+            cef::PermissionRequestResult::DISMISS
+        );
+        assert_eq!(
+            permission_prompt_result_for_decision(false),
+            cef::PermissionRequestResult::DISMISS
+        );
+    }
+
+    #[test]
+    fn permission_origins_normalize_to_a_stable_key() {
+        assert_eq!(
+            normalize_permission_origin("https://Example.com/meeting/"),
+            "https://example.com"
+        );
+        assert_eq!(
+            normalize_permission_origin("https://example.com"),
+            "https://example.com"
+        );
+        assert_eq!(normalize_permission_origin("  "), "");
     }
 }

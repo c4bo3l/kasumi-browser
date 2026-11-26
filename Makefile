@@ -1,4 +1,9 @@
-.PHONY: dev dev-release watch check test fmt lint build release bundle clean help
+.PHONY: dev dev-release watch check test fmt lint build release build-windows bundle clean help
+
+# Windows cross-compilation needs LLVM's clang-cl/lld-link/llvm-lib and a CEF
+# distribution for Windows, not the macOS one configured in .cargo/config.toml.
+LLVM_BIN ?= $(shell command -v llvm-lib >/dev/null 2>&1 && dirname "$$(command -v llvm-lib)" || echo /opt/local/libexec/llvm-22/bin)
+WINDOWS_CEF_PATH ?= $(CURDIR)/.cef/cef_windows_x86_64
 
 # Default target: same as `npm run dev`
 dev:
@@ -14,7 +19,7 @@ check:
 	cargo check --bins
 
 test:
-	cargo test --bin kasumi-browser
+	cargo test --bins
 
 fmt:
 	cargo fmt --all
@@ -22,12 +27,17 @@ fmt:
 lint:
 	cargo fmt --all -- --check
 	cargo check --bins
-	cargo test --bin kasumi-browser
+	cargo test --bins
 
 build: check test
 
 release:
 	cargo build --release
+
+build-windows:
+	PATH="$(LLVM_BIN):$$PATH" \
+		CEF_PATH="$(WINDOWS_CEF_PATH)" \
+		cargo xwin build --release --target x86_64-pc-windows-msvc
 
 bundle:
 	cargo run --release --bin bundle
@@ -47,5 +57,6 @@ help:
 	@echo "  make lint         Verify formatting, check, and test"
 	@echo "  make build        Run checks and tests"
 	@echo "  make release      Optimized release build"
+	@echo "  make build-windows  Cross-compile a Windows app with cargo-xwin"
 	@echo "  make bundle       Build the macOS .app bundle"
 	@echo "  make clean        Remove build artifacts and CEF cache"
