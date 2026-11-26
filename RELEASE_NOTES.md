@@ -21,8 +21,9 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 ### Fixed
 
 - “Close other tabs” now preserves pinned tabs and disables itself when there are no unpinned tabs to close.
-- Camera/microphone grants use the correct CEF callback: embedded browsers stay on Alloy style, Chrome-style permission prompts are mapped from CEF's permission-type bitmask (including camera pan/tilt/zoom), and one Allow/Deny resolves the content-setting prompt together with the matching media-access callback so the camera is actually granted.
-- Pending permission callbacks are dropped during committed navigation, browser close, hibernation, tab close, and shutdown instead of being invoked against torn-down Chromium state. Live prompts still receive Chromium's real ACCEPT/DENY result. This addresses the bundled macOS force-close after choosing **Use mic and camera** in Google Meet without leaving the camera blocked.
+- Camera/microphone grants use the correct CEF callback: embedded browsers stay on Alloy style, Chrome-style permission prompts are mapped from CEF's permission-type bitmask (including camera pan/tilt/zoom), and one Allow/Deny resolves the prompt together with the matching media-access callback so the camera is actually granted.
+- Chrome-runtime permission prompt callbacks now use CEF's guarded `DISMISS` result instead of `ACCEPT`/`DENY`. Chromium's `Accept`/`Deny` paths consume every request callback unconditionally and trapped when Google Meet's prompt outlived its request. Kasumi grants the live WebRTC request through the media-access callback and writes the camera/microphone content settings separately, so future requests are auto-approved without creating another fragile one-shot prompt callback.
+- Pending permission callbacks are dropped during committed navigation, browser close, hibernation, tab close, and shutdown instead of being invoked against torn-down Chromium state. This addresses the bundled macOS force-close after choosing **Use mic and camera** in Google Meet without leaving the camera blocked.
 - `getDisplayMedia` now enables CEF's screen-capture path and uses the native screen/window picker, including a second display or a specific window, instead of being denied by the browser shell.
 - The macOS bundle now carries `NSScreenCaptureUsageDescription` and `NSAudioCaptureUsageDescription`, so Chromium can request screen and system-audio capture from the app bundle.
 
@@ -30,7 +31,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 - `cargo fmt --all -- --check`
 - `cargo check --bins`
-- `cargo test --bins` — 205 browser tests plus 3 bundle tests
+- `cargo test --bins` — 206 browser tests plus 3 bundle tests
 - `cargo build --release`
 - `make build-windows`
 

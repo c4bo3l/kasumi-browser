@@ -133,6 +133,20 @@ impl TestPermissionCallback {
     }
 }
 
+/// Result used for Chrome-runtime permission prompts.
+///
+/// CEF's `PermissionPromptCallback` routes ACCEPT/DENY through
+/// `PermissionRequestManager::Accept/Deny`, which unconditionally moves every
+/// request's one-shot callback and traps when a prompt has already been
+/// decided (navigation, preemption, duplicate request, or a content-setting
+/// grant). `DISMISS` uses the guarded cancellation path instead. Kasumi grants
+/// the actual camera/microphone access through `MediaAccessCallback` and keeps
+/// Chromium's content settings in sync separately, so dismissing this prompt
+/// cannot leave WebRTC blocked.
+fn permission_prompt_result_for_decision(_granted: bool) -> cef::PermissionRequestResult {
+    cef::PermissionRequestResult::DISMISS
+}
+
 impl MediaPermissionCallback {
     /// Resolve a one-shot callback. Callers must remove it from pending state
     /// before invoking this so CEF never sees the same callback twice.
@@ -145,15 +159,13 @@ impl MediaPermissionCallback {
                     callback.cancel();
                 }
             }
-            // Chrome-style prompts need the real content-setting grant. The
-            // caller removes the pending entry before resolving, and teardown
-            // paths discard callbacks instead of invoking them, so this only
-            // runs while CEF's prompt is still alive.
-            Self::PermissionPrompt(callback) => callback.cont(if granted {
-                cef::PermissionRequestResult::ACCEPT
-            } else {
-                cef::PermissionRequestResult::DENY
-            }),
+            // Dismiss the prompt wrapper instead of accepting/denying it.
+            // The real WebRTC grant comes from `MediaAccessCallback`, and
+            // `TabManager` updates the request context's content settings so
+            // future requests are auto-approved by Chromium itself.
+            Self::PermissionPrompt(callback) => {
+                callback.cont(permission_prompt_result_for_decision(granted))
+            }
             #[cfg(test)]
             Self::Test(callback) => {
                 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -810,8 +822,8 @@ pub enum UiAction {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_permission_origin, DownloadEngine, DownloadInfo, DownloadState,
-        MediaAccessPermissions,
+        normalize_permission_origin, permission_prompt_result_for_decision, DownloadEngine,
+        DownloadInfo, DownloadState, MediaAccessPermissions,
     };
 
     fn info(state: DownloadState) -> DownloadInfo {
@@ -890,6 +902,21 @@ mod tests {
         assert_eq!(
             MediaAccessPermissions::from_bits(1 << 12).recognized_bits(),
             0
+        );
+    }
+
+    #[test]
+    fn permission_prompt_callback_is_always_dismissed() {
+        // Accept/Deny run Chromium's unconditional callback path and have
+        // already trapped on a consumed one-shot callback. Dismiss is the only
+        // guarded result; real media access is granted separately.
+        assert_eq!(
+            permission_prompt_result_for_decision(true),
+            cef::PermissionRequestResult::DISMISS
+        );
+        assert_eq!(
+            permission_prompt_result_for_decision(false),
+            cef::PermissionRequestResult::DISMISS
         );
     }
 

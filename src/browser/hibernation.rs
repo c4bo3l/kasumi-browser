@@ -15,7 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cef::{
-    CefString, ImplBrowser, ImplBrowserHost, ImplDownloadItemCallback, ImplFrame, ImplUrlrequest,
+    CefString, ContentSettingTypes, ContentSettingValues, ImplBrowser, ImplBrowserHost,
+    ImplDownloadItemCallback, ImplFrame, ImplRequestContext, ImplUrlrequest,
 };
 use crossbeam_channel::{Receiver, Sender};
 use sysinfo::{ProcessesToUpdate, System};
@@ -357,9 +358,10 @@ impl std::fmt::Debug for PendingMediaPermission {
 }
 
 /// Resolve a one-shot CEF callback on the UI thread. MediaAccess callbacks need
-/// the exact requested bitmask; Chrome-runtime prompt callbacks grant or deny
-/// the content setting. Pending entries are removed before this runs, so CEF
-/// never sees the same callback twice.
+/// the exact requested bitmask; Chrome-runtime prompt callbacks are dismissed
+/// because CEF's Accept/Deny paths unconditionally consume request callbacks.
+/// Content settings are kept in sync separately. Pending entries are removed
+/// before this runs, so CEF never sees the same callback twice.
 fn resolve_permission_callback(callback: MediaPermissionCallback, granted: bool, permissions: u32) {
     callback.resolve(granted, permissions);
 }
@@ -418,6 +420,46 @@ fn record_media_permission(
             if let Some(storage) = storage {
                 storage.save_site_permission(origin.to_string(), kind.to_string(), granted);
             }
+        }
+    }
+}
+
+/// Keep Chromium's own camera/microphone content settings aligned with the
+/// decision Kasumi just showed. Letting Chromium auto-approve future requests
+/// avoids creating a `PermissionPromptCallback` for them at all, which is the
+/// only safe way to grant a content setting without risking CEF's one-shot
+/// prompt callback path.
+fn sync_media_content_settings(
+    context: Option<&cef::RequestContext>,
+    origin: &str,
+    permissions: u32,
+    granted: bool,
+) {
+    let Some(context) = context else {
+        return;
+    };
+    if origin.is_empty() {
+        return;
+    }
+
+    let value = if granted {
+        ContentSettingValues::ALLOW
+    } else {
+        ContentSettingValues::BLOCK
+    };
+    let requesting_url = CefString::from(origin);
+    for (bit, content_type) in [
+        (
+            MediaAccessPermissions::AUDIO,
+            ContentSettingTypes::MEDIASTREAM_MIC,
+        ),
+        (
+            MediaAccessPermissions::VIDEO,
+            ContentSettingTypes::MEDIASTREAM_CAMERA,
+        ),
+    ] {
+        if MediaAccessPermissions::from_bits(permissions).contains(bit) {
+            context.set_content_setting(Some(&requesting_url), None, content_type, value.clone());
         }
     }
 }
@@ -934,18 +976,21 @@ impl TabManager {
             return;
         }
 
+        let mut permissions = 0;
+        let mut origin = String::new();
+        let mut private = false;
+        let mut tab_id = None;
+        for pending in &pendings {
+            permissions |= pending.permissions;
+            if origin.is_empty() {
+                origin = pending.origin.clone();
+                private = pending.private;
+                tab_id = Some(pending.tab_id);
+            }
+        }
+
         // Persist before moving the one-shot callbacks out of `pending`.
         if persist {
-            let mut permissions = 0;
-            let mut origin = String::new();
-            let mut private = false;
-            for pending in &pendings {
-                permissions |= pending.permissions;
-                if origin.is_empty() {
-                    origin = pending.origin.clone();
-                    private = pending.private;
-                }
-            }
             record_media_permission(
                 &mut self.saved_site_permissions,
                 &mut self.private_site_permissions,
@@ -955,6 +1000,15 @@ impl TabManager {
                 private,
                 granted,
             );
+        }
+
+        // Incognito decisions stay in memory and never reach the shared CEF
+        // content settings either. For normal tabs, update Chromium's content
+        // settings so the next request for this origin is auto-approved and
+        // never produces another one-shot permission prompt callback.
+        if !private {
+            let context = tab_id.and_then(|id| self.request_context_for_tab(id));
+            sync_media_content_settings(context.as_ref(), &origin, permissions, granted);
         }
         tracing::info!(
             "Resolving {} media callback(s) for tab {} as {}",
