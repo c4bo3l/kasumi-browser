@@ -164,7 +164,7 @@ Windows and Linux native child-view, tooltip, download, bookmark, and media-perm
 
 ## Roadmap
 
-Current focus: WebRTC calls. Next: native print support, browser import, cross-platform verification, auto-update, PiP, local AI, and extension support. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for completed work.
+Current focus: WebRTC calls. Next: website notifications (Notification API permission prompts, native notification display, and click-through), native print support, browser import, cross-platform verification, auto-update, PiP, local AI, and extension support. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for completed work.
 
 ## Adblock filter lists
 
