@@ -32,6 +32,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 - Saved camera/microphone decisions are restored into Chromium's content settings at startup as well as when a new request is auto-resolved. Sites such as Google Meet now see the persisted decision instead of treating the origin as still in the "ask" state.
 - The macOS bundle now carries `NSScreenCaptureUsageDescription` and `NSAudioCaptureUsageDescription` in the main app and every CEF helper app, so Chromium can request screen and system-audio capture from the process macOS holds responsible. It also declares `CFBundleIconName` alongside `CFBundleIconFile` so Finder and the Dock resolve the bundled `.icns` artwork instead of falling back to a generic icon.
 - Documented the macOS TCC difference between `make dev` and the Finder-launched bundle. Terminal may already hold camera, microphone, and screen-recording approval, while `target/bundle/kasumi-browser.app` needs its own **Screen & System Audio Recording**, **Camera**, and **Microphone** approvals before Meet can use them. Quitting and reopening the bundle after granting access is required.
+- `make bundle` now ad-hoc signs the app by default. Unsigned bundles no longer reliably produced Camera/Microphone TCC prompts, so the app could fail with `NotReadableError` despite the usage descriptions. `CODESIGN_IDENTITY` selects a Developer ID Application identity and adds hardened-runtime camera/audio entitlements from `assets/macos/KasumiBrowser.entitlements`. Ad-hoc signatures change on rebuild, so TCC approval must be repeated after replacing a development bundle.
 
 ### Verification
 
@@ -47,6 +48,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 - Finder-launched bundle reproduced the TCC screen-recording prompt; all main and helper `Info.plist` files carry screen/audio usage keys, and bundled `getUserMedia` returned live camera/microphone tracks after a clean relaunch
 - Finder-launched Meet room `https://meet.google.com/goo-rkhj-xze` now returns live microphone and FaceTime camera tracks for Meet's concurrent prejoin requests
 - Native display picker source rows render Material Symbols screen/window icons without missing-glyph boxes
+- Ad-hoc signed bundle presented the macOS microphone prompt; after Allow, bundled `getUserMedia({audio:true, video:true})` returned live built-in microphone and FaceTime camera tracks
 
 ---
 

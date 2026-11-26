@@ -124,6 +124,14 @@ open target/bundle/kasumi-browser.app
 
 Sign after building and bundling. Never commit certificates or credentials.
 
+`make bundle` ad-hoc signs the generated app by default so macOS reliably shows Camera, Microphone, and Screen Recording TCC prompts during local testing. Ad-hoc signatures change on every rebuild, so re-grant permissions after replacing the bundle. For a stable release identity, set `CODESIGN_IDENTITY`:
+
+```bash
+CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" make bundle
+```
+
+That path uses hardened runtime, a secure timestamp, and `assets/macos/KasumiBrowser.entitlements` for camera/microphone access.
+
 **macOS:** install a Developer ID Application certificate and store notarization credentials with `xcrun notarytool store-credentials`. Sign nested CEF helpers/frameworks first, then the outer app, then notarize and staple:
 
 ```bash

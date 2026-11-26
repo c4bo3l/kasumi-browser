@@ -61,6 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        sign_bundle(&bundle_path)?;
+
         println!(
             "Successfully generated application bundle: {}",
             bundle_path.display()
@@ -90,6 +92,52 @@ fn add_capture_usage_keys(contents: &str) -> String {
         "NSAudioCaptureUsageDescription",
         "Kasumi Browser needs system audio access so web apps can share computer audio when you choose to present.",
     )
+}
+
+/// Sign the generated app. Ad-hoc signing is the development default because
+/// macOS will not reliably present Camera/Microphone TCC prompts for an
+/// unsigned bundle. Set `CODESIGN_IDENTITY` to a Developer ID Application
+/// identity for release signing; the camera/audio entitlements are added for
+/// hardened-runtime builds.
+#[cfg(target_os = "macos")]
+fn sign_bundle(bundle_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let identity = std::env::var("CODESIGN_IDENTITY")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let signer = identity.as_deref().unwrap_or("-");
+
+    let mut command = std::process::Command::new("codesign");
+    command
+        .arg("--force")
+        .arg("--deep")
+        .arg("--sign")
+        .arg(signer);
+
+    if identity.is_some() {
+        command.arg("--options").arg("runtime");
+        command.arg("--timestamp");
+        let entitlements = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/macos/KasumiBrowser.entitlements");
+        if entitlements.is_file() {
+            command.arg("--entitlements").arg(entitlements);
+        }
+    }
+
+    command.arg(bundle_path);
+    println!(
+        "Signing {} as {}...",
+        bundle_path.display(),
+        if identity.is_some() { signer } else { "ad-hoc" }
+    );
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "codesign failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Add a string-valued Info.plist key unless it is already present.
