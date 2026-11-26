@@ -28,19 +28,21 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 - `getDisplayMedia` now enables CEF's screen-capture path and uses Kasumi's own native screen/window picker, including a second display or a specific window, instead of falling back to Chromium's first-screen-only `TYPE_SCREEN, -1` source. Chrome style cannot be used with a native parent on macOS, so the picker is implemented in the Rust shell. Standard `getDisplayMedia` drops content-capture device IDs in Chromium 156; the page-facing shim therefore resolves the chosen source with Chromium's legacy `getUserMedia` mandatory desktop-capture constraints.
 - Screen sharing retries video-only when macOS denies system-audio capture. Sites that request display audio now still receive the selected display or window instead of having the entire `getDisplayMedia` promise fail with `NotAllowedError: Permission denied by system`.
 - Saved camera/microphone decisions are restored into Chromium's content settings at startup as well as when a new request is auto-resolved. Sites such as Google Meet now see the persisted decision instead of treating the origin as still in the "ask" state.
-- The macOS bundle now carries `NSScreenCaptureUsageDescription` and `NSAudioCaptureUsageDescription`, so Chromium can request screen and system-audio capture from the app bundle. It also declares `CFBundleIconName` alongside `CFBundleIconFile` so Finder and the Dock resolve the bundled `.icns` artwork instead of falling back to a generic icon.
+- The macOS bundle now carries `NSScreenCaptureUsageDescription` and `NSAudioCaptureUsageDescription` in the main app and every CEF helper app, so Chromium can request screen and system-audio capture from the process macOS holds responsible. It also declares `CFBundleIconName` alongside `CFBundleIconFile` so Finder and the Dock resolve the bundled `.icns` artwork instead of falling back to a generic icon.
+- Documented the macOS TCC difference between `make dev` and the Finder-launched bundle. Terminal may already hold camera, microphone, and screen-recording approval, while `target/bundle/kasumi-browser.app` needs its own **Screen & System Audio Recording**, **Camera**, and **Microphone** approvals before Meet can use them. Quitting and reopening the bundle after granting access is required.
 
 ### Verification
 
 - `cargo fmt --all -- --check`
 - `cargo check --bins`
-- `cargo test --bins` — 209 browser tests plus 3 bundle tests
+- `cargo test --bins` — 209 browser tests plus 4 bundle tests
 - `cargo build --release`
 - Windows `cargo xwin check --target x86_64-pc-windows-msvc` and `make build-windows`
 - `make bundle` with `CFBundleIconName`, `CFBundleIconFile`, and matching source/bundled `.icns` hashes
 - Bundled-app CDP probe on a never-seen HTTP origin showed the native camera/microphone prompt, accepted Allow, and returned live camera and microphone tracks
 - Bundled-app CDP probes on fresh HTTP origins showed the display/window picker, accepted the native screen-recording prompt, and returned live streams for the second display (`screen:1489838273:0`, 3440×1440) and an individual app window (`window:1354:0`, 1720×1440), with matching `deviceId` settings
 - A display-audio request was confirmed to fail at the macOS system-audio layer; the video-only retry returned a live selected-display stream
+- Finder-launched bundle reproduced the TCC screen-recording prompt; all main and helper `Info.plist` files carry screen/audio usage keys, and bundled `getUserMedia` returned live camera/microphone tracks after a clean relaunch
 
 ---
 

@@ -34,21 +34,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // or system audio even after the native Kasumi prompt is allowed.
         let info_plist = bundle_path.join("Contents/Info.plist");
         let contents = std::fs::read_to_string(&info_plist)?;
-        let contents = insert_plist_string_key(
-            &contents,
-            "NSScreenCaptureUsageDescription",
-            "Kasumi Browser needs screen recording access so web apps can share a screen, window, or tab when you choose to present.",
-        );
-        let contents = insert_plist_string_key(
-            &contents,
-            "NSAudioCaptureUsageDescription",
-            "Kasumi Browser needs system audio access so web apps can share computer audio when you choose to present.",
-        );
+        let contents = add_capture_usage_keys(&contents);
         // CEF's helper writes `CFBundleIconFile`, but macOS also consults
         // `CFBundleIconName` when resolving the Dock/Finder icon. Declaring both
         // keeps unsigned development bundles from falling back to a generic icon.
         let contents = insert_plist_string_key(&contents, "CFBundleIconName", "kasumi-browser");
         std::fs::write(&info_plist, contents)?;
+
+        // Chromium runs capture work in helper apps. macOS may attribute a TCC
+        // check to the helper's bundle rather than the main app, so every helper
+        // needs the same screen/audio usage descriptions or the request can be
+        // denied without a useful prompt.
+        let frameworks = bundle_path.join("Contents/Frameworks");
+        if let Ok(entries) = std::fs::read_dir(frameworks) {
+            for entry in entries.flatten() {
+                let helper = entry.path();
+                if helper.extension().and_then(|ext| ext.to_str()) != Some("app") {
+                    continue;
+                }
+                let helper_plist = helper.join("Contents/Info.plist");
+                if !helper_plist.is_file() {
+                    continue;
+                }
+                let contents = std::fs::read_to_string(&helper_plist)?;
+                std::fs::write(&helper_plist, add_capture_usage_keys(&contents))?;
+            }
+        }
 
         println!(
             "Successfully generated application bundle: {}",
@@ -62,6 +73,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Add the screen and system-audio usage descriptions required by Chromium's
+/// macOS capture path. CEF only generates camera/microphone keys, and macOS may
+/// attribute the TCC check to the main app or any helper app.
+#[cfg(target_os = "macos")]
+fn add_capture_usage_keys(contents: &str) -> String {
+    let contents = insert_plist_string_key(
+        contents,
+        "NSScreenCaptureUsageDescription",
+        "Kasumi Browser needs screen recording access so web apps can share a screen, window, or tab when you choose to present.",
+    );
+    insert_plist_string_key(
+        &contents,
+        "NSAudioCaptureUsageDescription",
+        "Kasumi Browser needs system audio access so web apps can share computer audio when you choose to present.",
+    )
 }
 
 /// Add a string-valued Info.plist key unless it is already present.
@@ -109,7 +137,17 @@ fn xml_escape(value: &str) -> String {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{insert_plist_string_key, xml_escape};
+    use super::{add_capture_usage_keys, insert_plist_string_key, xml_escape};
+
+    #[test]
+    fn adds_screen_and_audio_capture_keys_for_helpers() {
+        let plist =
+            "<dict>\n\t<key>NSCameraUsageDescription</key>\n\t<string>Camera</string>\n</dict>";
+        let updated = add_capture_usage_keys(plist);
+        assert!(updated.contains("<key>NSScreenCaptureUsageDescription</key>"));
+        assert!(updated.contains("<key>NSAudioCaptureUsageDescription</key>"));
+        assert!(updated.contains("<key>NSCameraUsageDescription</key>"));
+    }
 
     #[test]
     fn adds_missing_usage_description_before_the_plist_dictionary_closes() {

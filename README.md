@@ -111,6 +111,13 @@ open target/release/KasumiBrowser.app
 
 For WebRTC tests on macOS, launch the bundled app rather than the bare `target/release/kasumi-browser` binary from a terminal. macOS attributes TCC camera, microphone, screen, and system-audio permissions to the responsible app bundle; running the bare binary can make macOS prompt the terminal or IDE instead. Kasumi's Allow/Deny prompt records the origin decision, releases the CEF media request, and syncs Chromium's own camera/microphone content settings. `getDisplayMedia` opens Kasumi's native source picker because CEF Alloy cannot present Chrome's screen picker inside an embedded native child view on macOS. The chosen display or window is resolved through Chromium's legacy mandatory desktop-capture constraints, which carry the exact `DesktopMediaID` into CEF's media request. If macOS denies system-audio capture, Kasumi retries the share video-only so the selected display or window still works.
 
+**Bundled app vs `make dev`:** `make dev` runs under Terminal, which may already have camera, microphone, and screen-recording approval. The Finder-launched bundle is a separate macOS app and needs its own approvals. If the bundle cannot use the camera/microphone or share the screen, open **System Settings → Privacy & Security → Screen & System Audio Recording**, **Camera**, and **Microphone**, enable **KasumiBrowser**, then quit and reopen `target/bundle/kasumi-browser.app`. While the screen-recording approval dialog is pending, camera/microphone capture can fail; finish the approval and restart the app before testing Meet again. If the screen-recording request was previously denied, reset the bundle entry and relaunch to get a fresh prompt:
+
+```bash
+tccutil reset ScreenCapture com.kasumi.browser
+open target/bundle/kasumi-browser.app
+```
+
 ---
 
 ## Release signing
