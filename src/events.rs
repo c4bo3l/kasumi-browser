@@ -12,6 +12,10 @@ pub const MEDIA_PERMISSION_VIDEO: u32 = 2;
 pub const MEDIA_PERMISSION_DESKTOP_AUDIO: u32 = 4;
 pub const MEDIA_PERMISSION_DESKTOP_VIDEO: u32 = 8;
 
+/// Console marker used by the renderer shim to request Kasumi's native
+/// screen/window picker before CEF builds a `getDisplayMedia` stream.
+pub const DISPLAY_MEDIA_CONSOLE_PREFIX: &str = "__KASUMI_DISPLAY_MEDIA_REQUEST__:";
+
 /// A CEF media permission bitmask with small helpers shared by the permission
 /// handler, the native prompt, and SQLite persistence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -523,6 +527,12 @@ pub enum BrowserEvent {
         tab_id: u64,
         prompt_id: u64,
     },
+    /// Renderer shim reported a `getDisplayMedia` call. The main UI thread owns
+    /// the native source picker and later resolves the page promise by token.
+    DisplayMediaPickerRequested {
+        tab_id: u64,
+        token: String,
+    },
 }
 
 /// Native browser shortcuts mirrored from CEF's `on_pre_key_event`.
@@ -661,6 +671,11 @@ impl std::fmt::Debug for BrowserEvent {
                 .debug_struct("PermissionPromptDismissed")
                 .field("tab_id", tab_id)
                 .field("prompt_id", prompt_id)
+                .finish(),
+            Self::DisplayMediaPickerRequested { tab_id, token } => f
+                .debug_struct("DisplayMediaPickerRequested")
+                .field("tab_id", tab_id)
+                .field("token", token)
                 .finish(),
             Self::ParallelDownload(event) => {
                 f.debug_tuple("ParallelDownload").field(event).finish()
@@ -816,6 +831,12 @@ pub enum UiAction {
         request_id: u64,
         granted: bool,
         persist: bool,
+    },
+    /// Resolve the native source picker. `device_id` is a Chromium
+    /// `DesktopMediaID`; `None` rejects the pending `getDisplayMedia` promise.
+    ResolveDisplayMediaPicker {
+        token: String,
+        device_id: Option<String>,
     },
 }
 

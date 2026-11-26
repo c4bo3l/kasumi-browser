@@ -1,6 +1,6 @@
 use crate::events::{
     BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadState,
-    MediaAccessPermissions, MediaPermissionCallback,
+    MediaAccessPermissions, MediaPermissionCallback, DISPLAY_MEDIA_CONSOLE_PREFIX,
 };
 use cef::*;
 use crossbeam_channel::Sender;
@@ -326,6 +326,38 @@ wrap_load_handler! {
                 can_go_forward: can_go_forward != 0,
             });
         }
+
+        fn on_load_end(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _http_status_code: i32,
+        ) {
+            let Some(frame) = frame else {
+                return;
+            };
+            if frame.is_main() == 0 {
+                return;
+            }
+            let url = CefStringUtf16::from(&frame.url()).to_string();
+            if !(url.starts_with("http://")
+                || url.starts_with("https://")
+                || url.starts_with("file://"))
+            {
+                return;
+            }
+            // Install the display-source shim on the browser's UI thread after
+            // the document is ready. Doing this from a renderer context hook
+            // made CEF's initial navigation fail and could re-enter V8 when
+            // DevTools attached.
+            frame.execute_java_script(
+                Some(&CefString::from(
+                    crate::browser::display_capture::RENDERER_SHIM,
+                )),
+                None,
+                0,
+            );
+        }
     }
 }
 
@@ -391,6 +423,33 @@ wrap_display_handler! {
                 tab_id: self.tab_id,
                 progress,
             });
+        }
+
+        fn on_console_message(
+            &self,
+            _browser: Option<&mut Browser>,
+            _level: LogSeverity,
+            message: Option<&CefString>,
+            _source: Option<&CefString>,
+            _line: i32,
+        ) -> i32 {
+            let Some(message) = message else {
+                return 0;
+            };
+            let message = message.to_string();
+            let Some(token) = message.strip_prefix(DISPLAY_MEDIA_CONSOLE_PREFIX) else {
+                return 0;
+            };
+            let token = token.trim().to_string();
+            if token.is_empty() {
+                return 0;
+            }
+            let _ = self.event_sender.send(BrowserEvent::DisplayMediaPickerRequested {
+                tab_id: self.tab_id,
+                token,
+            });
+            // This is an internal control message, not useful page logging.
+            1
         }
     }
 }

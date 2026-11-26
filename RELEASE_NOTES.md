@@ -10,6 +10,7 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 - Native WebRTC media-access prompts bridge CEF camera, microphone, and desktop audio/video capture requests into the egui chrome. Allow/Deny decisions resolve each CEF callback exactly once on the main UI thread.
 - Normal-space permission decisions are remembered in SQLite WAL by origin. Incognito requests never reach SQLite; their decisions stay in memory until the private workspace closes.
+- `getDisplayMedia` opens a native Kasumi display/window picker. CoreGraphics enumerates connected displays and on-screen application windows, and the selection is passed to Chromium through legacy mandatory desktop-capture constraints carrying the exact `DesktopMediaID`, so second displays and individual apps can be shared from an Alloy embedded browser.
 - Added the native Kasumi app icon set. The macOS bundle uses `assets/icons/mac/kasumi-browser.icns`, the Windows executable embeds `assets/icons/windows/kasumi-browser.ico`, and Linux-ready PNG/SVG assets are included.
 
 ### Changed
@@ -24,16 +25,20 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 - Camera/microphone grants use the correct CEF callback: embedded browsers stay on Alloy style, Chrome-style permission prompts are mapped from CEF's permission-type bitmask (including camera pan/tilt/zoom), and one Allow/Deny resolves the prompt together with the matching media-access callback so the camera is actually granted.
 - Chrome-runtime permission prompt callbacks now use CEF's guarded `DISMISS` result instead of `ACCEPT`/`DENY`. Chromium's `Accept`/`Deny` paths consume every request callback unconditionally and trapped when Google Meet's prompt outlived its request. Kasumi grants the live WebRTC request through the media-access callback and writes the camera/microphone content settings separately, so future requests are auto-approved without creating another fragile one-shot prompt callback.
 - Pending permission callbacks are dropped during committed navigation, browser close, hibernation, tab close, and shutdown instead of being invoked against torn-down Chromium state. This addresses the bundled macOS force-close after choosing **Use mic and camera** in Google Meet without leaving the camera blocked.
-- `getDisplayMedia` now enables CEF's screen-capture path and uses the native screen/window picker, including a second display or a specific window, instead of being denied by the browser shell.
-- The macOS bundle now carries `NSScreenCaptureUsageDescription` and `NSAudioCaptureUsageDescription`, so Chromium can request screen and system-audio capture from the app bundle.
+- `getDisplayMedia` now enables CEF's screen-capture path and uses Kasumi's own native screen/window picker, including a second display or a specific window, instead of falling back to Chromium's first-screen-only `TYPE_SCREEN, -1` source. Chrome style cannot be used with a native parent on macOS, so the picker is implemented in the Rust shell. Standard `getDisplayMedia` drops content-capture device IDs in Chromium 156; the page-facing shim therefore resolves the chosen source with Chromium's legacy `getUserMedia` mandatory desktop-capture constraints.
+- Saved camera/microphone decisions are restored into Chromium's content settings at startup as well as when a new request is auto-resolved. Sites such as Google Meet now see the persisted decision instead of treating the origin as still in the "ask" state.
+- The macOS bundle now carries `NSScreenCaptureUsageDescription` and `NSAudioCaptureUsageDescription`, so Chromium can request screen and system-audio capture from the app bundle. It also declares `CFBundleIconName` alongside `CFBundleIconFile` so Finder and the Dock resolve the bundled `.icns` artwork instead of falling back to a generic icon.
 
 ### Verification
 
 - `cargo fmt --all -- --check`
 - `cargo check --bins`
-- `cargo test --bins` — 206 browser tests plus 3 bundle tests
+- `cargo test --bins` — 208 browser tests plus 3 bundle tests
 - `cargo build --release`
-- `make build-windows`
+- Windows `cargo xwin check --target x86_64-pc-windows-msvc` and `make build-windows`
+- `make bundle` with `CFBundleIconName`, `CFBundleIconFile`, and matching source/bundled `.icns` hashes
+- Bundled-app CDP probe returned live `getUserMedia({audio:true, video:true})` camera and microphone tracks
+- Bundled-app CDP probes returned live `getDisplayMedia` streams for the second display (`screen:1489838273:0`, 3440×1440) and an individual app window (`window:1354:0`, 1720×1440), with matching `deviceId` settings
 
 ---
 

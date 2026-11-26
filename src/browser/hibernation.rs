@@ -25,7 +25,7 @@ use crate::browser::favicon::create_favicon_download_callback;
 use crate::browser::parallel_download::{
     self, part_path_for, safe_file_name, DownloadWriter, SegmentRange,
 };
-use crate::browser::{adblocker, client};
+use crate::browser::{adblocker, client, display_capture};
 use crate::config::{
     BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
     PARALLEL_DOWNLOAD_SEGMENTS, RAM_CHECK_INTERVAL, RAM_CRITICAL_PRESSURE_THRESHOLD,
@@ -38,7 +38,8 @@ use crate::events::{
 };
 use crate::storage::db::{BookmarkItem, SessionTabSnapshot, SitePermission, StorageHandle};
 use crate::ui::chrome::{
-    BookmarkInfo, ChromeState, Favicon, PermissionPrompt, TabDisplayState, TabInfo, WorkspaceInfo,
+    BookmarkInfo, ChromeState, DisplayMediaPicker, Favicon, PermissionPrompt, TabDisplayState,
+    TabInfo, WorkspaceInfo,
 };
 use crate::ui::platform_view::{self, ContentRect};
 
@@ -357,6 +358,14 @@ impl std::fmt::Debug for PendingMediaPermission {
     }
 }
 
+/// A native display picker awaiting a user choice. The renderer's pending
+/// Promise is resolved by executing JavaScript back in the originating tab.
+#[derive(Debug, Clone)]
+struct PendingDisplayMediaPicker {
+    tab_id: u64,
+    picker: DisplayMediaPicker,
+}
+
 /// Resolve a one-shot CEF callback on the UI thread. MediaAccess callbacks need
 /// the exact requested bitmask; Chrome-runtime prompt callbacks are dismissed
 /// because CEF's Accept/Deny paths unconditionally consume request callbacks.
@@ -545,6 +554,8 @@ pub struct TabManager {
     // on the main UI thread; CEF handlers send plain events over crossbeam.
     pending_media_permissions: HashMap<u64, PendingMediaPermission>,
     pending_media_permission_queue: VecDeque<u64>,
+    pending_display_media_pickers: HashMap<String, PendingDisplayMediaPicker>,
+    pending_display_media_queue: VecDeque<String>,
     saved_site_permissions: BTreeMap<(String, String), bool>,
     private_site_permissions: BTreeMap<(String, String), bool>,
 
@@ -690,6 +701,8 @@ impl TabManager {
             private_download_ids: HashSet::new(),
             pending_media_permissions: HashMap::new(),
             pending_media_permission_queue: VecDeque::new(),
+            pending_display_media_pickers: HashMap::new(),
+            pending_display_media_queue: VecDeque::new(),
             saved_site_permissions: BTreeMap::new(),
             private_site_permissions: BTreeMap::new(),
             pending_browser_closes: 0,
@@ -737,6 +750,7 @@ impl TabManager {
     /// in-memory map and never reads or writes this cache.
     pub fn seed_site_permissions(&mut self, permissions: Vec<SitePermission>) {
         self.saved_site_permissions.clear();
+        let mut content_masks: BTreeMap<String, (u32, u32)> = BTreeMap::new();
         for permission in permissions {
             let bit = MediaAccessPermissions::bits_for_kind(&permission.permission);
             if bit == 0 {
@@ -746,8 +760,27 @@ impl TabManager {
             if origin.is_empty() {
                 continue;
             }
+            // Web apps such as Google Meet inspect Chromium's own
+            // content-setting state before requesting media. Restored decisions
+            // must be visible there too, not only in Kasumi's callback cache.
+            let entry = content_masks.entry(origin.clone()).or_insert((0, 0));
+            if permission.allowed {
+                entry.0 |= bit;
+            } else {
+                entry.1 |= bit;
+            }
             self.saved_site_permissions
                 .insert((origin, permission.permission), permission.allowed);
+        }
+
+        let global_context = cef::request_context_get_global_context();
+        for (origin, (allowed, blocked)) in content_masks {
+            if allowed != 0 {
+                sync_media_content_settings(global_context.as_ref(), &origin, allowed, true);
+            }
+            if blocked != 0 {
+                sync_media_content_settings(global_context.as_ref(), &origin, blocked, false);
+            }
         }
     }
 
@@ -1043,6 +1076,7 @@ impl TabManager {
                 id,
             );
         }
+        self.discard_display_media_for_tab(tab_id);
     }
 
     fn discard_all_media_permissions(&mut self) {
@@ -1052,6 +1086,68 @@ impl TabManager {
                 &mut self.pending_media_permissions,
                 &mut self.pending_media_permission_queue,
                 id,
+            );
+        }
+        self.discard_all_display_media();
+    }
+
+    fn active_display_media_token(&self) -> Option<String> {
+        self.pending_display_media_queue.front().cloned()
+    }
+
+    /// Drop picker state when its page is closing or navigating. No JavaScript is
+    /// sent here: the renderer's pending Promise dies with the frame.
+    fn discard_display_media_for_tab(&mut self, tab_id: u64) {
+        let tokens: Vec<String> = self
+            .pending_display_media_pickers
+            .iter()
+            .filter(|(_, pending)| pending.tab_id == tab_id)
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in tokens {
+            self.pending_display_media_pickers.remove(&token);
+            self.pending_display_media_queue
+                .retain(|value| value != &token);
+        }
+    }
+
+    fn discard_all_display_media(&mut self) {
+        self.pending_display_media_pickers.clear();
+        self.pending_display_media_queue.clear();
+    }
+
+    /// Resolve the renderer's `getDisplayMedia` Promise with the selected
+    /// Chromium `DesktopMediaID`, or reject it when the user cancels.
+    fn resolve_display_media_picker(&mut self, token: String, device_id: Option<String>) {
+        let Some(pending) = self.pending_display_media_pickers.remove(&token) else {
+            tracing::warn!("Ignoring stale display media picker {token}");
+            return;
+        };
+        self.pending_display_media_queue
+            .retain(|value| value != &token);
+
+        let token_json = serde_json::to_string(&token).unwrap_or_else(|_| "\"\"".to_string());
+        let device_json = device_id
+            .as_deref()
+            .and_then(|value| serde_json::to_string(value).ok())
+            .unwrap_or_else(|| "null".to_string());
+        let script = format!(
+            "window.__kasumiResolveDisplayMedia && window.__kasumiResolveDisplayMedia({token_json}, {device_json});"
+        );
+        let resolved = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == pending.tab_id)
+            .and_then(|tab| tab.browser.as_ref())
+            .and_then(|browser| browser.main_frame())
+            .map(|frame| {
+                frame.execute_java_script(Some(&CefString::from(script.as_str())), None, 0);
+            })
+            .is_some();
+        if !resolved {
+            tracing::warn!(
+                "Could not resolve display media picker {token}: tab {} has no live frame",
+                pending.tab_id
             );
         }
     }
@@ -3122,6 +3218,21 @@ impl TabManager {
                 } else {
                     remembered_permission_decision(saved, &origin, permissions)
                 };
+                // A remembered decision resolves the CEF callback directly, but
+                // web apps also inspect Chromium's own content-setting state.
+                // Sync it here so a restart does not leave Google Meet believing
+                // camera/microphone access is still in the "prompt" state.
+                if !private {
+                    if let Some(allowed) = auto_decision {
+                        let context = self.request_context_for_tab(tab_id);
+                        sync_media_content_settings(
+                            context.as_ref(),
+                            &origin,
+                            permissions,
+                            allowed,
+                        );
+                    }
+                }
                 self.pending_media_permissions.insert(
                     request_id,
                     PendingMediaPermission {
@@ -3167,6 +3278,35 @@ impl TabManager {
                         );
                     }
                 }
+            }
+            BrowserEvent::DisplayMediaPickerRequested { tab_id, token } => {
+                if self.pending_display_media_pickers.contains_key(&token)
+                    || !self.tabs.iter().any(|tab| tab.id == tab_id)
+                {
+                    return;
+                }
+                let sources = display_capture::available_sources();
+                tracing::info!(
+                    "Display media request from tab {} found {} source(s)",
+                    tab_id,
+                    sources.len()
+                );
+                if sources.is_empty() {
+                    self.resolve_display_media_picker(token, None);
+                    return;
+                }
+                self.pending_display_media_pickers.insert(
+                    token.clone(),
+                    PendingDisplayMediaPicker {
+                        tab_id,
+                        picker: DisplayMediaPicker {
+                            tab_id,
+                            token: token.clone(),
+                            sources,
+                        },
+                    },
+                );
+                self.pending_display_media_queue.push_back(token);
             }
             BrowserEvent::BrowserCreated { tab_id, browser } => {
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
@@ -3764,6 +3904,9 @@ impl TabManager {
                 granted,
                 persist,
             } => self.resolve_media_permission(request_id, granted, persist),
+            UiAction::ResolveDisplayMediaPicker { token, device_id } => {
+                self.resolve_display_media_picker(token, device_id);
+            }
             // The winit handler persists the live rail toggle; tab state needs
             // no change for a chrome width update.
             UiAction::SetRailExpanded(_) => {}
@@ -3964,6 +4107,10 @@ impl TabManager {
             }),
             None => None,
         };
+        state.display_media_picker = self
+            .active_display_media_token()
+            .and_then(|token| self.pending_display_media_pickers.get(&token))
+            .map(|pending| pending.picker.clone());
     }
 }
 

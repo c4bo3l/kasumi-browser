@@ -495,6 +495,9 @@ const DOWNLOADS_BOTTOM_MARGIN: f32 = 18.0;
 const DOWNLOADS_RAIL_GAP: f32 = 12.0;
 const PERMISSION_PROMPT_WIDTH: f32 = 420.0;
 const PERMISSION_PROMPT_TOP_OFFSET: f32 = 72.0;
+const DISPLAY_PICKER_WIDTH: f32 = 540.0;
+const DISPLAY_PICKER_TOP_OFFSET: f32 = 64.0;
+const DISPLAY_PICKER_MAX_HEIGHT: f32 = 560.0;
 
 /// Prefer egui's recommended non-sRGB surface formats. Some drivers only list
 /// `Bgra8UnormSrgb` first, which makes `egui_wgpu` warn about linear sRGB
@@ -712,6 +715,22 @@ pub struct PermissionPrompt {
     pub private: bool,
 }
 
+/// One display or window Kasumi can pass to Chromium's `getDisplayMedia`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayMediaSource {
+    pub device_id: String,
+    pub label: String,
+    pub is_window: bool,
+}
+
+/// Native source picker mirrored from `TabManager` into the overlay renderer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayMediaPicker {
+    pub tab_id: u64,
+    pub token: String,
+    pub sources: Vec<DisplayMediaSource>,
+}
+
 /// Commands offered by the rail tab context menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RailMenuAction {
@@ -817,6 +836,10 @@ pub struct ChromeState {
     pub downloads_open: bool,
     /// Highest-priority modal: a CEF WebRTC permission request awaiting a reply.
     pub permission_prompt: Option<PermissionPrompt>,
+    /// Native display/window picker for a `getDisplayMedia` request.
+    pub display_media_picker: Option<DisplayMediaPicker>,
+    /// Highlighted row in the display picker.
+    pub display_media_selection: usize,
     /// True when at least one closed tab can be restored with Cmd/Ctrl+Z.
     pub can_reopen_tab: bool,
     /// Current OS light/dark appearance. The user preference may override it.
@@ -887,6 +910,8 @@ impl Default for ChromeState {
             menu_selection: 0,
             downloads_open: false,
             permission_prompt: None,
+            display_media_picker: None,
+            display_media_selection: 0,
             can_reopen_tab: false,
             system_theme: ChromeTheme::default(),
             theme: ChromeTheme::default(),
@@ -1002,6 +1027,7 @@ impl ChromeState {
     /// True when the shared overlay must capture pointer/keyboard input.
     pub fn has_modal_overlay(&self) -> bool {
         self.permission_prompt.is_some()
+            || self.display_media_picker.is_some()
             || self.command_palette_open
             || self.menu.is_some()
             || self.settings_open
@@ -1124,6 +1150,16 @@ impl ChromeState {
                 request_id: prompt.request_id,
                 granted: false,
                 persist: false,
+            });
+        }
+    }
+
+    /// Reject a display-source request without persisting anything.
+    pub fn dismiss_display_media_picker(&self, actions: &mut Vec<UiAction>) {
+        if let Some(picker) = self.display_media_picker.as_ref() {
+            actions.push(UiAction::ResolveDisplayMediaPicker {
+                token: picker.token.clone(),
+                device_id: None,
             });
         }
     }
@@ -2661,6 +2697,153 @@ impl ChromeRenderer {
             )
         }) {
             state.dismiss_permission_prompt(actions);
+        }
+    }
+
+    /// Draw Kasumi's native display/window picker for `getDisplayMedia`.
+    pub fn build_display_media_picker(
+        ctx: &egui::Context,
+        state: &mut ChromeState,
+        actions: &mut Vec<UiAction>,
+    ) {
+        let Some(picker) = state.display_media_picker.clone() else {
+            return;
+        };
+        let token = picker.token.clone();
+
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            state.dismiss_display_media_picker(actions);
+            return;
+        }
+        if picker.sources.is_empty() {
+            state.dismiss_display_media_picker(actions);
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+            state.display_media_selection =
+                (state.display_media_selection + 1).min(picker.sources.len() - 1);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+            state.display_media_selection = state.display_media_selection.saturating_sub(1);
+        }
+        let selected = state.display_media_selection.min(picker.sources.len() - 1);
+        state.display_media_selection = selected;
+
+        let palette = state.palette();
+        let screen = ctx.viewport_rect();
+        let width = DISPLAY_PICKER_WIDTH.min((screen.width() - 24.0).max(280.0));
+        let x = (screen.width() - width) / 2.0;
+        let y = DISPLAY_PICKER_TOP_OFFSET.min((screen.height() - 180.0).max(4.0));
+        let max_height = DISPLAY_PICKER_MAX_HEIGHT.min((screen.height() - y - 16.0).max(200.0));
+
+        egui::Area::new(egui::Id::new("display_picker_scrim"))
+            .order(Order::Foreground)
+            .fixed_pos(screen.min)
+            .movable(false)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, CornerRadius::ZERO, palette.scrim);
+            });
+
+        let mut card_rect = egui::Rect::from_min_size(pos2(x, y), vec2(width, 0.0));
+        let mut share_clicked = false;
+        let mut cancel_clicked = false;
+        egui::Area::new(egui::Id::new("display_picker"))
+            .order(Order::Foreground)
+            .fixed_pos(pos2(x, y))
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                card_rect = Frame::NONE
+                    .fill(palette.palette_bg)
+                    .stroke(Stroke::new(1.0_f32, palette.palette_border))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(16, 14))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Choose what to share")
+                                .size(15.0)
+                                .color(palette.text_strong),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Kasumi sends the selected display or window to the site.",
+                            )
+                            .size(10.0)
+                            .color(palette.palette_subtext),
+                        );
+                        ui.add_space(10.0);
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .max_height(max_height - 132.0)
+                            .show(ui, |ui| {
+                                for (index, source) in picker.sources.iter().enumerate() {
+                                    let icon = if source.is_window { "🪟" } else { "🖥" };
+                                    let response = ui.selectable_label(
+                                        index == selected,
+                                        format!("{icon}  {}", source.label),
+                                    );
+                                    if response.clicked() {
+                                        state.display_media_selection = index;
+                                    }
+                                    if response.double_clicked() {
+                                        share_clicked = true;
+                                        state.display_media_selection = index;
+                                    }
+                                }
+                            });
+                        ui.separator();
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    share_clicked |= material_button(
+                                        ui,
+                                        RailIcon::Check,
+                                        "Share",
+                                        MaterialButtonStyle::Filled,
+                                        &palette,
+                                        true,
+                                    )
+                                    .clicked();
+                                    cancel_clicked = material_button(
+                                        ui,
+                                        RailIcon::Close,
+                                        "Cancel",
+                                        MaterialButtonStyle::Tonal,
+                                        &palette,
+                                        true,
+                                    )
+                                    .clicked();
+                                },
+                            );
+                        });
+                    })
+                    .response
+                    .rect
+                    .expand(8.0);
+            });
+
+        if cancel_clicked {
+            actions.push(UiAction::ResolveDisplayMediaPicker {
+                token,
+                device_id: None,
+            });
+        } else if share_clicked || ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            actions.push(UiAction::ResolveDisplayMediaPicker {
+                token,
+                device_id: Some(picker.sources[selected].device_id.clone()),
+            });
+        } else if ctx.input(|i| {
+            command_palette_click_outside(
+                card_rect,
+                i.pointer.latest_pos(),
+                i.pointer.primary_clicked(),
+            )
+        }) {
+            state.dismiss_display_media_picker(actions);
         }
     }
 
@@ -5046,29 +5229,30 @@ impl ChromeOverlayRenderer {
         // context menu, command palette, and downloads bubble. A toast paints
         // only when no modal surface is active.
         let permission_open = state.permission_prompt.is_some();
-        let settings_open = state.settings_open && !permission_open;
-        let bookmark_manager_open =
-            state.bookmark_manager_open && !settings_open && !permission_open;
+        let display_picker_open = state.display_media_picker.is_some() && !permission_open;
+        let modal_open = permission_open || display_picker_open;
+        let settings_open = state.settings_open && !modal_open;
+        let bookmark_manager_open = state.bookmark_manager_open && !settings_open && !modal_open;
         let menu_open =
-            state.menu.is_some() && !settings_open && !bookmark_manager_open && !permission_open;
+            state.menu.is_some() && !settings_open && !bookmark_manager_open && !modal_open;
         let palette_open = state.command_palette_open
             && !menu_open
             && !settings_open
             && !bookmark_manager_open
-            && !permission_open;
+            && !modal_open;
         let downloads_open = state.downloads_open
             && !palette_open
             && !menu_open
             && !settings_open
             && !bookmark_manager_open
-            && !permission_open;
+            && !modal_open;
         let toast_open = state.toast.is_some()
             && !settings_open
             && !bookmark_manager_open
             && !menu_open
             && !palette_open
             && !downloads_open
-            && !permission_open;
+            && !modal_open;
         let focus_before = state.command_palette_focus_requested && palette_open;
         let select_all_before = state.command_palette_select_all_requested && palette_open;
         state.apply_visuals(&self.egui_ctx);
@@ -5093,6 +5277,8 @@ impl ChromeOverlayRenderer {
             let ctx = ui.ctx().clone();
             if permission_open {
                 ChromeRenderer::build_permission_prompt(&ctx, state, &mut actions);
+            } else if display_picker_open {
+                ChromeRenderer::build_display_media_picker(&ctx, state, &mut actions);
             } else if settings_open {
                 ChromeRenderer::build_settings(&ctx, state, &mut actions);
             } else if bookmark_manager_open {

@@ -44,6 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "NSAudioCaptureUsageDescription",
             "Kasumi Browser needs system audio access so web apps can share computer audio when you choose to present.",
         );
+        // CEF's helper writes `CFBundleIconFile`, but macOS also consults
+        // `CFBundleIconName` when resolving the Dock/Finder icon. Declaring both
+        // keeps unsigned development bundles from falling back to a generic icon.
+        let contents = insert_plist_string_key(&contents, "CFBundleIconName", "kasumi-browser");
         std::fs::write(&info_plist, contents)?;
 
         println!(

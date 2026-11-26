@@ -22,7 +22,7 @@ Current version: **0.10.0**. Version bumps land in release PRs and become offici
 - Collapsible vertical workspace rail (208 px expanded / 44 px icon rail), pinned tabs, tab context menu, and per-workspace tab state.
 - Floating `Cmd/Ctrl+K` command palette for tab search, URL/search resolution, and native actions.
 - Native Workspaces, Incognito mode, Settings, downloads bubble, bookmark manager, tab menu, tooltips, and system notifications.
-- Native WebRTC media-access prompts for camera, microphone, and desktop audio/video capture, with remembered decisions for normal spaces. `getDisplayMedia` uses CEF's native screen/window picker after access is approved.
+- Native WebRTC media-access prompts for camera, microphone, and desktop audio/video capture, with remembered decisions for normal spaces. `getDisplayMedia` opens Kasumi's own display/window picker and passes the selected source to Chromium.
 - 24 DIP bottom HUDs for Command/DevTools and blocked-request/RAM status.
 - SQLite-backed history, bookmarks, downloads, pinned tabs, workspaces, preferences, and low-RAM session restore.
 - Chromium DevTools in a separate window; `F12`, rail button, tab menu, and command palette all open it.
@@ -107,9 +107,9 @@ bundle-cef-app \
 open target/release/KasumiBrowser.app
 ```
 
-`cargo run --release --bin bundle` is the in-repo alternative; it writes `target/bundle/kasumi-browser.app`, includes the app icon from `assets/icons/mac/kasumi-browser.icns`, and adds camera, microphone, screen-recording, and system-audio usage descriptions to `Info.plist`.
+`cargo run --release --bin bundle` is the in-repo alternative; it writes `target/bundle/kasumi-browser.app`, includes the app icon from `assets/icons/mac/kasumi-browser.icns`, sets both `CFBundleIconFile` and `CFBundleIconName`, and adds camera, microphone, screen-recording, and system-audio usage descriptions to `Info.plist`.
 
-For WebRTC tests on macOS, launch the bundled app rather than the bare `target/release/kasumi-browser` binary from a terminal. macOS attributes TCC camera, microphone, screen, and system-audio permissions to the responsible app bundle; running the bare binary can make macOS prompt the terminal or IDE instead. Kasumi's Allow/Deny prompt records the origin decision and releases the CEF media request; Chromium's own picker still handles the final screen, window, or tab choice.
+For WebRTC tests on macOS, launch the bundled app rather than the bare `target/release/kasumi-browser` binary from a terminal. macOS attributes TCC camera, microphone, screen, and system-audio permissions to the responsible app bundle; running the bare binary can make macOS prompt the terminal or IDE instead. Kasumi's Allow/Deny prompt records the origin decision, releases the CEF media request, and syncs Chromium's own camera/microphone content settings. `getDisplayMedia` opens Kasumi's native source picker because CEF Alloy cannot present Chrome's screen picker inside an embedded native child view on macOS. The chosen display or window is resolved through Chromium's legacy mandatory desktop-capture constraints, which carry the exact `DesktopMediaID` into CEF's media request.
 
 ---
 
