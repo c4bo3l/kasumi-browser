@@ -106,6 +106,10 @@ pub enum DbCommand {
     LoadHistory {
         reply: std::sync::mpsc::SyncSender<Vec<HistoryItem>>,
     },
+    /// Read every history row for a portable export. The caller waits off-thread.
+    LoadAllHistory {
+        reply: std::sync::mpsc::SyncSender<Vec<HistoryItem>>,
+    },
     DeleteHistory {
         url: String,
     },
@@ -237,6 +241,11 @@ impl StorageHandle {
     /// Queue a bounded history refresh. The caller waits off-thread.
     pub fn request_history(&self, reply: std::sync::mpsc::SyncSender<Vec<HistoryItem>>) {
         self.send(DbCommand::LoadHistory { reply });
+    }
+
+    /// Queue a full history export snapshot. The caller waits off-thread.
+    pub fn request_all_history(&self, reply: std::sync::mpsc::SyncSender<Vec<HistoryItem>>) {
+        self.send(DbCommand::LoadAllHistory { reply });
     }
 
     pub fn delete_history(&self, url: String) {
@@ -531,6 +540,28 @@ impl StorageManager {
              ORDER BY last_visited DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], |row| {
+            Ok(HistoryItem {
+                url: row.get(0)?,
+                title: row.get(1)?,
+                visit_count: row.get::<_, i64>(2)? as u32,
+                last_visited: row.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        let mut history = Vec::new();
+        for row in rows {
+            if let Ok(item) = row {
+                history.push(item);
+            }
+        }
+        Ok(history)
+    }
+
+    fn load_all_history_from(conn: &Connection) -> Result<Vec<HistoryItem>, rusqlite::Error> {
+        let mut stmt = conn.prepare(
+            "SELECT url, title, visit_count, last_visited FROM history
+             ORDER BY last_visited DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
             Ok(HistoryItem {
                 url: row.get(0)?,
                 title: row.get(1)?,
@@ -872,6 +903,15 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
                 }
             }
         }
+        DbCommand::LoadAllHistory { reply } => match StorageManager::load_all_history_from(conn) {
+            Ok(history) => {
+                let _ = reply.send(history);
+            }
+            Err(error) => {
+                tracing::warn!("Failed to load history for export: {error}");
+                let _ = reply.send(Vec::new());
+            }
+        },
         DbCommand::DeleteHistory { url } => {
             if let Err(error) = conn.execute("DELETE FROM history WHERE url = ?1", params![url]) {
                 tracing::warn!("Failed to delete history entry: {error}");
@@ -1983,6 +2023,11 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].url, "https://new.example");
         assert_eq!(items[0].visit_count, 3);
+
+        let (reply_tx, reply_rx) = sync_channel(1);
+        apply_command(&mut conn, DbCommand::LoadAllHistory { reply: reply_tx });
+        let all_items = reply_rx.try_recv().expect("full history load reply");
+        assert_eq!(all_items.len(), 2);
 
         apply_command(
             &mut conn,

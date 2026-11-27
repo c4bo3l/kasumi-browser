@@ -2507,6 +2507,9 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             for (kind, title, message) in tm.consume_print_toasts() {
                 self.chrome_state.show_toast(kind, title, message);
             }
+            for (kind, title, message) in tm.consume_export_toasts() {
+                self.chrome_state.show_toast(kind, title, message);
+            }
             if let Some(profiles) = tm.consume_browser_profiles() {
                 self.chrome_state.set_browser_profiles(profiles);
             }

@@ -543,6 +543,7 @@ enum RailIcon {
     Sidebar,
     Settings,
     Download,
+    Upload,
     Print,
     Pause,
     Play,
@@ -671,6 +672,8 @@ pub enum CommandAction {
     Print,
     OpenSettings,
     OpenBrowserImport,
+    ExportBookmarks,
+    ExportHistory,
     OpenDownloads,
     OpenHistory,
     BookmarkActiveTab,
@@ -5155,6 +5158,63 @@ impl ChromeRenderer {
                 .size(10.0)
                 .color(palette.palette_hint),
         );
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("EXPORT")
+                .size(10.0)
+                .strong()
+                .color(palette.section_label),
+        );
+        ui.add_space(3.0);
+        ui.label(
+            RichText::new(
+                "Save portable copies of your bookmarks and history in the download folder.",
+            )
+            .size(11.0)
+            .color(palette.palette_subtext),
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if material_button(
+                ui,
+                RailIcon::Upload,
+                "Bookmarks (HTML)",
+                MaterialButtonStyle::Tonal,
+                palette,
+                true,
+            )
+            .clicked()
+            {
+                actions.push(UiAction::ExportBrowserData {
+                    bookmarks: true,
+                    history: false,
+                });
+            }
+            if material_button(
+                ui,
+                RailIcon::Upload,
+                "History (CSV)",
+                MaterialButtonStyle::Tonal,
+                palette,
+                true,
+            )
+            .clicked()
+            {
+                actions.push(UiAction::ExportBrowserData {
+                    bookmarks: false,
+                    history: true,
+                });
+            }
+        });
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Bookmarks use Netscape HTML, which Chrome, Edge, Firefox, and Safari can import. Browsers do not share a history import format, so history is exported as CSV with Unix and UTC timestamps.")
+                .size(10.0)
+                .color(palette.palette_hint),
+        );
     }
 
     /// Draw the native Settings card in the shared transparent overlay.
@@ -5268,7 +5328,7 @@ impl ChromeRenderer {
                             for (tab, label) in [
                                 (SettingsTab::General, "General"),
                                 (SettingsTab::Workspaces, "Workspaces"),
-                                (SettingsTab::Import, "Import"),
+                                (SettingsTab::Import, "Import / Export"),
                             ] {
                                 if ui.selectable_label(settings_tab == tab, label).clicked() {
                                     settings_tab = tab;
@@ -7791,7 +7851,7 @@ fn rail_icon_glyph(icon: RailIcon) -> &'static str {
         ICON_MUSIC_NOTE, ICON_NEW_WINDOW, ICON_NOTIFICATIONS, ICON_OPEN_IN_NEW, ICON_PALETTE,
         ICON_PAUSE, ICON_PIN, ICON_PLAY_ARROW, ICON_PRINT, ICON_PUBLIC, ICON_PUSH_PIN,
         ICON_REFRESH, ICON_ROCKET, ICON_SCHOOL, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD, ICON_STAR,
-        ICON_VIEW_SIDEBAR, ICON_VISIBILITY_OFF, ICON_WORK,
+        ICON_UPLOAD, ICON_VIEW_SIDEBAR, ICON_VISIBILITY_OFF, ICON_WORK,
     };
 
     match icon {
@@ -7814,6 +7874,7 @@ fn rail_icon_glyph(icon: RailIcon) -> &'static str {
         RailIcon::Sidebar => ICON_VIEW_SIDEBAR.into(),
         RailIcon::Settings => ICON_SETTINGS.into(),
         RailIcon::Download => ICON_DOWNLOAD.into(),
+        RailIcon::Upload => ICON_UPLOAD.into(),
         RailIcon::Print => ICON_PRINT.into(),
         RailIcon::Pause => ICON_PAUSE.into(),
         RailIcon::Play => ICON_PLAY_ARROW.into(),
@@ -8630,6 +8691,18 @@ pub fn command_palette_items(
         subtitle: "Search, reopen, and remove visited pages".to_string(),
         action: CommandAction::OpenHistory,
     };
+    let export_bookmarks_item = || CommandPaletteItem {
+        icon: ICON_UPLOAD.into(),
+        label: "Export bookmarks (HTML)".to_string(),
+        subtitle: "Save a Netscape bookmark file other browsers can import".to_string(),
+        action: CommandAction::ExportBookmarks,
+    };
+    let export_history_item = || CommandPaletteItem {
+        icon: ICON_UPLOAD.into(),
+        label: "Export history (CSV)".to_string(),
+        subtitle: "Save all visited pages with Unix and UTC timestamps".to_string(),
+        action: CommandAction::ExportHistory,
+    };
 
     if trimmed.is_empty() {
         items.push(CommandPaletteItem {
@@ -8787,6 +8860,11 @@ pub fn command_palette_items(
         items.push(bookmark_manager_item());
     }
 
+    if needle.contains("export") {
+        items.push(export_bookmarks_item());
+        items.push(export_history_item());
+    }
+
     if needle.contains("pin") {
         if let Some(item) = pin_item() {
             items.push(item);
@@ -8835,6 +8913,14 @@ fn apply_command_item(
         }
         CommandAction::OpenSettings => state.open_settings(),
         CommandAction::OpenBrowserImport => state.open_browser_import(),
+        CommandAction::ExportBookmarks => actions.push(UiAction::ExportBrowserData {
+            bookmarks: true,
+            history: false,
+        }),
+        CommandAction::ExportHistory => actions.push(UiAction::ExportBrowserData {
+            bookmarks: false,
+            history: true,
+        }),
         CommandAction::OpenDownloads => state.open_downloads(),
         CommandAction::OpenHistory => actions.push(UiAction::OpenHistory),
         CommandAction::OpenBookmarkManager => state.open_bookmark_manager(),
@@ -9964,7 +10050,9 @@ mod tests {
         private.workspace_id = Workspace::PRIVATE_ID;
         let tabs = vec![tab(1, "Docs", "https://docs.example"), private];
 
-        for query in ["", "private", "bookmark", "download", "history", "settings"] {
+        for query in [
+            "", "private", "bookmark", "download", "export", "history", "settings",
+        ] {
             let items = command_palette_items(query, &tabs, Some(1), &prefs);
             assert!(!items.is_empty(), "no palette rows for {query:?}");
             for item in items {
@@ -9997,6 +10085,38 @@ mod tests {
         let mut actions = Vec::new();
         apply_command_item(&CommandAction::OpenHistory, &mut state, &mut actions);
         assert_eq!(actions, vec![UiAction::OpenHistory]);
+    }
+
+    #[test]
+    fn palette_finds_portable_export_actions() {
+        let items = command_palette_items("export", &[], None, &BrowserPreferences::default());
+        assert!(items
+            .iter()
+            .any(|item| item.action == CommandAction::ExportBookmarks));
+        assert!(items
+            .iter()
+            .any(|item| item.action == CommandAction::ExportHistory));
+
+        let mut state = ChromeState::default();
+        let mut actions = Vec::new();
+        apply_command_item(&CommandAction::ExportBookmarks, &mut state, &mut actions);
+        assert_eq!(
+            actions,
+            vec![UiAction::ExportBrowserData {
+                bookmarks: true,
+                history: false,
+            }]
+        );
+
+        actions.clear();
+        apply_command_item(&CommandAction::ExportHistory, &mut state, &mut actions);
+        assert_eq!(
+            actions,
+            vec![UiAction::ExportBrowserData {
+                bookmarks: false,
+                history: true,
+            }]
+        );
     }
 
     #[test]
