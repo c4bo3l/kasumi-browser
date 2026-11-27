@@ -1,3 +1,7 @@
+use crate::browser::find::{
+    parse_result as parse_find_result, FIND_RESULT_CONSOLE_PREFIX,
+    RENDERER_SHIM as FIND_RENDERER_SHIM,
+};
 use crate::browser::notifications::{
     parse_close_message, parse_permission_message, parse_show_message,
     NOTIFICATION_CLOSE_CONSOLE_PREFIX, NOTIFICATION_PERMISSION_CONSOLE_PREFIX,
@@ -380,6 +384,40 @@ wrap_load_handler! {
                 None,
                 0,
             );
+            // Install the non-destructive find highlighter. It is idempotent and
+            // also re-installed by each find request, so a search typed during
+            // the initial navigation still works.
+            frame.execute_java_script(Some(&CefString::from(FIND_RENDERER_SHIM)), None, 0);
+        }
+    }
+}
+
+// Streams CEF find results to the main UI thread. The `selection_rect` is
+// deliberately ignored: it is a browser-viewport rectangle that belongs to
+// the page and must never be retained outside the callback.
+wrap_find_handler! {
+    pub struct TabFindHandler {
+        tab_id: u64,
+        event_sender: Sender<BrowserEvent>,
+    }
+
+    impl FindHandler {
+        fn on_find_result(
+            &self,
+            _browser: Option<&mut Browser>,
+            identifier: i32,
+            count: i32,
+            _selection_rect: Option<&Rect>,
+            active_match_ordinal: i32,
+            final_update: i32,
+        ) {
+            let _ = self.event_sender.send(BrowserEvent::FindResult {
+                tab_id: self.tab_id,
+                identifier,
+                count,
+                active_match_ordinal,
+                final_update: final_update != 0,
+            });
         }
     }
 }
@@ -477,6 +515,22 @@ wrap_display_handler! {
                 return 1;
             }
 
+            if message.starts_with(FIND_RESULT_CONSOLE_PREFIX) {
+                let Some(payload) = parse_find_result(&message) else {
+                    return 0;
+                };
+                let _ = self.event_sender.send(BrowserEvent::FindResultRich {
+                    tab_id: self.tab_id,
+                    request_id: payload.request_id,
+                    count: payload.count,
+                    active_ordinal: payload.active_ordinal,
+                    snippets: payload.snippets,
+                    error: payload.error,
+                    cleared: payload.cleared,
+                });
+                return 1;
+            }
+
             if message.starts_with(NOTIFICATION_PERMISSION_CONSOLE_PREFIX) {
                 let Some(payload) = parse_permission_message(&message) else {
                     return 0;
@@ -535,6 +589,7 @@ const REPEAT_EVENT_FLAG: u32 = 8_192;
 /// Virtual key codes, using CEF's platform-independent Windows key codes.
 const VK_B: i32 = 0x42;
 const VK_C: i32 = 0x43;
+const VK_F: i32 = 0x46;
 const VK_J: i32 = 0x4A;
 const VK_K: i32 = 0x4B;
 const VK_L: i32 = 0x4C;
@@ -600,6 +655,7 @@ pub(crate) fn browser_shortcut(
         VK_N if shift => Some(BrowserShortcut::NewPrivateWindow),
         VK_T => Some(BrowserShortcut::NewTab),
         VK_W if !shift => Some(BrowserShortcut::CloseTab),
+        VK_F if !shift => Some(BrowserShortcut::FindInPage),
         VK_L | VK_K if !shift => Some(BrowserShortcut::OpenCommandPalette),
         VK_B if shift => Some(BrowserShortcut::OpenBookmarkManager),
         VK_C if shift => Some(BrowserShortcut::CopyUrl),
@@ -651,6 +707,7 @@ fn browser_shortcut_from_char(
             }
         }
         c if c == 'W' as u16 || c == 'w' as u16 => Some(BrowserShortcut::CloseTab),
+        c if c == 'F' as u16 || c == 'f' as u16 => Some(BrowserShortcut::FindInPage),
         c if c == 'L' as u16 || c == 'l' as u16 || c == 'K' as u16 || c == 'k' as u16 => {
             Some(BrowserShortcut::OpenCommandPalette)
         }
@@ -954,6 +1011,7 @@ wrap_client! {
         life_span_handler: LifeSpanHandler,
         load_handler: LoadHandler,
         display_handler: DisplayHandler,
+        find_handler: FindHandler,
         request_handler: RequestHandler,
         download_handler: DownloadHandler,
         keyboard_handler: KeyboardHandler,
@@ -970,6 +1028,9 @@ wrap_client! {
         }
         fn display_handler(&self) -> Option<DisplayHandler> {
             Some(self.display_handler.clone())
+        }
+        fn find_handler(&self) -> Option<FindHandler> {
+            Some(self.find_handler.clone())
         }
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(self.request_handler.clone())
@@ -999,6 +1060,7 @@ pub fn create_tab_client(
     let life_span_handler = TabLifeSpanHandler::new(tab_id, event_sender.clone());
     let load_handler = TabLoadHandler::new(tab_id, event_sender.clone());
     let display_handler = TabDisplayHandler::new(tab_id, event_sender.clone());
+    let find_handler = TabFindHandler::new(tab_id, event_sender.clone());
     let keyboard_handler = TabKeyboardHandler::new(tab_id, event_sender.clone());
     let context_menu_handler = TabContextMenuHandler::new(tab_id, event_sender.clone());
     let permission_handler = TabPermissionHandler::new(tab_id, event_sender.clone());
@@ -1015,6 +1077,7 @@ pub fn create_tab_client(
         life_span_handler.into(),
         load_handler.into(),
         display_handler.into(),
+        find_handler.into(),
         request_handler.into(),
         download_handler.into(),
         keyboard_handler.into(),
@@ -1166,6 +1229,15 @@ mod tests {
             browser_shortcut(true, 0x4C, 4),
             Some(BrowserShortcut::OpenCommandPalette)
         );
+        assert_eq!(
+            browser_shortcut(true, 0x46, 128),
+            Some(BrowserShortcut::FindInPage)
+        );
+        assert_eq!(
+            browser_shortcut(true, 0x46, 4),
+            Some(BrowserShortcut::FindInPage)
+        );
+        assert_eq!(browser_shortcut(true, 0x46, 128 | 2), None);
         assert_eq!(
             browser_shortcut(true, 0x4A, 128),
             Some(BrowserShortcut::OpenDownloads)

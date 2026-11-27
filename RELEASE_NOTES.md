@@ -4,7 +4,40 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
-## v0.11.0 — Unreleased
+## v0.12.0 — Unreleased
+
+### Added
+
+- Native find in page (`Cmd/Ctrl+F`) with a floating find bar, match count, previous/next navigation, and close control.
+- Rich snippet results with bounded context, bold and per-term colour highlighting, heading breadcrumbs, hover previews, and click-to-jump navigation.
+- Regex, whole-word, and multi-term find modes, inline invalid-regex feedback, and an optional source-text filter.
+- `This tab` and `All tabs` scopes with grouped cross-tab results, favicon/title/count metadata, and wake-and-search replay for hibernated tabs.
+- Copy actions for matching lines, sentences, and hrefs. Native CEF find remains authoritative for substring counts and ordinals while the bounded renderer bridge supplies snippets.
+
+### Changed
+
+- Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.11.0` to `0.12.0`.
+- Rewrote the README feature list to cover all shipped functionality and removed DPI/pixel-size details that are not useful to users.
+- The shared native overlay re-syncs its size and position to the main window on every modal update, so overlays follow display and DPI changes and repeated `Cmd/Ctrl+F` reopening.
+- Find-bar tooltips use shadowless styling so the card does not leave a shadow after the snippet drawer closes.
+
+### Fixed
+
+- The find bar stays inside the browser window on secondary displays and small viewports, and repeated `Cmd/Ctrl+F` re-shows, repositions, and refocuses it instead of redrawing a hidden or stranded overlay.
+- The overlay stays above the browser while Kasumi is active but no longer floats above other apps or steals their keyboard focus.
+- Hibernated tabs found by `All tabs` replay the query on wake without restarting the whole sweep, and delayed native find results no longer overwrite advanced rich-query state.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bins` — 229 browser tests plus 4 bundle tests
+- `cargo build --release`
+- Interactive macOS verification confirmed find results, cross-tab grouping, display-drag recovery, repeated `Cmd/Ctrl+F`, and normal layering behind other apps.
+
+---
+
+## v0.11.0 — 2026-11-27
 
 ### Added
 
@@ -625,8 +658,7 @@ Initial public source release: [github.com/c4bo3l/kasumi-browser](https://github
 
 ## Future development
 
-- Find in page (`Cmd/Ctrl+F`)
-- Native print support
+- Native print support (`Cmd/Ctrl+P`)
 - Browser import
 - Full Windows and Linux validation
 - Automated cross-platform integration tests

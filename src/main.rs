@@ -437,6 +437,7 @@ mod native_shortcuts {
             't' if shift => Some(BrowserShortcut::ReopenClosedTab),
             't' => Some(BrowserShortcut::NewTab),
             'w' if !shift => Some(BrowserShortcut::CloseTab),
+            'f' if !shift => Some(BrowserShortcut::FindInPage),
             'l' | 'k' if !shift => Some(BrowserShortcut::OpenCommandPalette),
             'j' if !shift => Some(BrowserShortcut::OpenDownloads),
             ',' | '.' if !shift => Some(BrowserShortcut::OpenSettings),
@@ -588,7 +589,7 @@ fn install_macos_main_menu() {
     let app_menu = NSMenu::new(mtm);
     let app_version = NSMenuItem::new(mtm);
     unsafe {
-        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.11.0"));
+        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.12.0"));
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
@@ -895,22 +896,47 @@ impl KasumiBrowserHandler {
                 }
                 self.overlay_click_through = toast_only;
             }
-            if !self.overlay_visible {
+            // Only re-assert our own z-order while Kasumi is the active app. A
+            // plain `WindowLevel::Normal` keeps the overlay above the browser
+            // when focused, but lets another app cover it normally. Re-showing
+            // or focusing while another app is active would make the find bar
+            // float over that app and steal its keyboard focus.
+            let overlay_front_allowed = {
+                #[cfg(target_os = "macos")]
+                {
+                    app_is_active()
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    window.has_focus() || self.window.as_ref().is_some_and(|w| w.has_focus())
+                }
+            };
+            if overlay_front_allowed && (!self.overlay_visible || window.is_visible() != Some(true))
+            {
                 window.set_visible(true);
-                self.position_chrome_overlay();
                 self.overlay_visible = true;
             }
+            // Keep the overlay glued to the main window on every sync. winit can
+            // delay Moved/ScaleFactorChanged while a window crosses displays,
+            // and Cmd+F reuses the same native overlay instead of creating a
+            // fresh one, so positioning only on the show transition can leave
+            // the find bar stranded on the previous screen.
+            self.position_chrome_overlay();
 
-            // Modal overlays must own the keyboard; toast-only overlays must
-            // leave focus on the main window so typing still reaches the page.
+            // Modal overlays must own the keyboard while Kasumi is active.
+            // Dragging the main window can reorder it in front while our cached
+            // focus flag is still true, so re-assert ordering every active sync
+            // instead of only on the transition. Toast-only overlays leave focus
+            // on the page.
             let wants_overlay_focus = !toast_only;
-            if wants_overlay_focus != self.overlay_focused {
-                if wants_overlay_focus {
-                    window.focus_window();
-                } else if let Some(main) = self.window.as_ref() {
+            if overlay_front_allowed && wants_overlay_focus {
+                window.focus_window();
+                self.overlay_focused = true;
+            } else if overlay_front_allowed && self.overlay_focused {
+                if let Some(main) = self.window.as_ref() {
                     main.focus_window();
                 }
-                self.overlay_focused = wants_overlay_focus;
+                self.overlay_focused = false;
             }
             window.request_redraw();
         } else {
@@ -966,7 +992,10 @@ impl KasumiBrowserHandler {
         else {
             return;
         };
-        let _ = overlay.request_inner_size(main.inner_size());
+        let desired_size = main.inner_size();
+        if overlay.inner_size() != desired_size {
+            let _ = overlay.request_inner_size(desired_size);
+        }
         // The overlay is undecorated, so its outer origin is its content origin.
         // Anchor it to the main window's current content origin to account for
         // macOS title bars and for windows moved to another display; egui
@@ -992,7 +1021,13 @@ impl KasumiBrowserHandler {
                 )
             }
         };
-        overlay.set_outer_position(target);
+        if overlay
+            .outer_position()
+            .map(|current| current != target)
+            .unwrap_or(true)
+        {
+            overlay.set_outer_position(target);
+        }
     }
 
     fn hide_chrome_overlay(&mut self) {
@@ -1401,6 +1436,9 @@ impl KasumiBrowserHandler {
                         tm.handle_ui_action(UiAction::OpenDevTools { tab_id: id });
                     }
                 }
+            }
+            BrowserShortcut::FindInPage => {
+                self.chrome_state.open_find_bar();
             }
             BrowserShortcut::OpenSettings => {
                 self.chrome_state.open_settings();
@@ -2410,6 +2448,9 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             } else if explicit_downloads_request {
                 self.chrome_state.toggle_downloads();
             }
+            if tm.consume_find_request() {
+                self.chrome_state.open_find_bar();
+            }
             if tm.consume_command_palette_request() {
                 self.chrome_state.open_command_palette();
             }
@@ -2426,6 +2467,9 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                 tm.tick();
             }
             tm.update_chrome_state(&mut self.chrome_state);
+            if let Some(active_id) = self.chrome_state.active_tab_id {
+                self.chrome_state.sync_find_result(active_id);
+            }
         }
 
         self.request_page_hud_redraw();
@@ -2925,6 +2969,11 @@ mod tests {
             shortcut_from_parts('l', 0x25, cmd),
             Some(BrowserShortcut::OpenCommandPalette)
         );
+        assert_eq!(
+            shortcut_from_parts('f', 0x03, cmd),
+            Some(BrowserShortcut::FindInPage)
+        );
+        assert_eq!(shortcut_from_parts('f', 0x03, cmd | shift), None);
         assert_eq!(
             shortcut_from_parts('j', 0x26, cmd),
             Some(BrowserShortcut::OpenDownloads)

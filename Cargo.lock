@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "kasumi-browser"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "adblock",
  "block2 0.6.2",
