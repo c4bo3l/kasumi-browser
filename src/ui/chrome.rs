@@ -34,7 +34,7 @@ use crate::config::{
 };
 use crate::events::{
     DownloadEngine, DownloadInfo, DownloadNotification, DownloadNotificationKind, DownloadState,
-    UiAction,
+    UiAction, WebNotification,
 };
 
 /// Light or dark chrome appearance. The OS theme decides the default, and
@@ -550,6 +550,7 @@ enum RailIcon {
     Edit,
     BookmarkAdd,
     OpenInNew,
+    Notifications,
     WorkspaceWork,
     WorkspaceCode,
     WorkspaceStudy,
@@ -706,15 +707,34 @@ pub struct RailMenu {
     pub height: f32,
 }
 
-/// A native camera/microphone prompt mirrored from `TabManager`.
+/// Which native permission request the shared prompt is currently showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionPromptKind {
+    Media,
+    Notifications,
+}
+
+/// A native camera/microphone or web-notification prompt mirrored from
+/// `TabManager`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionPrompt {
+    pub kind: PermissionPromptKind,
     pub request_id: u64,
     pub tab_id: u64,
     pub origin: String,
     pub permissions: u32,
     pub label: String,
     pub private: bool,
+}
+
+/// A native Web Notification shown in a small always-on-top window. It is
+/// separate from the click-through download toasts so the card can receive a
+/// click and dispatch the page's `notification.onclick` handler.
+#[derive(Debug, Clone)]
+pub struct WebNotificationToast {
+    pub notification: WebNotification,
+    pub created_at: Instant,
+    pub duration: Duration,
 }
 
 /// One display or window Kasumi can pass to Chromium's `getDisplayMedia`.
@@ -796,6 +816,11 @@ pub struct ChromeState {
     /// Notifications held until no modal overlay owns the shared surface. The
     /// display timer starts only when a toast becomes visible.
     pub pending_toasts: VecDeque<ChromeToast>,
+    /// Current website notification shown in its own clickable native window.
+    pub web_notification: Option<WebNotificationToast>,
+    /// Website notifications waiting for the modal overlay and the current
+    /// notification to clear. Timers start when a notification becomes visible.
+    pub pending_web_notifications: VecDeque<WebNotificationToast>,
     /// WAL-backed download snapshots mirrored from the CEF download handler.
     pub downloads: Vec<DownloadInfo>,
     /// Text mirrored from the active tab; the command palette edits a copy.
@@ -891,6 +916,8 @@ impl Default for ChromeState {
             bookmark_folder_draft: String::new(),
             toast: None,
             pending_toasts: VecDeque::new(),
+            web_notification: None,
+            pending_web_notifications: VecDeque::new(),
             downloads: Vec::new(),
             omnibox_text: String::new(),
             omnibox_focused: false,
@@ -1012,6 +1039,97 @@ impl ChromeState {
                 format!("Could not finish {name}"),
             ),
         }
+    }
+
+    /// Queue or show a website notification. Real notifications stay visible
+    /// longer than download toasts, and `requireInteraction` keeps them until
+    /// the user dismisses or clicks them.
+    pub fn show_web_notification(&mut self, notification: WebNotification) {
+        // A non-empty tag replaces the previous notification from the same tab.
+        if !notification.tag.is_empty() {
+            let same_slot = |toast: &WebNotificationToast| {
+                toast.notification.tab_id == notification.tab_id
+                    && toast.notification.tag == notification.tag
+            };
+            if self.web_notification.as_ref().is_some_and(same_slot) {
+                self.web_notification = None;
+            }
+            self.pending_web_notifications
+                .retain(|toast| !same_slot(toast));
+        }
+        let duration = if notification.require_interaction {
+            // `requireInteraction` notifications stay until the user acts.
+            Duration::from_secs(60 * 60)
+        } else {
+            Duration::from_secs(9)
+        };
+        let toast = WebNotificationToast {
+            notification,
+            created_at: Instant::now(),
+            duration,
+        };
+        if self.has_modal_overlay() || self.web_notification.is_some() {
+            const MAX_PENDING_WEB_NOTIFICATIONS: usize = 4;
+            self.pending_web_notifications.push_back(toast);
+            while self.pending_web_notifications.len() > MAX_PENDING_WEB_NOTIFICATIONS {
+                self.pending_web_notifications.pop_front();
+            }
+            return;
+        }
+        self.web_notification = Some(toast);
+    }
+
+    /// Promote the oldest queued website notification once the modal overlay
+    /// and the visible notification have cleared.
+    pub fn promote_pending_web_notification(&mut self) {
+        if self.web_notification.is_some() || self.has_modal_overlay() {
+            return;
+        }
+        if let Some(mut toast) = self.pending_web_notifications.pop_front() {
+            toast.created_at = Instant::now();
+            self.web_notification = Some(toast);
+        }
+    }
+
+    /// Drop a website notification once its display window has elapsed and
+    /// return it so the shell can dispatch the page's `close` handler.
+    pub fn expire_web_notification(&mut self) -> Option<WebNotification> {
+        let expired = self
+            .web_notification
+            .as_ref()
+            .is_some_and(|toast| toast.created_at.elapsed() >= toast.duration);
+        if !expired {
+            return None;
+        }
+        let notification = self.web_notification.take().map(|toast| toast.notification);
+        self.promote_pending_web_notification();
+        notification
+    }
+
+    /// Remove a website notification by id, whether it is visible or queued.
+    /// Page-initiated `notification.close()` calls land here.
+    pub fn remove_web_notification(&mut self, id: &str) {
+        if self
+            .web_notification
+            .as_ref()
+            .is_some_and(|toast| toast.notification.id == id)
+        {
+            self.web_notification = None;
+            self.promote_pending_web_notification();
+        }
+        self.pending_web_notifications
+            .retain(|toast| toast.notification.id != id);
+    }
+
+    /// Take the visible website notification so the shell can hide its window
+    /// before dispatching the click/close event.
+    pub fn take_web_notification(&mut self) -> Option<WebNotification> {
+        let notification = self
+            .web_notification
+            .take()
+            .map(|toast| toast.notification)?;
+        self.promote_pending_web_notification();
+        Some(notification)
     }
 
     /// Drop a toast once its display window has elapsed.
@@ -1148,11 +1266,22 @@ impl ChromeState {
     /// leave the request hanging.
     pub fn dismiss_permission_prompt(&self, actions: &mut Vec<UiAction>) {
         if let Some(prompt) = self.permission_prompt.as_ref() {
-            actions.push(UiAction::ResolveMediaAccessPermission {
-                request_id: prompt.request_id,
-                granted: false,
-                persist: false,
-            });
+            match prompt.kind {
+                PermissionPromptKind::Media => {
+                    actions.push(UiAction::ResolveMediaAccessPermission {
+                        request_id: prompt.request_id,
+                        granted: false,
+                        persist: false,
+                    });
+                }
+                PermissionPromptKind::Notifications => {
+                    actions.push(UiAction::ResolveNotificationPermission {
+                        request_id: prompt.request_id,
+                        granted: false,
+                        persist: false,
+                    });
+                }
+            }
         }
     }
 
@@ -1500,7 +1629,7 @@ impl ChromeRenderer {
         let egui_ctx = egui::Context::default();
         // Register the Material Symbols fallback used by every rail icon. It
         // is pinned to the egui 0.30-compatible crate release.
-        egui_material_icons::initialize(&egui_ctx);
+        register_material_icon_font(&egui_ctx);
         // Tooltips must appear immediately; the default delay makes the chrome
         // controls look unlabeled during quick hovers.
         egui_ctx.all_styles_mut(|style| {
@@ -2573,6 +2702,23 @@ impl ChromeRenderer {
             return;
         };
         let request_id = prompt.request_id;
+        let notification_prompt = prompt.kind == PermissionPromptKind::Notifications;
+        let request_text = if notification_prompt {
+            format!("Allow {} to show notifications?", prompt.origin)
+        } else {
+            format!("Allow {} to use {}?", prompt.origin, prompt.label)
+        };
+        let remember_text = if notification_prompt {
+            if prompt.private {
+                "This choice is forgotten when Incognito closes."
+            } else {
+                "Kasumi shows web notifications as native alerts and remembers your choice."
+            }
+        } else if prompt.private {
+            "This choice is forgotten when Incognito closes."
+        } else {
+            "Kasumi remembers your choice for this site."
+        };
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             state.dismiss_permission_prompt(actions);
@@ -2630,22 +2776,15 @@ impl ChromeRenderer {
                         });
                         ui.add_space(8.0);
                         ui.label(
-                            RichText::new(format!(
-                                "Allow {} to use {}?",
-                                prompt.origin, prompt.label
-                            ))
-                            .size(14.0)
-                            .color(palette.text_strong),
+                            RichText::new(&request_text)
+                                .size(14.0)
+                                .color(palette.text_strong),
                         );
                         ui.add_space(4.0);
                         ui.label(
-                            RichText::new(if prompt.private {
-                                "This choice is forgotten when Incognito closes."
-                            } else {
-                                "Kasumi remembers your choice for this site."
-                            })
-                            .size(10.0)
-                            .color(palette.palette_subtext),
+                            RichText::new(remember_text)
+                                .size(10.0)
+                                .color(palette.palette_subtext),
                         );
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
@@ -2680,16 +2819,32 @@ impl ChromeRenderer {
             });
 
         if deny_clicked {
-            actions.push(UiAction::ResolveMediaAccessPermission {
-                request_id,
-                granted: false,
-                persist: true,
+            actions.push(if notification_prompt {
+                UiAction::ResolveNotificationPermission {
+                    request_id,
+                    granted: false,
+                    persist: true,
+                }
+            } else {
+                UiAction::ResolveMediaAccessPermission {
+                    request_id,
+                    granted: false,
+                    persist: true,
+                }
             });
         } else if allow_clicked {
-            actions.push(UiAction::ResolveMediaAccessPermission {
-                request_id,
-                granted: true,
-                persist: true,
+            actions.push(if notification_prompt {
+                UiAction::ResolveNotificationPermission {
+                    request_id,
+                    granted: true,
+                    persist: true,
+                }
+            } else {
+                UiAction::ResolveMediaAccessPermission {
+                    request_id,
+                    granted: true,
+                    persist: true,
+                }
             });
         } else if ctx.input(|i| {
             command_palette_click_outside(
@@ -5184,7 +5339,7 @@ impl ChromeOverlayRenderer {
         let renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
-        egui_material_icons::initialize(&egui_ctx);
+        register_material_icon_font(&egui_ctx);
 
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
@@ -5625,6 +5780,304 @@ impl TooltipRenderer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Native web notification renderer
+// ---------------------------------------------------------------------------
+
+/// Logical size of the clickable website-notification window. The card itself
+/// fills this small top-level window, so the rest of the page keeps receiving
+/// pointer input.
+pub const WEB_NOTIFICATION_WIDTH: f32 = 368.0;
+pub const WEB_NOTIFICATION_HEIGHT: f32 = 122.0;
+
+/// Transparent always-on-top window used for a single website notification.
+/// Unlike the download toast, this surface is intentionally hit-testable so a
+/// click can activate the source tab and fire the page's `click` handler.
+pub struct WebNotificationRenderer {
+    surface: wgpu::Surface<'static>,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    surface_config: wgpu::SurfaceConfiguration,
+    renderer: egui_wgpu::Renderer,
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    max_texture_dim: u32,
+}
+
+impl WebNotificationRenderer {
+    pub fn new(
+        window: Arc<winit::window::Window>,
+        instance: &wgpu::Instance,
+        adapter: &wgpu::Adapter,
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+    ) -> Option<Self> {
+        let surface = match instance.create_surface(Arc::clone(&window)) {
+            Ok(surface) => surface,
+            Err(e) => {
+                tracing::error!("Failed to create web notification surface: {e}");
+                return None;
+            }
+        };
+
+        let size = window.inner_size();
+        let caps = surface.get_capabilities(adapter);
+        let Some(format) = preferred_surface_format(&caps.formats) else {
+            tracing::error!("Web notification adapter reported no surface formats");
+            return None;
+        };
+        let alpha_mode = caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|m| {
+                matches!(
+                    m,
+                    wgpu::CompositeAlphaMode::PreMultiplied
+                        | wgpu::CompositeAlphaMode::PostMultiplied
+                )
+            })
+            .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
+
+        let max_tex = adapter.limits().max_texture_dimension_2d;
+        let surface_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width: size.width.max(1).min(max_tex),
+            height: size.height.max(1).min(max_tex),
+            present_mode: wgpu::PresentMode::AutoVsync,
+            alpha_mode,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &surface_config);
+
+        let renderer =
+            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+        let egui_ctx = egui::Context::default();
+        // The notification card draws the same Material Symbols glyphs as the
+        // rail and needs its own font registration.
+        register_material_icon_font(&egui_ctx);
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(window.scale_factor() as f32),
+            None,
+            Some(max_tex as usize),
+        );
+
+        Some(Self {
+            surface,
+            device,
+            queue,
+            surface_config,
+            renderer,
+            egui_ctx,
+            egui_state,
+            max_texture_dim: max_tex,
+        })
+    }
+
+    pub fn on_window_event(
+        &mut self,
+        window: &winit::window::Window,
+        event: &winit::event::WindowEvent,
+    ) -> bool {
+        self.egui_state.on_window_event(window, event).consumed
+    }
+
+    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if new_size.width == 0
+            || new_size.height == 0
+            || (new_size.width == self.surface_config.width
+                && new_size.height == self.surface_config.height)
+        {
+            return;
+        }
+        self.surface_config.width = new_size.width.min(self.max_texture_dim);
+        self.surface_config.height = new_size.height.min(self.max_texture_dim);
+        self.surface.configure(&self.device, &self.surface_config);
+    }
+
+    /// Paint the notification card and return a click/close action when the
+    /// user interacts with it.
+    pub fn render(&mut self, window: &winit::window::Window, state: &ChromeState) -> Vec<UiAction> {
+        self.resize(window.inner_size());
+        state.apply_visuals(&self.egui_ctx);
+        let palette = state.palette();
+        let Some(toast) = state.web_notification.as_ref() else {
+            return Vec::new();
+        };
+        let notification = toast.notification.clone();
+        self.egui_ctx
+            .request_repaint_after(toast.duration.saturating_sub(toast.created_at.elapsed()));
+
+        let raw_input = self.egui_state.take_egui_input(window);
+        let egui_ctx = self.egui_ctx.clone();
+        let mut actions = Vec::new();
+        let mut close_clicked = false;
+        let mut card_clicked = false;
+        let mut full_output = egui_ctx.run_ui(raw_input, |ui| {
+            egui::CentralPanel::no_frame()
+                .frame(Frame::NONE.fill(Color32::TRANSPARENT))
+                .show(ui, |ui| {
+                    let frame = Frame::NONE
+                        .fill(palette.palette_bg)
+                        .stroke(Stroke::new(1.0_f32, palette.rail_accent))
+                        .corner_radius(CornerRadius::same(10))
+                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .show(ui, |ui| {
+                            // Fill the whole small window so its transparent
+                            // margin cannot intercept page clicks.
+                            ui.set_min_size(ui.available_size());
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) =
+                                    ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                                paint_rail_icon(
+                                    ui,
+                                    egui::Rect::from_center_size(
+                                        icon_rect.center(),
+                                        vec2(15.0, 15.0),
+                                    ),
+                                    RailIcon::Notifications,
+                                    palette.rail_accent,
+                                );
+                                ui.add_space(6.0);
+                                let title = if notification.title.trim().is_empty() {
+                                    "Notification"
+                                } else {
+                                    notification.title.trim()
+                                };
+                                ui.label(
+                                    RichText::new(truncate_title(title, 52))
+                                        .size(12.0)
+                                        .strong()
+                                        .color(palette.text_strong),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        close_clicked = compact_icon_button(
+                                            ui,
+                                            RailIcon::Close,
+                                            "Dismiss notification",
+                                            &palette,
+                                            false,
+                                        )
+                                        .clicked();
+                                    },
+                                );
+                            });
+                            if !notification.body.is_empty() {
+                                ui.add_space(2.0);
+                                ui.label(
+                                    RichText::new(truncate_title(&notification.body, 150))
+                                        .size(10.5)
+                                        .color(palette.text),
+                                );
+                            }
+                            ui.add_space(3.0);
+                            ui.label(
+                                RichText::new(truncate_title(&notification.origin, 56))
+                                    .size(9.5)
+                                    .color(palette.palette_hint),
+                            );
+                        });
+                    card_clicked = frame.response.interact(Sense::click()).clicked();
+                });
+        });
+
+        if close_clicked {
+            actions.push(UiAction::DismissWebNotification {
+                tab_id: notification.tab_id,
+                notification_id: notification.id.clone(),
+            });
+        } else if card_clicked {
+            actions.push(UiAction::ActivateWebNotification {
+                tab_id: notification.tab_id,
+                notification_id: notification.id.clone(),
+            });
+        }
+
+        self.egui_state
+            .handle_platform_output(window, full_output.platform_output.clone());
+
+        for (id, deltas) in full_output.textures_delta.set.drain() {
+            for delta in deltas {
+                self.renderer
+                    .update_texture(&self.device, &self.queue, id, &delta);
+            }
+        }
+        let Some(output_frame) = acquire_surface_frame(
+            &self.surface,
+            &self.device,
+            &self.surface_config,
+            "web notification",
+        ) else {
+            return actions;
+        };
+        let view = output_frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [self.surface_config.width, self.surface_config.height],
+            pixels_per_point: window.scale_factor() as f32,
+        };
+        let tris = self
+            .egui_ctx
+            .tessellate(full_output.shapes, screen_descriptor.pixels_per_point);
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("web_notification"),
+            });
+        self.renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &tris,
+            &screen_descriptor,
+        );
+
+        {
+            let mut rpass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("web_notification_rpass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    occlusion_query_set: None,
+                    timestamp_writes: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            self.renderer.render(&mut rpass, &tris, &screen_descriptor);
+        }
+
+        for id in full_output.textures_delta.free.drain() {
+            self.renderer.free_texture(&id);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.queue.present(output_frame);
+        actions
+    }
+}
+
 /// Which corner of the CEF content area a page HUD strip belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageHudSide {
@@ -5700,7 +6153,7 @@ impl PageHudRenderer {
         let renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
-        egui_material_icons::initialize(&egui_ctx);
+        register_material_icon_font(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -5919,10 +6372,10 @@ fn rail_icon_glyph(icon: RailIcon) -> &'static str {
         ICON_ADD, ICON_BEDTIME, ICON_BOOK, ICON_BOOKMARK_ADD, ICON_CHECK, ICON_CHEVRON_LEFT,
         ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_CODE, ICON_CONTENT_COPY, ICON_DELETE,
         ICON_DESKTOP_WINDOWS, ICON_DOWNLOAD, ICON_EDIT, ICON_FOLDER_OPEN, ICON_MEMORY,
-        ICON_MUSIC_NOTE, ICON_NEW_WINDOW, ICON_OPEN_IN_NEW, ICON_PALETTE, ICON_PAUSE, ICON_PIN,
-        ICON_PLAY_ARROW, ICON_PUBLIC, ICON_PUSH_PIN, ICON_REFRESH, ICON_ROCKET, ICON_SCHOOL,
-        ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD, ICON_STAR, ICON_VIEW_SIDEBAR, ICON_VISIBILITY_OFF,
-        ICON_WORK,
+        ICON_MUSIC_NOTE, ICON_NEW_WINDOW, ICON_NOTIFICATIONS, ICON_OPEN_IN_NEW, ICON_PALETTE,
+        ICON_PAUSE, ICON_PIN, ICON_PLAY_ARROW, ICON_PUBLIC, ICON_PUSH_PIN, ICON_REFRESH,
+        ICON_ROCKET, ICON_SCHOOL, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD, ICON_STAR,
+        ICON_VIEW_SIDEBAR, ICON_VISIBILITY_OFF, ICON_WORK,
     };
 
     match icon {
@@ -5955,6 +6408,7 @@ fn rail_icon_glyph(icon: RailIcon) -> &'static str {
         RailIcon::Edit => ICON_EDIT.into(),
         RailIcon::BookmarkAdd => ICON_BOOKMARK_ADD.into(),
         RailIcon::OpenInNew => ICON_OPEN_IN_NEW.into(),
+        RailIcon::Notifications => ICON_NOTIFICATIONS.into(),
         RailIcon::WorkspaceWork => ICON_WORK.into(),
         RailIcon::WorkspaceCode => ICON_CODE.into(),
         RailIcon::WorkspaceStudy => ICON_SCHOOL.into(),
@@ -5964,6 +6418,13 @@ fn rail_icon_glyph(icon: RailIcon) -> &'static str {
         RailIcon::WorkspaceReading => ICON_BOOK.into(),
         RailIcon::WorkspaceWeb => ICON_PUBLIC.into(),
     }
+}
+
+/// Register the Material Symbols fallback used by every icon surface, including
+/// the standalone website-notification window. Without this, private-use
+/// glyphs such as the close icon render as tofu on a fresh `egui::Context`.
+fn register_material_icon_font(ctx: &egui::Context) {
+    egui_material_icons::initialize(ctx);
 }
 
 fn paint_rail_icon(ui: &Ui, rect: egui::Rect, icon: RailIcon, color: Color32) {
@@ -6956,10 +7417,11 @@ mod tests {
         normalize_bookmark_url, page_tooltip_anchor, palette_row_fill, preferred_surface_format,
         rail_menu_anchor, rail_menu_click_outside, rail_menu_items, rail_menu_metrics,
         rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled, rail_tooltip_metrics,
-        resolve_omnibox, resolve_omnibox_with_search, tab_close_center, tab_status_center,
-        tooltip_size_for_text, truncate_title, workspace_form_actions, BookmarkInfo, ChromePalette,
-        ChromeRenderer, ChromeState, ChromeTheme, CommandAction, DownloadBadge, DownloadSummary,
-        PermissionPrompt, RailMenuAction, SettingsTab, TabDisplayState, TabInfo, ToastKind,
+        register_material_icon_font, resolve_omnibox, resolve_omnibox_with_search,
+        tab_close_center, tab_status_center, tooltip_size_for_text, truncate_title,
+        workspace_form_actions, BookmarkInfo, ChromePalette, ChromeRenderer, ChromeState,
+        ChromeTheme, CommandAction, DownloadBadge, DownloadSummary, PermissionPrompt,
+        PermissionPromptKind, RailMenuAction, SettingsTab, TabDisplayState, TabInfo, ToastKind,
         WorkspaceInfo, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED, RAIL_STATUS_ICON_EXPANDED,
         TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_MAX_WIDTH,
     };
@@ -6970,7 +7432,7 @@ mod tests {
     };
     use crate::events::{
         DownloadEngine, DownloadInfo, DownloadNotification, DownloadNotificationKind,
-        DownloadState, UiAction,
+        DownloadState, UiAction, WebNotification,
     };
 
     fn tab(id: u64, title: &str, url: &str) -> TabInfo {
@@ -7006,6 +7468,7 @@ mod tests {
         assert!(!state.has_modal_overlay());
 
         state.permission_prompt = Some(PermissionPrompt {
+            kind: PermissionPromptKind::Media,
             request_id: 42,
             tab_id: 7,
             origin: "https://meet.example".to_string(),
@@ -7263,6 +7726,80 @@ mod tests {
         let toast = state.toast.expect("promoted toast");
         assert_eq!(toast.title, "Copied");
         assert!(toast.created_at.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    fn web_notification(id: &str, tab_id: u64, require_interaction: bool) -> WebNotification {
+        WebNotification {
+            id: id.to_string(),
+            tab_id,
+            origin: "https://example.com".to_string(),
+            title: "Build finished".to_string(),
+            body: "The nightly artifact is ready".to_string(),
+            tag: String::new(),
+            require_interaction,
+        }
+    }
+
+    #[test]
+    fn web_notifications_queue_behind_modals_and_promote_after_dismissal() {
+        let mut state = ChromeState::default();
+        state.open_settings();
+        state.show_web_notification(web_notification("kn-1", 7, false));
+        assert!(state.web_notification.is_none());
+        assert_eq!(state.pending_web_notifications.len(), 1);
+
+        state.close_settings();
+        state.promote_pending_web_notification();
+        let toast = state.web_notification.expect("promoted notification");
+        assert_eq!(toast.notification.id, "kn-1");
+        assert!(toast.created_at.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn web_notifications_replace_by_id_and_require_interaction_stays_visible() {
+        let mut state = ChromeState::default();
+        state.show_web_notification(web_notification("kn-2", 3, true));
+        assert!(state.web_notification.is_some());
+        state.show_web_notification(web_notification("kn-3", 3, false));
+        assert_eq!(state.pending_web_notifications.len(), 1);
+
+        state.remove_web_notification("kn-2");
+        assert_eq!(
+            state
+                .web_notification
+                .as_ref()
+                .map(|toast| toast.notification.id.as_str()),
+            Some("kn-3")
+        );
+        let taken = state.take_web_notification().expect("taken notification");
+        assert_eq!(taken.id, "kn-3");
+        assert!(state.web_notification.is_none());
+    }
+
+    #[test]
+    fn notification_permission_dismissal_does_not_persist() {
+        let mut state = ChromeState::default();
+        state.permission_prompt = Some(PermissionPrompt {
+            kind: PermissionPromptKind::Notifications,
+            request_id: 9,
+            tab_id: 4,
+            origin: "https://chat.example".to_string(),
+            permissions: 0,
+            label: "notifications".to_string(),
+            private: false,
+        });
+        assert!(state.has_modal_overlay());
+
+        let mut actions = Vec::new();
+        state.dismiss_permission_prompt(&mut actions);
+        assert_eq!(
+            actions,
+            vec![UiAction::ResolveNotificationPermission {
+                request_id: 9,
+                granted: false,
+                persist: false,
+            }]
+        );
     }
 
     #[test]
@@ -8800,5 +9337,26 @@ mod tests {
         state.close_tab_menu();
         assert!(state.menu.is_none());
         assert_eq!(state.menu_selection, 0);
+    }
+
+    #[test]
+    fn notification_icon_context_registers_material_symbol_font() {
+        let ctx = egui::Context::default();
+        register_material_icon_font(&ctx);
+        // egui builds its font atlas on the first frame.
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+
+        let families = ctx.fonts(|fonts| fonts.families());
+        assert!(families.iter().any(|family| matches!(
+            family,
+            egui::FontFamily::Name(name) if name.as_ref() == egui_material_icons::FONT_FAMILY
+        )));
+        assert!(ctx.fonts_mut(|fonts| {
+            fonts.has_glyph(
+                &egui::FontId::new(16.0, egui::FontFamily::Proportional),
+                '\u{e5cd}',
+            )
+        }));
     }
 }

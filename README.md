@@ -4,7 +4,7 @@ A low-memory, daily-driver desktop browser written in Rust and powered by CEF (`
 
 Repository: [github.com/c4bo3l/kasumi-browser](https://github.com/c4bo3l/kasumi-browser) · [Release notes](RELEASE_NOTES.md) · [PR checks](https://github.com/c4bo3l/kasumi-browser/actions/workflows/pr.yml)
 
-Current version: **0.10.0**. Version bumps land in release PRs and become official at merge, as required by [AGENTS.md](AGENTS.md).
+Current version: **0.11.0**. Version bumps land in release PRs and become official at merge, as required by [AGENTS.md](AGENTS.md).
 
 ---
 
@@ -22,6 +22,7 @@ Current version: **0.10.0**. Version bumps land in release PRs and become offici
 - Collapsible vertical workspace rail (208 px expanded / 44 px icon rail), pinned tabs, tab context menu, and per-workspace tab state.
 - Floating `Cmd/Ctrl+K` command palette for tab search, URL/search resolution, and native actions.
 - Native Workspaces, Incognito mode, Settings, downloads bubble, bookmark manager, tab menu, tooltips, and system notifications.
+- Native Web Notification API support: remembered per-site permission prompts, clickable notification cards above the page, and click-through to the originating tab when the card is activated. Incognito decisions stay in memory and never reach SQLite.
 - Native WebRTC media-access prompts for camera, microphone, and desktop audio/video capture, with remembered decisions for normal spaces. `getDisplayMedia` opens Kasumi's own display/window picker, with Material Symbols source icons, and passes the selected source to Chromium.
 - 24 DIP bottom HUDs for Command/DevTools and blocked-request/RAM status.
 - SQLite-backed history, bookmarks, downloads, pinned tabs, workspaces, preferences, and low-RAM session restore.
@@ -57,6 +58,7 @@ src/
 ├── browser/
 │   ├── client.rs           # CEF handlers (lifecycle, load, input, permissions, downloads)
 │   ├── adblocker.rs        # adblock-rust request interception
+│   ├── notifications.rs    # Web Notification API shim and native bridge
 │   └── hibernation.rs      # TabManager, workspace state, RAM watchdog
 ├── storage/                # SQLite WAL schema and async worker
 └── ui/
@@ -175,11 +177,11 @@ CI runs the same checks on macOS 15 Intel, Windows, and Linux.
 
 ## Known issues
 
-Windows and Linux native child-view, tooltip, download, bookmark, and media-permission flows still need hands-on verification.
+Windows and Linux native child-view, tooltip, download, bookmark, media-permission, and website-notification flows still need hands-on verification.
 
 ## Roadmap
 
-Current focus: WebRTC calls. Next: website notifications (Notification API permission prompts, native notification display, and click-through), native print support, browser import, cross-platform verification, auto-update, PiP, local AI, and extension support. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for completed work.
+Up next: find in page (`Cmd/Ctrl+F`), native print support, browser import, cross-platform verification, auto-update, PiP, local AI, and extension support. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for completed work and [Future development](RELEASE_NOTES.md#future-development) for deferred items.
 
 ## Adblock filter lists
 

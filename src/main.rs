@@ -26,7 +26,7 @@ use events::{BrowserShortcut, UiAction};
 use storage::db::{StorageHandle, StorageManager};
 use ui::chrome::{
     ChromeOverlayRenderer, ChromeRenderer, ChromeState, ChromeTheme, PageHudRenderer,
-    TooltipRenderer,
+    TooltipRenderer, WebNotificationRenderer, WEB_NOTIFICATION_HEIGHT, WEB_NOTIFICATION_WIDTH,
 };
 use ui::platform_view::ContentRect;
 use winit::application::ApplicationHandler;
@@ -588,7 +588,7 @@ fn install_macos_main_menu() {
     let app_menu = NSMenu::new(mtm);
     let app_version = NSMenuItem::new(mtm);
     unsafe {
-        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.10.0"));
+        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.11.0"));
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
@@ -782,6 +782,15 @@ struct KasumiBrowserHandler {
     page_hud: Option<PageHudRenderer>,
     page_hud_visible: bool,
 
+    // Small always-on-top window for one clickable website notification. It is
+    // separate from the shared modal overlay so clicks land on the card and the
+    // rest of the page keeps receiving input.
+    notification_window: Option<Arc<Window>>,
+    notification_window_id: Option<WindowId>,
+    notification: Option<WebNotificationRenderer>,
+    notification_visible: bool,
+    notification_size: Option<(u32, u32)>,
+
     // Current UI state (populated from CEF events in Phase 3+)
     chrome_state: ChromeState,
 
@@ -842,6 +851,11 @@ impl KasumiBrowserHandler {
             page_hud_window_id: None,
             page_hud: None,
             page_hud_visible: false,
+            notification_window: None,
+            notification_window_id: None,
+            notification: None,
+            notification_visible: false,
+            notification_size: None,
             chrome_state: ChromeState::default(),
             modifiers: ModifiersState::default(),
             shutdown_requested: false,
@@ -1053,6 +1067,124 @@ impl KasumiBrowserHandler {
         }
         if let Some(window) = self.page_hud_window.as_ref() {
             window.request_redraw();
+        }
+    }
+
+    /// Show, reposition, or hide the small clickable website-notification
+    /// window. A modal prompt always hides it; the notification stays queued and
+    /// reappears when the overlay closes.
+    fn sync_web_notification_overlay(&mut self, event_loop: &ActiveEventLoop) {
+        if self.shutdown_requested {
+            self.hide_web_notification_overlay();
+            return;
+        }
+        if let Some(expired) = self.chrome_state.expire_web_notification() {
+            if let Some(tm) = self.tab_manager.as_mut() {
+                tm.handle_ui_action(UiAction::DismissWebNotification {
+                    tab_id: expired.tab_id,
+                    notification_id: expired.id,
+                });
+            }
+        }
+        self.chrome_state.promote_pending_web_notification();
+
+        if self.chrome_state.web_notification.is_none() || self.chrome_state.has_modal_overlay() {
+            self.hide_web_notification_overlay();
+            return;
+        }
+
+        if self.notification_window.is_none() {
+            let attrs = Window::default_attributes()
+                .with_title("Kasumi Notification")
+                .with_inner_size(winit::dpi::LogicalSize::new(
+                    WEB_NOTIFICATION_WIDTH,
+                    WEB_NOTIFICATION_HEIGHT,
+                ))
+                .with_transparent(true)
+                .with_decorations(false)
+                .with_resizable(false)
+                .with_visible(false)
+                .with_window_level(WindowLevel::AlwaysOnTop);
+            let window = match event_loop.create_window(attrs) {
+                Ok(window) => Arc::new(window),
+                Err(e) => {
+                    tracing::error!("Failed to create web notification window: {e}");
+                    return;
+                }
+            };
+            window.set_window_level(WindowLevel::AlwaysOnTop);
+            self.notification_window_id = Some(window.id());
+            self.notification_window = Some(window);
+        }
+
+        if self.notification.is_none() {
+            let Some(window) = self.notification_window.as_ref() else {
+                return;
+            };
+            let Some(renderer) = WebNotificationRenderer::new(
+                Arc::clone(window),
+                &self.wgpu_instance,
+                &self.adapter,
+                Arc::clone(&self.device),
+                Arc::clone(&self.queue),
+            ) else {
+                tracing::error!("Failed to initialize web notification renderer");
+                return;
+            };
+            self.notification = Some(renderer);
+        }
+
+        let (Some(main), Some(window)) = (self.window.as_ref(), self.notification_window.as_ref())
+        else {
+            return;
+        };
+        let main_scale = effective_scale_factor(main.scale_factor());
+        let main_size = main.inner_size();
+        let logical_width = main_size.width as f64 / main_scale;
+        let content_left = rail_width(self.chrome_state.rail_expanded) as f64;
+        let x = (logical_width - WEB_NOTIFICATION_WIDTH as f64 - 16.0).max(content_left + 8.0);
+        // Keep clear of a transient download toast in the shared overlay.
+        let y = if self.chrome_state.toast.is_some() {
+            16.0 + 74.0
+        } else {
+            16.0
+        };
+        let content_origin = match main.inner_position().or_else(|_| main.outer_position()) {
+            Ok(origin) => origin,
+            Err(_) => return,
+        };
+        // Position before sizing: moving across displays can change the
+        // window's backing scale factor, and the OS may resize its backing
+        // pixels as it crosses. Sizing afterwards keeps the card at its
+        // logical dimensions on the new display.
+        window.set_outer_position(overlay_screen_position(
+            content_origin,
+            (x as f32, y as f32),
+            main_scale,
+        ));
+
+        let size = web_notification_physical_size(window.scale_factor());
+        if self.notification_size != Some((size.width, size.height)) {
+            let _ = window.request_inner_size(size);
+            self.notification_size = Some((size.width, size.height));
+        }
+
+        if !self.notification_visible {
+            // winit's macOS `set_visible(true)` makes the new window key. A
+            // notification must never steal keyboard focus, so use AppKit's
+            // non-key ordering path there (and the normal path elsewhere).
+            show_notification_window_without_focus(window);
+            self.notification_visible = true;
+        }
+        window.request_redraw();
+    }
+
+    fn hide_web_notification_overlay(&mut self) {
+        if self.notification_visible {
+            if let Some(window) = self.notification_window.as_ref() {
+                let _ = window.set_visible(false);
+            }
+            self.notification_visible = false;
         }
     }
 
@@ -1463,6 +1595,66 @@ fn overlay_screen_position(
     )
 }
 
+/// Ignore invalid winit scale factors so a display transition can never turn
+/// an overlay's physical size into zero or a saturated `u32`.
+fn effective_scale_factor(scale_factor: f64) -> f64 {
+    if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    }
+}
+
+/// Physical size of the notification card for the display that currently owns
+/// its window. Moving the browser between displays changes this value.
+fn web_notification_physical_size(scale_factor: f64) -> winit::dpi::PhysicalSize<u32> {
+    let scale = effective_scale_factor(scale_factor);
+    winit::dpi::PhysicalSize::new(
+        (WEB_NOTIFICATION_WIDTH as f64 * scale).round().max(1.0) as u32,
+        (WEB_NOTIFICATION_HEIGHT as f64 * scale).round().max(1.0) as u32,
+    )
+}
+
+/// Show the website-notification window without making it the key window.
+/// AppKit's `orderFrontRegardless` keeps keyboard focus on the page while the
+/// always-on-top card remains clickable.
+#[cfg(target_os = "macos")]
+fn show_notification_window_without_focus(window: &Window) {
+    use objc2_app_kit::NSView;
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = window.window_handle() else {
+        let _ = window.set_visible(true);
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        let _ = window.set_visible(true);
+        return;
+    };
+    let view_ptr = appkit.ns_view.as_ptr().cast::<NSView>();
+    if view_ptr.is_null() {
+        let _ = window.set_visible(true);
+        return;
+    }
+    // SAFETY: the view belongs to the live winit window and this runs on the
+    // main thread.
+    unsafe {
+        let view: &NSView = &*view_ptr;
+        if let Some(ns_window) = view.window() {
+            ns_window.orderFrontRegardless();
+            return;
+        }
+    }
+    let _ = window.set_visible(true);
+}
+
+/// Windows and Linux have no equivalent no-activate helper wired yet, so show
+/// the notification window normally and let the platform decide focus.
+#[cfg(not(target_os = "macos"))]
+fn show_notification_window_without_focus(window: &Window) {
+    window.set_visible(true);
+}
+
 /// Cmd on macOS, Ctrl elsewhere. Keeping this decision in one place makes the
 /// shortcut behavior easy to test without constructing a winit event loop.
 fn is_primary_shortcut_modifier(modifiers: ModifiersState) -> bool {
@@ -1819,6 +2011,68 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             return;
         }
 
+        // Website notification window events are handled on their own small
+        // surface. A card click activates the source tab and dispatches the
+        // page handler without ever blocking the rest of the page.
+        if Some(window_id) == self.notification_window_id {
+            let _consumed = if let (Some(window), Some(renderer)) = (
+                self.notification_window.as_ref(),
+                self.notification.as_mut(),
+            ) {
+                renderer.on_window_event(window, &event)
+            } else {
+                false
+            };
+
+            match event {
+                WindowEvent::CloseRequested => {
+                    let _ = self.chrome_state.take_web_notification();
+                    self.hide_web_notification_overlay();
+                }
+                WindowEvent::Resized(new_size) => {
+                    if let Some(renderer) = self.notification.as_mut() {
+                        renderer.resize(new_size);
+                    }
+                }
+                WindowEvent::ScaleFactorChanged {
+                    scale_factor,
+                    mut inner_size_writer,
+                } => {
+                    // Apply the card's logical size synchronously during the
+                    // DPI change. Letting the OS keep its suggested backing
+                    // size is what made the card grow or shrink after a move.
+                    let desired = web_notification_physical_size(scale_factor);
+                    if inner_size_writer.request_inner_size(desired).is_ok() {
+                        self.notification_size = Some((desired.width, desired.height));
+                    }
+                    if let Some(renderer) = self.notification.as_mut() {
+                        renderer.resize(desired);
+                    }
+                }
+                WindowEvent::RedrawRequested => {
+                    let actions = if let (Some(window), Some(renderer)) = (
+                        self.notification_window.as_ref(),
+                        self.notification.as_mut(),
+                    ) {
+                        renderer.render(window, &self.chrome_state)
+                    } else {
+                        Vec::new()
+                    };
+                    if !actions.is_empty() {
+                        let _ = self.chrome_state.take_web_notification();
+                        self.hide_web_notification_overlay();
+                        self.handle_ui_actions(actions);
+                        if let Some(main) = self.window.as_ref() {
+                            main.focus_window();
+                        }
+                    }
+                    self.sync_web_notification_overlay(event_loop);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Tooltip overlay events never reach the main chrome or shortcuts.
         if Some(window_id) == self.tooltip_window_id {
             let _consumed = if let (Some(window), Some(tooltip)) =
@@ -2014,8 +2268,34 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                 // the user drags the main window between monitors.
                 self.position_chrome_overlay();
                 self.position_page_huds();
+                self.notification_size = None;
                 self.chrome_state.tooltip = None;
                 self.hide_tooltip_overlay();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // A display change alters the backing size of every native
+                // surface. Recompute the CEF rect and force the notification
+                // card to be sized again for the new DPI.
+                self.position_chrome_overlay();
+                self.position_page_huds();
+                self.notification_size = None;
+                if let (Some(window), Some(chrome)) = (self.window.as_ref(), self.chrome.as_mut()) {
+                    chrome.resize(window.inner_size());
+                }
+                if let (Some(window), Some(tm)) = (self.window.as_ref(), self.tab_manager.as_mut())
+                {
+                    let size = window.inner_size();
+                    let mut rect = ContentRect::from_window(
+                        size.width,
+                        size.height,
+                        *scale_factor,
+                        rail_width(self.chrome_state.rail_expanded),
+                    );
+                    rect.height = rect
+                        .height
+                        .saturating_sub((PAGE_HUD_HEIGHT + PAGE_HUD_MARGIN * 2.0) as u32);
+                    tm.resize(rect);
+                }
             }
             WindowEvent::Resized(new_size) => {
                 if let Some(chrome) = self.chrome.as_mut() {
@@ -2075,6 +2355,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
 
         self.sync_chrome_overlay(event_loop);
         self.sync_tooltip_overlay(event_loop);
+        self.sync_web_notification_overlay(event_loop);
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -2118,6 +2399,12 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             for notification in tm.consume_download_notifications() {
                 self.chrome_state.show_download_notification(notification);
             }
+            for notification in tm.consume_web_notifications() {
+                self.chrome_state.show_web_notification(notification);
+            }
+            for notification_id in tm.consume_closed_web_notifications() {
+                self.chrome_state.remove_web_notification(&notification_id);
+            }
             if new_download && !self.chrome_state.has_modal_overlay() {
                 self.chrome_state.open_downloads();
             } else if explicit_downloads_request {
@@ -2144,6 +2431,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
         self.request_page_hud_redraw();
         self.sync_chrome_overlay(event_loop);
         self.sync_tooltip_overlay(event_loop);
+        self.sync_web_notification_overlay(event_loop);
 
         if self.shutdown_requested {
             // The one-shot observer may not fire until the run loop is allowed
@@ -2433,12 +2721,13 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_copy_url_shortcut, is_new_private_window_shortcut, is_primary_shortcut_modifier,
-        is_quit_shortcut, is_reopen_tab_shortcut, overlay_screen_position, pointer_is_past_rail,
+        effective_scale_factor, is_copy_url_shortcut, is_new_private_window_shortcut,
+        is_primary_shortcut_modifier, is_quit_shortcut, is_reopen_tab_shortcut,
+        overlay_screen_position, pointer_is_past_rail, web_notification_physical_size,
         BrowserShortcut,
     };
     use crate::config::rail_width;
-    use winit::dpi::PhysicalPosition;
+    use winit::dpi::{PhysicalPosition, PhysicalSize};
     use winit::keyboard::{Key, ModifiersState};
 
     #[cfg(target_os = "macos")]
@@ -2676,6 +2965,30 @@ mod tests {
             shortcut_from_parts('c', 0x08, cmd),
             None,
             "plain Cmd+C must keep copying the page selection"
+        );
+    }
+
+    #[test]
+    fn notification_card_size_follows_the_display_scale_factor() {
+        assert_eq!(effective_scale_factor(2.0), 2.0);
+        assert_eq!(effective_scale_factor(0.0), 1.0);
+        assert_eq!(effective_scale_factor(f64::NAN), 1.0);
+
+        assert_eq!(
+            web_notification_physical_size(1.0),
+            PhysicalSize::new(368, 122)
+        );
+        assert_eq!(
+            web_notification_physical_size(1.5),
+            PhysicalSize::new(552, 183)
+        );
+        assert_eq!(
+            web_notification_physical_size(2.0),
+            PhysicalSize::new(736, 244)
+        );
+        assert_eq!(
+            web_notification_physical_size(f64::NAN),
+            PhysicalSize::new(368, 122)
         );
     }
 }

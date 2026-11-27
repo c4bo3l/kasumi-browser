@@ -4,7 +4,35 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
-## v0.10.0 — Unreleased
+## v0.11.0 — Unreleased
+
+### Added
+
+- Native Web Notification API support. A renderer shim replaces `window.Notification` so pages can request permission, construct notifications, call `notification.close()`, and register `click`, `show`, `close`, and `error` handlers without depending on CEF's missing Alloy notification presenter.
+- A native permission prompt for website notifications, using the same modal surface as WebRTC prompts. Normal-space decisions are stored in `site_permissions` and restored on startup; Incognito decisions stay in memory and are dropped with the private workspace. Escape or click-outside dismissal leaves the page in the askable `default` state.
+- Clickable native notification cards in a small always-on-top window. Activating a card focuses the originating tab and dispatches the page's `click` handler; the close button dispatches `close`. Notifications queue behind modal chrome and respect `requireInteraction`.
+- Notification ids and payloads are capped and validated before reaching native chrome, and notifications are only displayed for tabs whose origin has a saved grant.
+
+### Changed
+
+- Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.10.0` to `0.11.0`.
+- Added find in page (`Cmd/Ctrl+F`) to the future-development roadmap.
+
+### Fixed
+
+- The notification card's Material Symbols close glyph now renders correctly in its standalone native window.
+- Notification cards keep their logical size when the browser is moved between displays with different scale factors.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bins` — 224 browser tests plus 4 bundle tests
+- `cargo build --release`
+
+---
+
+## v0.10.0 — 2026-11-26
 
 ### Added
 
@@ -597,11 +625,13 @@ Initial public source release: [github.com/c4bo3l/kasumi-browser](https://github
 
 ## Future development
 
-- Vertical tabs
+- Find in page (`Cmd/Ctrl+F`)
+- Native print support
+- Browser import
 - Full Windows and Linux validation
-- More unit tests
-- Settings UI
-- Bookmark manager UI
-- Download manager
 - Automated cross-platform integration tests
 - Release CI and signed artifact publishing
+- Auto-update
+- Picture-in-picture
+- Local AI
+- Extension support

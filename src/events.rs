@@ -331,6 +331,19 @@ pub struct DownloadNotification {
     pub kind: DownloadNotificationKind,
 }
 
+/// A Web Notification API notification mirrored from the renderer shim.
+/// Kept as plain owned data so CEF handler threads never retain page objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebNotification {
+    pub id: String,
+    pub tab_id: u64,
+    pub origin: String,
+    pub title: String,
+    pub body: String,
+    pub tag: String,
+    pub require_interaction: bool,
+}
+
 /// Progress and control results from Kasumi's native segmented downloader.
 /// These are plain owned values so a CEF `UrlRequestClient` callback never
 /// retains a request or performs disk I/O on a Chromium thread.
@@ -533,6 +546,23 @@ pub enum BrowserEvent {
         tab_id: u64,
         token: String,
     },
+    /// A page called `Notification.requestPermission()`. `token` identifies the
+    /// renderer promise that the native prompt resolves.
+    NotificationPermissionRequested {
+        request_id: u64,
+        tab_id: u64,
+        origin: String,
+        token: String,
+    },
+    /// A page constructed a notification and the renderer shim forwarded its
+    /// content for native display.
+    WebNotificationShown(WebNotification),
+    /// A page called `notification.close()` for a notification that may still be
+    /// visible in the native notification window.
+    WebNotificationClosed {
+        tab_id: u64,
+        id: String,
+    },
 }
 
 /// Native browser shortcuts mirrored from CEF's `on_pre_key_event`.
@@ -676,6 +706,29 @@ impl std::fmt::Debug for BrowserEvent {
                 .debug_struct("DisplayMediaPickerRequested")
                 .field("tab_id", tab_id)
                 .field("token", token)
+                .finish(),
+            Self::NotificationPermissionRequested {
+                request_id,
+                tab_id,
+                origin,
+                token,
+            } => f
+                .debug_struct("NotificationPermissionRequested")
+                .field("request_id", request_id)
+                .field("tab_id", tab_id)
+                .field("origin", origin)
+                .field("token", token)
+                .finish(),
+            Self::WebNotificationShown(notification) => f
+                .debug_struct("WebNotificationShown")
+                .field("tab_id", &notification.tab_id)
+                .field("id", &notification.id)
+                .field("title", &notification.title)
+                .finish(),
+            Self::WebNotificationClosed { tab_id, id } => f
+                .debug_struct("WebNotificationClosed")
+                .field("tab_id", tab_id)
+                .field("id", id)
                 .finish(),
             Self::ParallelDownload(event) => {
                 f.debug_tuple("ParallelDownload").field(event).finish()
@@ -837,6 +890,24 @@ pub enum UiAction {
     ResolveDisplayMediaPicker {
         token: String,
         device_id: Option<String>,
+    },
+    /// Resolve a native Web Notification permission prompt. `persist` is false
+    /// for Escape/click-outside dismissal so a transient close never becomes a
+    /// permanent site rule.
+    ResolveNotificationPermission {
+        request_id: u64,
+        granted: bool,
+        persist: bool,
+    },
+    /// Activate the notification's source tab and dispatch its `click` handler.
+    ActivateWebNotification {
+        tab_id: u64,
+        notification_id: String,
+    },
+    /// Dismiss a native web notification and dispatch its `close` handler.
+    DismissWebNotification {
+        tab_id: u64,
+        notification_id: String,
     },
 }
 
