@@ -22,6 +22,7 @@ use crossbeam_channel::{Receiver, Sender};
 use sysinfo::{ProcessesToUpdate, System};
 
 use crate::browser::favicon::create_favicon_download_callback;
+use crate::browser::find;
 use crate::browser::parallel_download::{
     self, part_path_for, safe_file_name, DownloadWriter, SegmentRange,
 };
@@ -33,8 +34,9 @@ use crate::config::{
 };
 use crate::events::{
     normalize_permission_origin, BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo,
-    DownloadNotification, DownloadNotificationKind, DownloadState, MediaAccessPermissions,
-    MediaPermissionCallback, ParallelDownloadEvent, UiAction, WebNotification,
+    DownloadNotification, DownloadNotificationKind, DownloadState, FindOptions, FindSnippet,
+    MediaAccessPermissions, MediaPermissionCallback, ParallelDownloadEvent, UiAction,
+    WebNotification,
 };
 use crate::storage::db::{BookmarkItem, SessionTabSnapshot, SitePermission, StorageHandle};
 use crate::ui::chrome::{
@@ -516,6 +518,28 @@ fn sync_media_content_settings(
     }
 }
 
+/// Plain-data mirror of a CEF `OnFindResult` callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FindResultSnapshot {
+    pub count: i32,
+    pub active_ordinal: i32,
+    pub final_update: bool,
+    /// Our monotonic request id, shared by the native and rich bridges.
+    pub request_id: u64,
+    /// Advanced queries must ignore in-flight CEF results from an older query.
+    pub advanced: bool,
+    /// A hibernated tab is queued to run this query when its browser wakes.
+    pub pending: bool,
+}
+
+/// A find request that must wait until a hibernated tab's browser is recreated.
+#[derive(Debug, Clone)]
+struct PendingFindRequest {
+    query: String,
+    match_case: bool,
+    options: FindOptions,
+}
+
 pub struct TabManager {
     pub tabs: Vec<Tab>,
     pub active_tab_id: Option<u64>,
@@ -608,6 +632,16 @@ pub struct TabManager {
     saved_site_permissions: BTreeMap<(String, String), bool>,
     private_site_permissions: BTreeMap<(String, String), bool>,
 
+    /// Latest CEF find result per tab, mirrored into `TabInfo` for the find bar
+    /// and cross-tab result list. Kept outside `Tab` so every existing tab
+    /// constructor stays small and hibernation never has to reset find state.
+    find_results: HashMap<u64, FindResultSnapshot>,
+    /// Rich snippets and invalid-regex messages mirrored from the renderer shim.
+    find_snippets: HashMap<u64, Vec<FindSnippet>>,
+    find_errors: HashMap<u64, String>,
+    next_find_request_id: u64,
+    pending_find_on_wake: HashMap<u64, PendingFindRequest>,
+
     // Number of `host.close_browser(1)` calls awaiting an `on_before_close` event.
     pending_browser_closes: u32,
 
@@ -619,6 +653,9 @@ pub struct TabManager {
 
     // Retry state for browsers that have not committed their initial URL.
     pending_navigation_checks: HashMap<u64, PendingNavigationCheck>,
+
+    // Set when CEF forwards Cmd/Ctrl+F; consumed by the winit handler.
+    find_requested: bool,
 
     // Set when CEF forwards Cmd/Ctrl+K; consumed by the winit handler.
     command_palette_requested: bool,
@@ -758,9 +795,15 @@ impl TabManager {
             closed_web_notifications: Vec::new(),
             saved_site_permissions: BTreeMap::new(),
             private_site_permissions: BTreeMap::new(),
+            find_results: HashMap::new(),
+            find_snippets: HashMap::new(),
+            find_errors: HashMap::new(),
+            next_find_request_id: 1,
+            pending_find_on_wake: HashMap::new(),
             pending_browser_closes: 0,
             pending_browser_spawns: VecDeque::new(),
             pending_navigation_checks: HashMap::new(),
+            find_requested: false,
             command_palette_requested: false,
             settings_requested: false,
             downloads_requested: false,
@@ -2564,6 +2607,10 @@ impl TabManager {
             self.active_tab_by_workspace.remove(&tab.workspace_id);
         }
         self.pending_navigation_checks.remove(&id);
+        self.pending_find_on_wake.remove(&id);
+        self.find_results.remove(&id);
+        self.find_snippets.remove(&id);
+        self.find_errors.remove(&id);
         self.discard_media_permissions_for_tab(id);
         self.requested_favicons.retain(|(tab_id, _)| *tab_id != id);
         self.pending_favicon_urls.remove(&id);
@@ -3316,6 +3363,11 @@ impl TabManager {
         self.resolve_ready_auto_media_permissions();
     }
 
+    /// Consume a Cmd/Ctrl+F request forwarded from the CEF web view.
+    pub fn consume_find_request(&mut self) -> bool {
+        std::mem::take(&mut self.find_requested)
+    }
+
     /// Consume a Cmd/Ctrl+K request forwarded from the CEF web view.
     pub fn consume_command_palette_request(&mut self) -> bool {
         std::mem::take(&mut self.command_palette_requested)
@@ -3639,6 +3691,16 @@ impl TabManager {
                         }
                     }
                 }
+                if let Some(pending) = self.pending_find_on_wake.remove(&tab_id) {
+                    self.find_in_page(
+                        tab_id,
+                        &pending.query,
+                        true,
+                        pending.match_case,
+                        false,
+                        pending.options,
+                    );
+                }
                 if let Some(urls) = self.pending_favicon_urls.remove(&tab_id) {
                     if !urls.is_empty() {
                         self.request_favicon_downloads(tab_id, urls);
@@ -3722,6 +3784,86 @@ impl TabManager {
                     tab.blocked_requests += 1;
                 }
             }
+            BrowserEvent::FindResult {
+                tab_id,
+                identifier: _,
+                count,
+                active_match_ordinal,
+                final_update,
+            } => {
+                // The rich shim owns snippets; CEF remains authoritative for the
+                // fast substring count and active match ordinal. `identifier`
+                // is CEF's own ordinal and must not replace our shim request id,
+                // otherwise late snippet payloads would look stale.
+                let Some(current) = self.find_results.get(&tab_id).copied() else {
+                    return;
+                };
+                if current.advanced || current.pending {
+                    return;
+                }
+                self.find_results.insert(
+                    tab_id,
+                    FindResultSnapshot {
+                        count,
+                        active_ordinal: active_match_ordinal,
+                        final_update,
+                        request_id: current.request_id,
+                        advanced: false,
+                        pending: false,
+                    },
+                );
+            }
+            BrowserEvent::FindResultRich {
+                tab_id,
+                request_id,
+                count,
+                active_ordinal,
+                snippets,
+                error,
+                cleared,
+            } => {
+                let current = self.find_results.get(&tab_id).copied();
+                if cleared {
+                    if current.is_some_and(|result| result.request_id == request_id) {
+                        self.find_results.remove(&tab_id);
+                        self.find_snippets.remove(&tab_id);
+                        self.find_errors.remove(&tab_id);
+                    }
+                    return;
+                }
+                if !current.is_some_and(|result| result.request_id == request_id) {
+                    // Late payload from a superseded query. It can still carry
+                    // an active-match update for the current query, so only the
+                    // count/snippet payload is dropped here.
+                    if active_ordinal > 0 && snippets.is_empty() {
+                        if let Some(result) = self.find_results.get_mut(&tab_id) {
+                            result.active_ordinal = active_ordinal;
+                        }
+                    }
+                    return;
+                }
+                if !snippets.is_empty() {
+                    self.find_snippets.insert(tab_id, snippets);
+                }
+                if !error.is_empty() {
+                    self.find_errors.insert(tab_id, error);
+                    self.find_results.remove(&tab_id);
+                    self.find_snippets.remove(&tab_id);
+                    return;
+                }
+                self.find_errors.remove(&tab_id);
+                self.find_results.insert(
+                    tab_id,
+                    FindResultSnapshot {
+                        count,
+                        active_ordinal,
+                        final_update: true,
+                        request_id,
+                        advanced: current.is_some_and(|result| result.advanced),
+                        pending: false,
+                    },
+                );
+            }
             BrowserEvent::BrowserClosed { tab_id } => {
                 self.pending_navigation_checks.remove(&tab_id);
                 self.discard_media_permissions_for_tab(tab_id);
@@ -3755,6 +3897,9 @@ impl TabManager {
                 }
                 BrowserShortcut::OpenDevTools => {
                     self.show_dev_tools(tab_id);
+                }
+                BrowserShortcut::FindInPage => {
+                    self.find_requested = true;
                 }
                 BrowserShortcut::OpenSettings => {
                     self.settings_requested = true;
@@ -3922,6 +4067,187 @@ impl TabManager {
                     );
                 }
             }
+        }
+    }
+
+    /// Execute a small find script in a live tab. A missing frame means the tab
+    /// hibernated or navigated while the user was typing; the request is simply
+    /// dropped instead of touching CEF from the wrong thread.
+    fn execute_find_script(&self, tab_id: u64, script: &str) -> bool {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.browser.as_ref())
+            .and_then(|browser| browser.main_frame())
+            .map(|frame| {
+                frame.execute_java_script(Some(&CefString::from(script)), None, 0);
+            })
+            .is_some()
+    }
+
+    /// Run find on one tab or, for the cross-tab scope, every live tab.
+    ///
+    /// Plain substring queries use the fast native CEF matcher and the rich
+    /// shim only for snippets. Regex, whole-word, and multi-term queries use the
+    /// `TreeWalker`/`CSS.highlights` path exclusively. Hibernated tabs have no
+    /// `BrowserHost`, so they are skipped here; clicking one in the results list
+    /// wakes it and re-runs the query.
+    pub fn find_in_page(
+        &mut self,
+        tab_id: u64,
+        query: &str,
+        forward: bool,
+        match_case: bool,
+        find_next: bool,
+        options: FindOptions,
+    ) {
+        let targets: Vec<u64> = if options.all_tabs {
+            // Include hibernated tabs so the query can wait for them to wake;
+            // `find_next` and the script executor silently skip tabs with no
+            // live frame.
+            self.tabs.iter().map(|tab| tab.id).collect()
+        } else {
+            vec![tab_id]
+        };
+        if targets.is_empty() {
+            return;
+        }
+
+        if query.is_empty() {
+            for target in targets {
+                self.stop_finding(target, true);
+                self.pending_find_on_wake.remove(&target);
+            }
+            return;
+        }
+
+        // Move between existing matches without rebuilding the DOM ranges.
+        if find_next {
+            for target in targets {
+                if !options.is_advanced() {
+                    let Some(tab) = self.tabs.iter().find(|tab| tab.id == target) else {
+                        continue;
+                    };
+                    if let Some(host) = tab.browser.as_ref().and_then(|browser| browser.host()) {
+                        let text = CefString::from(query);
+                        host.find(Some(&text), i32::from(forward), i32::from(match_case), 1);
+                    }
+                }
+                let script = find::next_script(forward);
+                if !self.execute_find_script(target, &script) {
+                    tracing::debug!("Find-next skipped for tab {target}: no live frame");
+                }
+            }
+            return;
+        }
+
+        let request_id = self.next_find_request_id;
+        self.next_find_request_id = self.next_find_request_id.wrapping_add(1).max(1);
+
+        for target in targets {
+            let has_browser = self
+                .tabs
+                .iter()
+                .find(|tab| tab.id == target)
+                .is_some_and(|tab| tab.browser.is_some());
+            if !has_browser {
+                self.pending_find_on_wake.insert(
+                    target,
+                    PendingFindRequest {
+                        query: query.to_string(),
+                        match_case,
+                        // Waking this tab is a single-tab replay, not a new
+                        // cross-tab sweep that would restart every live search.
+                        options: FindOptions {
+                            all_tabs: false,
+                            ..options
+                        },
+                    },
+                );
+                self.find_results.insert(
+                    target,
+                    FindResultSnapshot {
+                        count: -1,
+                        active_ordinal: -1,
+                        final_update: false,
+                        request_id,
+                        advanced: options.is_advanced(),
+                        pending: true,
+                    },
+                );
+                self.find_snippets.remove(&target);
+                self.find_errors.remove(&target);
+                continue;
+            }
+
+            self.find_results.insert(
+                target,
+                FindResultSnapshot {
+                    count: 0,
+                    active_ordinal: -1,
+                    final_update: false,
+                    request_id,
+                    advanced: options.is_advanced(),
+                    pending: false,
+                },
+            );
+            self.find_snippets.remove(&target);
+            self.find_errors.remove(&target);
+
+            if !options.is_advanced() {
+                let Some(tab) = self.tabs.iter().find(|tab| tab.id == target) else {
+                    continue;
+                };
+                if let Some(host) = tab.browser.as_ref().and_then(|browser| browser.host()) {
+                    let text = CefString::from(query);
+                    host.find(Some(&text), i32::from(forward), i32::from(match_case), 0);
+                }
+            }
+
+            let script = find::run_script(
+                request_id,
+                query,
+                match_case,
+                options.regex,
+                options.whole_word,
+                options.multi_term,
+            );
+            if !self.execute_find_script(target, &script) {
+                tracing::debug!("Rich find skipped for tab {target}: no live frame");
+            }
+        }
+    }
+
+    /// Focus one rich match ordinal, scrolling it into view.
+    pub fn jump_to_find_match(&self, tab_id: u64, ordinal: i32) {
+        let script = find::focus_script(ordinal);
+        if !self.execute_find_script(tab_id, &script) {
+            tracing::debug!("Find jump skipped for tab {tab_id}: no live frame");
+        }
+    }
+
+    /// Clear find highlights (or just the active selection) on a tab.
+    pub fn stop_finding(&mut self, tab_id: u64, clear_selection: bool) {
+        if let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) {
+            if let Some(host) = tab.browser.as_ref().and_then(|browser| browser.host()) {
+                host.stop_finding(i32::from(clear_selection));
+            }
+        }
+        if clear_selection {
+            let script = find::clear_script();
+            self.execute_find_script(tab_id, &script);
+            self.pending_find_on_wake.remove(&tab_id);
+            self.find_results.remove(&tab_id);
+            self.find_snippets.remove(&tab_id);
+            self.find_errors.remove(&tab_id);
+        }
+    }
+
+    /// Clear every find session when the shared find bar is dismissed.
+    pub fn stop_finding_all(&mut self, clear_selection: bool) {
+        let ids: Vec<u64> = self.tabs.iter().map(|tab| tab.id).collect();
+        for tab_id in ids {
+            self.stop_finding(tab_id, clear_selection);
         }
     }
 
@@ -4231,6 +4557,24 @@ impl TabManager {
             } => {
                 self.dispatch_web_notification_event(tab_id, &notification_id, "close");
             }
+            UiAction::FindInPage {
+                tab_id,
+                query,
+                forward,
+                match_case,
+                find_next,
+                options,
+            } => self.find_in_page(tab_id, &query, forward, match_case, find_next, options),
+            UiAction::JumpToFindMatch { tab_id, ordinal } => {
+                self.jump_to_find_match(tab_id, ordinal);
+            }
+            UiAction::StopFinding {
+                tab_id,
+                clear_selection,
+            } => self.stop_finding(tab_id, clear_selection),
+            UiAction::StopFindingAll { clear_selection } => {
+                self.stop_finding_all(clear_selection);
+            }
             // The winit handler persists the live rail toggle; tab state needs
             // no change for a chrome width update.
             UiAction::SetRailExpanded(_) => {}
@@ -4358,6 +4702,22 @@ impl TabManager {
                 can_go_forward: t.can_go_forward,
                 is_pinned: t.pinned,
                 favicon: t.favicon.clone(),
+                find_count: self
+                    .find_results
+                    .get(&t.id)
+                    .map(|result| result.count)
+                    .unwrap_or(-1),
+                find_active_ordinal: self
+                    .find_results
+                    .get(&t.id)
+                    .map(|result| result.active_ordinal)
+                    .unwrap_or(-1),
+                find_pending: self
+                    .find_results
+                    .get(&t.id)
+                    .is_some_and(|result| result.pending),
+                find_snippets: self.find_snippets.get(&t.id).cloned().unwrap_or_default(),
+                find_error: self.find_errors.get(&t.id).cloned().unwrap_or_default(),
             })
             .collect();
 

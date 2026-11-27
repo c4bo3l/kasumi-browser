@@ -34,7 +34,7 @@ use crate::config::{
 };
 use crate::events::{
     DownloadEngine, DownloadInfo, DownloadNotification, DownloadNotificationKind, DownloadState,
-    UiAction, WebNotification,
+    FindOptions, FindSnippet, UiAction, WebNotification,
 };
 
 /// Light or dark chrome appearance. The OS theme decides the default, and
@@ -620,6 +620,16 @@ pub struct TabInfo {
     pub can_go_forward: bool,
     pub is_pinned: bool,
     pub favicon: Option<Favicon>,
+    /// Native find result count, or -1 when this tab has not been searched.
+    pub find_count: i32,
+    /// One-based index of the active match, or -1 when unknown.
+    pub find_active_ordinal: i32,
+    /// Query is waiting for this hibernated tab to wake before it can run.
+    pub find_pending: bool,
+    /// Rich context snippets emitted by the renderer find shim.
+    pub find_snippets: Vec<FindSnippet>,
+    /// Invalid-regex or shim error for this tab's current find query.
+    pub find_error: String,
 }
 
 /// A native workspace as displayed in the rail and settings overlay.
@@ -875,6 +885,37 @@ pub struct ChromeState {
     pub theme: ChromeTheme,
     /// Persisted user preferences mirrored into the chrome state.
     pub preferences: BrowserPreferences,
+    /// True while the native find-in-page bar is visible in the overlay.
+    pub find_bar_open: bool,
+    /// Current query in the find bar.
+    pub find_query: String,
+    /// Case-sensitive find toggle.
+    pub find_match_case: bool,
+    /// Regex toggle. Advanced mode is handled by the JS highlighter.
+    pub find_regex: bool,
+    /// Whole-word toggle. Advanced mode is handled by the JS highlighter.
+    pub find_whole_word: bool,
+    /// Multi-term mode (`error | timeout`). Each term gets its own colour.
+    pub find_multi_term: bool,
+    /// `This tab` vs `All tabs` search scope.
+    pub find_all_tabs: bool,
+    /// Snippet drawer expansion state.
+    pub find_drawer_open: bool,
+    /// Set when the find input should take focus on the next overlay frame.
+    pub find_focus_requested: bool,
+    /// Set when another overlay superseded find and CEF highlights need clearing.
+    pub find_dismiss_requested: bool,
+    /// Match count for the active tab, mirrored from CEF.
+    pub find_count: i32,
+    /// One-based active match index, mirrored from CEF.
+    pub find_active_ordinal: i32,
+    /// Active tab's query is waiting for its browser to wake.
+    pub find_pending: bool,
+    /// Error emitted by the rich shim, e.g. an invalid regular expression.
+    pub find_error: String,
+    /// Show only snippets matching this substring in the drawer.
+    pub find_filter_enabled: bool,
+    pub find_filter_query: String,
     /// True while the native Settings overlay is visible.
     pub settings_open: bool,
     /// Page currently shown in the Settings overlay.
@@ -942,6 +983,22 @@ impl Default for ChromeState {
             display_media_picker: None,
             display_media_selection: 0,
             can_reopen_tab: false,
+            find_bar_open: false,
+            find_query: String::new(),
+            find_match_case: false,
+            find_regex: false,
+            find_whole_word: false,
+            find_multi_term: false,
+            find_all_tabs: false,
+            find_drawer_open: false,
+            find_focus_requested: false,
+            find_dismiss_requested: false,
+            find_count: -1,
+            find_active_ordinal: -1,
+            find_pending: false,
+            find_error: String::new(),
+            find_filter_enabled: false,
+            find_filter_query: String::new(),
             system_theme: ChromeTheme::default(),
             theme: ChromeTheme::default(),
             preferences: BrowserPreferences::default(),
@@ -1148,6 +1205,7 @@ impl ChromeState {
     pub fn has_modal_overlay(&self) -> bool {
         self.permission_prompt.is_some()
             || self.display_media_picker.is_some()
+            || self.find_bar_open
             || self.command_palette_open
             || self.menu.is_some()
             || self.settings_open
@@ -1169,8 +1227,67 @@ impl ChromeState {
         self.bookmark_folder_draft.clear();
     }
 
+    /// Open the find bar and focus its input on the next overlay frame.
+    pub fn open_find_bar(&mut self) {
+        self.find_bar_open = true;
+        self.find_focus_requested = true;
+        // Find and the modal palette never share the overlay at once.
+        self.close_command_palette();
+        self.close_tab_menu();
+        self.settings_open = false;
+        self.bookmark_manager_open = false;
+        self.downloads_open = false;
+    }
+
+    /// Hide the find bar and clear its transient query state.
+    pub fn close_find_bar(&mut self) {
+        self.find_bar_open = false;
+        self.find_query.clear();
+        self.find_drawer_open = false;
+        self.find_focus_requested = false;
+        self.find_count = -1;
+        self.find_active_ordinal = -1;
+        self.find_pending = false;
+        self.find_error.clear();
+        self.find_filter_enabled = false;
+        self.find_filter_query.clear();
+    }
+
+    /// Copy the active tab's latest CEF find result into the find bar.
+    pub fn sync_find_result(&mut self, tab_id: u64) {
+        if Some(tab_id) != self.active_tab_id {
+            return;
+        }
+        if let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) {
+            self.find_count = tab.find_count;
+            self.find_active_ordinal = tab.find_active_ordinal;
+            self.find_pending = tab.find_pending;
+            self.find_error = tab.find_error.clone();
+        }
+    }
+
+    /// Another modal surface is taking over the shared overlay. Close find and
+    /// defer highlight cleanup to the next frame, where actions can be emitted.
+    fn dismiss_find_for_overlay(&mut self) {
+        if self.find_bar_open {
+            self.close_find_bar();
+            self.find_dismiss_requested = true;
+        }
+    }
+
+    /// Snapshot the current find toggles for the action bridge.
+    pub fn find_options(&self) -> FindOptions {
+        FindOptions {
+            regex: self.find_regex,
+            whole_word: self.find_whole_word,
+            multi_term: self.find_multi_term,
+            all_tabs: self.find_all_tabs,
+        }
+    }
+
     /// Open the command palette seeded with the active tab's current address.
     pub fn open_command_palette(&mut self) {
+        self.dismiss_find_for_overlay();
         if !self.command_palette_open {
             self.command_palette_query = self.omnibox_text.clone();
             self.command_selection = 0;
@@ -1201,6 +1318,7 @@ impl ChromeState {
     }
 
     pub fn open_tab_menu(&mut self, tab_id: u64, anchor: egui::Pos2) {
+        self.dismiss_find_for_overlay();
         // The palette and menu share one transparent overlay window and must
         // never both claim it. Clearing the palette here also avoids a stale
         // focus request when the menu is dismissed.
@@ -1231,11 +1349,13 @@ impl ChromeState {
 
     /// Open the native Settings overlay on the General page.
     pub fn open_settings(&mut self) {
+        self.dismiss_find_for_overlay();
         self.open_settings_tab(SettingsTab::General);
     }
 
     /// Open the Arc/Edge-style downloads bubble in the shared overlay.
     pub fn open_downloads(&mut self) {
+        self.dismiss_find_for_overlay();
         self.command_palette_open = false;
         self.command_palette_query.clear();
         self.command_selection = 0;
@@ -1321,6 +1441,7 @@ impl ChromeState {
     /// **New workspace** button uses this so creation is never mixed into the
     /// list of existing workspaces.
     pub fn open_workspace_creator(&mut self) {
+        self.dismiss_find_for_overlay();
         self.open_settings_tab(SettingsTab::Workspaces);
         self.workspace_create_mode = true;
     }
@@ -1358,6 +1479,7 @@ impl ChromeState {
     /// Open the standalone bookmark manager dialog on the shared native
     /// overlay. It has its own shortcut and never requires opening Settings.
     pub fn open_bookmark_manager(&mut self) {
+        self.dismiss_find_for_overlay();
         self.command_palette_open = false;
         self.command_palette_query.clear();
         self.command_selection = 0;
@@ -1388,6 +1510,8 @@ impl ChromeState {
             self.close_command_palette();
         } else if self.downloads_open {
             self.close_downloads();
+        } else if self.find_bar_open {
+            self.close_find_bar();
         }
     }
 
@@ -3181,6 +3305,444 @@ impl ChromeRenderer {
             if let Some(item) = items.get(state.command_selection) {
                 apply_command_item(&item.action, state, actions);
             }
+        }
+    }
+
+    /// Draw the floating find bar in the transparent overlay. CEF owns the fast
+    /// substring highlight; the renderer shim supplies snippets, regex/word/
+    /// multi-term highlights, and match navigation metadata.
+    fn build_find_bar(
+        ctx: &egui::Context,
+        state: &mut ChromeState,
+        actions: &mut Vec<UiAction>,
+        focus_input: bool,
+        favicon_textures: &HashMap<String, egui::TextureHandle>,
+    ) {
+        let palette = state.palette();
+        let screen = ctx.viewport_rect();
+        let (width, x, y) = find_bar_geometry(screen);
+        let anchor = pos2(x, y);
+
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let shift = ctx.input(|i| i.modifiers.shift);
+
+        let active_tab = state
+            .tabs
+            .iter()
+            .find(|tab| Some(tab.id) == state.active_tab_id);
+        let snippets: Vec<FindSnippet> = filtered_find_snippets(
+            active_tab,
+            &state.find_filter_query,
+            state.find_filter_enabled,
+        )
+        .into_iter()
+        .cloned()
+        .collect();
+        let active_tab_id = state.active_tab_id.unwrap_or_default();
+
+        let mut card_rect = egui::Rect::from_min_size(anchor, vec2(width, 0.0));
+        let input_id = egui::Id::new("kasumi_find_input");
+
+        egui::Area::new(egui::Id::new("find_bar"))
+            .order(Order::Foreground)
+            .fixed_pos(anchor)
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                card_rect = Frame::NONE
+                    .fill(palette.palette_bg)
+                    .stroke(Stroke::new(1.0_f32, palette.palette_border))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(10, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if focus_input {
+                                ctx.memory_mut(|mem| mem.request_focus(input_id));
+                            }
+                            let input = ui.add(
+                                TextEdit::singleline(&mut state.find_query)
+                                    .id(input_id)
+                                    .hint_text("Find in page…")
+                                    .text_color(palette.text_strong)
+                                    .frame(Frame::NONE)
+                                    .desired_width(width - 156.0),
+                            );
+                            if focus_input {
+                                input.request_focus();
+                            }
+                            if input.changed() {
+                                actions.push(UiAction::FindInPage {
+                                    tab_id: active_tab_id,
+                                    query: state.find_query.clone(),
+                                    forward: true,
+                                    match_case: state.find_match_case,
+                                    find_next: false,
+                                    options: state.find_options(),
+                                });
+                            }
+
+                            let count_label = if state.find_pending {
+                                "…".to_string()
+                            } else if state.find_count < 0 {
+                                "—".to_string()
+                            } else if state.find_count == 0 {
+                                "0/0".to_string()
+                            } else {
+                                let ordinal = state.find_active_ordinal.max(0);
+                                format!("{ordinal}/{}", state.find_count.max(0))
+                            };
+                            ui.label(
+                                RichText::new(count_label)
+                                    .size(11.0)
+                                    .color(palette.palette_subtext),
+                            );
+
+                            let prev = compact_find_icon_button(
+                                ui,
+                                RailIcon::ChevronLeft,
+                                "Previous match (Shift+Enter)",
+                                &palette,
+                                false,
+                            );
+                            let next = compact_find_icon_button(
+                                ui,
+                                RailIcon::ChevronRight,
+                                "Next match (Enter)",
+                                &palette,
+                                false,
+                            );
+                            let close = compact_find_icon_button(
+                                ui,
+                                RailIcon::Close,
+                                "Close find bar (Esc)",
+                                &palette,
+                                false,
+                            );
+                            if prev.clicked() || (enter && shift) {
+                                actions.push(UiAction::FindInPage {
+                                    tab_id: active_tab_id,
+                                    query: state.find_query.clone(),
+                                    forward: false,
+                                    match_case: state.find_match_case,
+                                    find_next: true,
+                                    options: state.find_options(),
+                                });
+                            }
+                            if next.clicked() || (enter && !shift) {
+                                actions.push(UiAction::FindInPage {
+                                    tab_id: active_tab_id,
+                                    query: state.find_query.clone(),
+                                    forward: true,
+                                    match_case: state.find_match_case,
+                                    find_next: true,
+                                    options: state.find_options(),
+                                });
+                            }
+                            if close.clicked() {
+                                actions.push(UiAction::StopFindingAll {
+                                    clear_selection: true,
+                                });
+                                state.close_find_bar();
+                            }
+                        });
+
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let mut toggle = |label: &str, value: &mut bool, tooltip: &str| {
+                                let text = if *value {
+                                    RichText::new(label).size(10.0).color(palette.text_strong)
+                                } else {
+                                    RichText::new(label).size(10.0).color(palette.text_dim)
+                                };
+                                if flat_find_tooltip(ui.button(text), tooltip, &palette).clicked() {
+                                    *value = !*value;
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            let case_changed =
+                                toggle("Aa", &mut state.find_match_case, "Match case");
+                            let regex_changed =
+                                toggle(".*", &mut state.find_regex, "Regular expression");
+                            let word_changed =
+                                toggle("\\b", &mut state.find_whole_word, "Whole word only");
+                            let multi_changed = toggle(
+                                "A|B",
+                                &mut state.find_multi_term,
+                                "Multiple terms, one colour each",
+                            );
+                            let scope_changed = toggle(
+                                "All tabs",
+                                &mut state.find_all_tabs,
+                                "Search every live tab",
+                            );
+                            let drawer_changed = toggle(
+                                "Snippets",
+                                &mut state.find_drawer_open,
+                                "Show match context",
+                            );
+                            if case_changed
+                                || regex_changed
+                                || word_changed
+                                || multi_changed
+                                || scope_changed
+                                || drawer_changed
+                            {
+                                actions.push(UiAction::FindInPage {
+                                    tab_id: active_tab_id,
+                                    query: state.find_query.clone(),
+                                    forward: true,
+                                    match_case: state.find_match_case,
+                                    find_next: false,
+                                    options: state.find_options(),
+                                });
+                            }
+                        });
+
+                        if !state.find_error.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(&state.find_error)
+                                    .size(10.0)
+                                    .color(Color32::from_rgb(255, 138, 128)),
+                            );
+                        }
+
+                        if state.find_all_tabs {
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("Tabs with matches")
+                                    .size(10.0)
+                                    .color(palette.palette_subtext),
+                            );
+                            let mut last_workspace = String::new();
+                            for tab in state
+                                .tabs
+                                .iter()
+                                .filter(|tab| tab.find_count > 0 || tab.find_pending)
+                                .take(12)
+                            {
+                                if last_workspace != tab.workspace_name {
+                                    last_workspace.clone_from(&tab.workspace_name);
+                                    ui.label(
+                                        RichText::new(&last_workspace)
+                                            .size(9.0)
+                                            .color(palette.section_label),
+                                    );
+                                }
+                                let response = ui.horizontal(|ui| {
+                                    paint_find_favicon(ui, tab, favicon_textures, &palette);
+                                    let title = if tab.title.trim().is_empty() {
+                                        tab.url.as_str()
+                                    } else {
+                                        tab.title.as_str()
+                                    };
+                                    let label = if tab.find_pending {
+                                        format!("{} — waking to search…", truncate_title(title, 38))
+                                    } else {
+                                        format!(
+                                            "{} — {} match{}",
+                                            truncate_title(title, 38),
+                                            tab.find_count,
+                                            if tab.find_count == 1 { "" } else { "es" }
+                                        )
+                                    };
+                                    flat_find_tooltip(
+                                        ui.button(RichText::new(label).size(11.0)),
+                                        &tab.url,
+                                        &palette,
+                                    )
+                                });
+                                if response.inner.clicked() {
+                                    actions.push(UiAction::SelectTab { tab_id: tab.id });
+                                    let mut options = state.find_options();
+                                    options.all_tabs = false;
+                                    actions.push(UiAction::FindInPage {
+                                        tab_id: tab.id,
+                                        query: state.find_query.clone(),
+                                        forward: true,
+                                        match_case: state.find_match_case,
+                                        find_next: false,
+                                        options,
+                                    });
+                                }
+                            }
+                        }
+
+                        if state.find_drawer_open {
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if flat_find_tooltip(
+                                    ui.button(RichText::new("Copy lines").size(10.0)),
+                                    "Copy every matching line",
+                                    &palette,
+                                )
+                                .clicked()
+                                {
+                                    let text = snippets
+                                        .iter()
+                                        .map(|snippet| {
+                                            if snippet.line.is_empty() {
+                                                format!(
+                                                    "{}{}{}",
+                                                    snippet.before, snippet.matched, snippet.after
+                                                )
+                                            } else {
+                                                snippet.line.clone()
+                                            }
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    ctx.copy_text(text);
+                                    state.show_toast(
+                                        ToastKind::Success,
+                                        "Copied",
+                                        "Matching lines copied to clipboard",
+                                    );
+                                }
+                                if flat_find_tooltip(
+                                    ui.button(RichText::new("Copy sentences").size(10.0)),
+                                    "Copy matching sentences",
+                                    &palette,
+                                )
+                                .clicked()
+                                {
+                                    let text = snippets
+                                        .iter()
+                                        .map(|snippet| snippet.sentence.clone())
+                                        .filter(|sentence| !sentence.is_empty())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    ctx.copy_text(text);
+                                    state.show_toast(
+                                        ToastKind::Success,
+                                        "Copied",
+                                        "Matching sentences copied to clipboard",
+                                    );
+                                }
+                                if flat_find_tooltip(
+                                    ui.button(RichText::new("Copy links").size(10.0)),
+                                    "Copy URLs of matching links",
+                                    &palette,
+                                )
+                                .clicked()
+                                {
+                                    let text = snippets
+                                        .iter()
+                                        .map(|snippet| snippet.href.clone())
+                                        .filter(|href| !href.is_empty())
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+                                    ctx.copy_text(text);
+                                    state.show_toast(
+                                        ToastKind::Success,
+                                        "Copied",
+                                        "Matching links copied to clipboard",
+                                    );
+                                }
+                                ui.toggle_value(
+                                    &mut state.find_filter_enabled,
+                                    RichText::new("Filter").size(10.0),
+                                );
+                            });
+                            if state.find_filter_enabled {
+                                ui.add_space(3.0);
+                                ui.add(
+                                    TextEdit::singleline(&mut state.find_filter_query)
+                                        .hint_text("Filter snippets by text, heading, or link…")
+                                        .font(FontId::proportional(11.0))
+                                        .desired_width(width - 24.0),
+                                );
+                            }
+
+                            egui::ScrollArea::vertical()
+                                .id_salt("find_snippet_drawer")
+                                .max_height(220.0)
+                                .show(ui, |ui| {
+                                    if snippets.is_empty() {
+                                        ui.label(
+                                            RichText::new("No matching context yet")
+                                                .size(10.0)
+                                                .color(palette.palette_hint),
+                                        );
+                                        return;
+                                    }
+                                    for snippet in &snippets {
+                                        if !snippet.heading.is_empty() {
+                                            ui.label(
+                                                RichText::new(&snippet.heading)
+                                                    .size(9.0)
+                                                    .color(palette.section_label),
+                                            );
+                                        }
+                                        let response = ui
+                                            .horizontal_wrapped(|ui| {
+                                                ui.label(
+                                                    RichText::new(&snippet.before)
+                                                        .size(11.0)
+                                                        .color(palette.text_dim),
+                                                );
+                                                ui.label(
+                                                    RichText::new(&snippet.matched)
+                                                        .size(11.0)
+                                                        .color(find_term_color(snippet.term_index))
+                                                        .strong(),
+                                                );
+                                                ui.label(
+                                                    RichText::new(&snippet.after)
+                                                        .size(11.0)
+                                                        .color(palette.text_dim),
+                                                );
+                                            })
+                                            .response;
+                                        let hover = if snippet.href.is_empty() {
+                                            snippet.line.clone()
+                                        } else {
+                                            format!("{}\n{}", snippet.line, snippet.href)
+                                        };
+                                        if flat_find_tooltip(response, hover, &palette).clicked() {
+                                            actions.push(UiAction::JumpToFindMatch {
+                                                tab_id: active_tab_id,
+                                                ordinal: snippet.ordinal,
+                                            });
+                                        }
+                                    }
+                                });
+                        }
+                    })
+                    .response
+                    .rect
+                    .expand(8.0);
+            });
+
+        if escape {
+            actions.push(UiAction::StopFindingAll {
+                clear_selection: true,
+            });
+            state.close_find_bar();
+            return;
+        }
+
+        // A click outside the bar dismisses it, keeping the same overlay
+        // behaviour as the command palette. The page keeps running behind it.
+        let outside_click = ctx.input(|i| {
+            command_palette_click_outside(
+                card_rect,
+                i.pointer.latest_pos(),
+                i.pointer.primary_clicked(),
+            )
+        });
+        if outside_click {
+            actions.push(UiAction::StopFindingAll {
+                clear_selection: true,
+            });
+            state.close_find_bar();
         }
     }
 
@@ -5285,6 +5847,8 @@ pub struct ChromeOverlayRenderer {
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     max_texture_dim: u32,
+    /// Find-bar result rows need the same cached site icons as the rail.
+    favicon_textures: HashMap<String, egui::TextureHandle>,
 }
 
 impl ChromeOverlayRenderer {
@@ -5359,6 +5923,7 @@ impl ChromeOverlayRenderer {
             egui_ctx,
             egui_state,
             max_texture_dim: max_tex,
+            favicon_textures: HashMap::new(),
         })
     }
 
@@ -5379,6 +5944,33 @@ impl ChromeOverlayRenderer {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
+    /// Keep the find-bar result list's favicons in sync with tab metadata.
+    fn sync_favicon_textures(&mut self, state: &ChromeState) {
+        let mut live_urls = HashSet::new();
+        for tab in &state.tabs {
+            let Some(favicon) = &tab.favicon else {
+                continue;
+            };
+            if favicon.width == 0 || favicon.height == 0 || favicon.rgba.is_empty() {
+                continue;
+            }
+            live_urls.insert(favicon.url.clone());
+            if self.favicon_textures.contains_key(&favicon.url) {
+                continue;
+            }
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [favicon.width as usize, favicon.height as usize],
+                &favicon.rgba[..],
+            );
+            let texture =
+                self.egui_ctx
+                    .load_texture(favicon.url.clone(), image, TextureOptions::LINEAR);
+            self.favicon_textures.insert(favicon.url.clone(), texture);
+        }
+        self.favicon_textures
+            .retain(|url, _| live_urls.contains(url));
+    }
+
     /// Render the palette or tab menu into the transparent overlay window.
     pub fn render(
         &mut self,
@@ -5387,6 +5979,11 @@ impl ChromeOverlayRenderer {
     ) -> Vec<UiAction> {
         let mut actions = Vec::new();
         let mut raw_input = self.egui_state.take_egui_input(window);
+        if std::mem::take(&mut state.find_dismiss_requested) {
+            actions.push(UiAction::StopFindingAll {
+                clear_selection: true,
+            });
+        }
         state.expire_toast();
         state.promote_pending_toast();
         // Only one surface may own the shared overlay. A native permission
@@ -5397,15 +5994,24 @@ impl ChromeOverlayRenderer {
         let permission_open = state.permission_prompt.is_some();
         let display_picker_open = state.display_media_picker.is_some() && !permission_open;
         let modal_open = permission_open || display_picker_open;
-        let settings_open = state.settings_open && !modal_open;
-        let bookmark_manager_open = state.bookmark_manager_open && !settings_open && !modal_open;
-        let menu_open =
-            state.menu.is_some() && !settings_open && !bookmark_manager_open && !modal_open;
+        if modal_open {
+            state.dismiss_find_for_overlay();
+        }
+        let find_open = state.find_bar_open && !modal_open;
+        let settings_open = state.settings_open && !modal_open && !find_open;
+        let bookmark_manager_open =
+            state.bookmark_manager_open && !settings_open && !modal_open && !find_open;
+        let menu_open = state.menu.is_some()
+            && !settings_open
+            && !bookmark_manager_open
+            && !modal_open
+            && !find_open;
         let palette_open = state.command_palette_open
             && !menu_open
             && !settings_open
             && !bookmark_manager_open
-            && !modal_open;
+            && !modal_open
+            && !find_open;
         let downloads_open = state.downloads_open
             && !palette_open
             && !menu_open
@@ -5417,10 +6023,13 @@ impl ChromeOverlayRenderer {
             && !bookmark_manager_open
             && !menu_open
             && !palette_open
+            && !find_open
             && !downloads_open
             && !modal_open;
         let focus_before = state.command_palette_focus_requested && palette_open;
         let select_all_before = state.command_palette_select_all_requested && palette_open;
+        let focus_find = state.find_focus_requested && find_open;
+        self.sync_favicon_textures(state);
         state.apply_visuals(&self.egui_ctx);
 
         // Focus is requested while building the input widget, and egui handles
@@ -5453,6 +6062,14 @@ impl ChromeOverlayRenderer {
                 ChromeRenderer::build_tab_menu(&ctx, state, &mut actions);
             } else if palette_open {
                 ChromeRenderer::build_command_palette(&ctx, state, &mut actions, focus_command);
+            } else if find_open {
+                ChromeRenderer::build_find_bar(
+                    &ctx,
+                    state,
+                    &mut actions,
+                    focus_find,
+                    &self.favicon_textures,
+                );
             } else if downloads_open {
                 ChromeRenderer::build_downloads_bubble(&ctx, state, &mut actions);
             } else if toast_open {
@@ -5465,6 +6082,8 @@ impl ChromeOverlayRenderer {
         state.command_palette_focus_requested =
             focus_request_after_render(focus_before, state.command_palette_focus_requested);
         state.command_palette_select_all_requested = select_all_next;
+        state.find_focus_requested =
+            focus_request_after_render(focus_find, state.find_focus_requested);
 
         self.egui_state
             .handle_platform_output(window, full_output.platform_output.clone());
@@ -6535,6 +7154,112 @@ fn compact_icon_button(
     response.on_hover_text(label)
 }
 
+/// A tooltip for the find bar that does not use egui's default popup frame.
+///
+/// The find bar lives in a transparent overlay above the CEF page. egui's
+/// `Frame::popup` applies `visuals.popup_shadow`, which reads as a dark box
+/// around short tooltips when the snippet drawer is closed. Reusing the flat
+/// rail-tooltip style keeps the overlay visually clean without changing
+/// tooltips elsewhere in the browser.
+fn flat_find_tooltip(
+    response: Response,
+    text: impl Into<egui::WidgetText>,
+    palette: &ChromePalette,
+) -> Response {
+    let mut tooltip = egui::Tooltip::for_enabled(&response);
+    tooltip.popup = tooltip.popup.frame(
+        Frame::NONE
+            .fill(palette.tooltip_bg)
+            .stroke(Stroke::new(1.0_f32, palette.tooltip_border))
+            .corner_radius(CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(8, 5)),
+    );
+    tooltip.show(|ui| {
+        let text: egui::WidgetText = text.into();
+        ui.label(text.color(palette.tooltip_text).size(11.0));
+    });
+    response
+}
+
+/// Icon button variant for the find bar with a shadowless tooltip.
+fn compact_find_icon_button(
+    ui: &mut Ui,
+    icon: RailIcon,
+    label: &'static str,
+    palette: &ChromePalette,
+    prominent: bool,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(20.0, 20.0), egui::Sense::click());
+    let color = if prominent || response.hovered() {
+        palette.text_strong
+    } else {
+        palette.text
+    };
+    let icon_rect = egui::Rect::from_center_size(rect.center(), vec2(14.0, 14.0));
+    paint_rail_icon(ui, icon_rect, icon, color);
+    flat_find_tooltip(response, label, palette)
+}
+
+/// Stable colours for multi-term find results. The renderer assigns the same
+/// term index to every match of one query term, so the drawer uses that index
+/// to keep its label colour in sync with the page highlight.
+fn find_term_color(index: usize) -> Color32 {
+    const COLORS: [Color32; 5] = [
+        Color32::from_rgb(255, 205, 86),
+        Color32::from_rgb(126, 231, 135),
+        Color32::from_rgb(129, 190, 255),
+        Color32::from_rgb(255, 150, 198),
+        Color32::from_rgb(196, 168, 255),
+    ];
+    COLORS[index % COLORS.len()]
+}
+
+/// Draw a cached favicon in the find results list without borrowing a full
+/// `ChromeRenderer` from the overlay renderer.
+fn paint_find_favicon(
+    ui: &mut Ui,
+    tab: &TabInfo,
+    textures: &HashMap<String, egui::TextureHandle>,
+    palette: &ChromePalette,
+) {
+    let rect = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover()).0;
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    if let Some(favicon) = &tab.favicon {
+        if let Some(texture) = textures.get(&favicon.url) {
+            let uv = egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+            ui.painter().image(texture.id(), rect, uv, Color32::WHITE);
+            return;
+        }
+    }
+    paint_rail_icon(ui, rect, RailIcon::Globe, palette.text_dim);
+}
+
+/// Apply the drawer's optional substring filter to a tab's rich snippets.
+fn filtered_find_snippets<'a>(
+    tab: Option<&'a TabInfo>,
+    filter: &str,
+    enabled: bool,
+) -> Vec<&'a FindSnippet> {
+    let Some(tab) = tab else {
+        return Vec::new();
+    };
+    let needle = if enabled { filter.trim() } else { "" };
+    tab.find_snippets
+        .iter()
+        .filter(|snippet| {
+            needle.is_empty()
+                || snippet.line.to_lowercase().contains(&needle.to_lowercase())
+                || snippet
+                    .heading
+                    .to_lowercase()
+                    .contains(&needle.to_lowercase())
+                || snippet.href.to_lowercase().contains(&needle.to_lowercase())
+        })
+        .collect()
+}
+
 /// Paint the active-transfer count (or a quiet history dot) over the rail's
 /// Downloads button. It is drawn directly on the native rail, not in a second
 /// view, so it tracks download snapshots on the same frame as the bubble.
@@ -6575,6 +7300,20 @@ fn paint_download_badge(
 // ---------------------------------------------------------------------------
 // Pure chrome helpers (unit-tested)
 // ---------------------------------------------------------------------------
+
+/// Logical geometry for the floating find bar inside its overlay viewport.
+///
+/// The overlay tracks the main window across displays and DPI changes, so the
+/// bar is anchored from the *current* viewport on every frame. Width and x are
+/// clamped to keep the card inside even a very small or freshly resized window.
+/// Returns `(width, x, y)`.
+pub fn find_bar_geometry(viewport: egui::Rect) -> (f32, f32, f32) {
+    let available_width = (viewport.width() - 16.0).max(1.0);
+    let width = 640.0_f32.min(available_width);
+    let x = ((viewport.width() - width) * 0.5).max(8.0);
+    let y = 14.0_f32.min((viewport.height() - 80.0).max(4.0));
+    (width, x, y)
+}
 
 /// Tooltips are labels for the icon-only collapsed rail. Expanded controls
 /// already draw visible text, so expanded-mode tooltips are disabled.
@@ -7412,15 +8151,15 @@ mod tests {
         bottom_hud_tooltip_anchor, clamp_command_selection, command_palette_click_outside,
         command_palette_items, download_engine_label, download_eta_label, download_rail_badge,
         download_row_uses_progress_bar, download_state_label, downloads_bubble_anchor,
-        downloads_bubble_size, effective_theme, filter_bookmarks, focus_request_after_render,
-        format_download_bytes, loading_spinner_angle, loading_spinner_point,
-        normalize_bookmark_url, page_tooltip_anchor, palette_row_fill, preferred_surface_format,
-        rail_menu_anchor, rail_menu_click_outside, rail_menu_items, rail_menu_metrics,
-        rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled, rail_tooltip_metrics,
-        register_material_icon_font, resolve_omnibox, resolve_omnibox_with_search,
-        tab_close_center, tab_status_center, tooltip_size_for_text, truncate_title,
-        workspace_form_actions, BookmarkInfo, ChromePalette, ChromeRenderer, ChromeState,
-        ChromeTheme, CommandAction, DownloadBadge, DownloadSummary, PermissionPrompt,
+        downloads_bubble_size, effective_theme, filter_bookmarks, find_bar_geometry,
+        focus_request_after_render, format_download_bytes, loading_spinner_angle,
+        loading_spinner_point, normalize_bookmark_url, page_tooltip_anchor, palette_row_fill,
+        preferred_surface_format, rail_menu_anchor, rail_menu_click_outside, rail_menu_items,
+        rail_menu_metrics, rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled,
+        rail_tooltip_metrics, register_material_icon_font, resolve_omnibox,
+        resolve_omnibox_with_search, tab_close_center, tab_status_center, tooltip_size_for_text,
+        truncate_title, workspace_form_actions, BookmarkInfo, ChromePalette, ChromeRenderer,
+        ChromeState, ChromeTheme, CommandAction, DownloadBadge, DownloadSummary, PermissionPrompt,
         PermissionPromptKind, RailMenuAction, SettingsTab, TabDisplayState, TabInfo, ToastKind,
         WorkspaceInfo, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED, RAIL_STATUS_ICON_EXPANDED,
         TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_MAX_WIDTH,
@@ -7449,6 +8188,11 @@ mod tests {
             can_go_forward: false,
             is_pinned: false,
             favicon: None,
+            find_count: -1,
+            find_active_ordinal: -1,
+            find_pending: false,
+            find_snippets: Vec::new(),
+            find_error: String::new(),
         }
     }
 
@@ -8455,6 +9199,27 @@ mod tests {
         assert!(state.rail_expanded);
         assert!(!state.command_palette_open);
         assert_eq!(state.command_selection, 0);
+    }
+
+    #[test]
+    fn find_bar_geometry_stays_centered_and_inside_the_viewport() {
+        let normal = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(1440.0, 900.0));
+        let (width, x, y) = find_bar_geometry(normal);
+        assert_eq!(width, 640.0);
+        assert_eq!(x, 400.0);
+        assert_eq!(y, 14.0);
+
+        let secondary_display = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(2880.0, 1800.0));
+        let (width, x, y) = find_bar_geometry(secondary_display);
+        assert_eq!(width, 640.0);
+        assert_eq!(x, 1120.0);
+        assert_eq!(y, 14.0);
+
+        let tiny = egui::Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 60.0));
+        let (width, x, y) = find_bar_geometry(tiny);
+        assert_eq!(width, 184.0);
+        assert_eq!(x, 8.0);
+        assert_eq!(y, 4.0);
     }
 
     #[test]

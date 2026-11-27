@@ -4,7 +4,7 @@ A low-memory, daily-driver desktop browser written in Rust and powered by CEF (`
 
 Repository: [github.com/c4bo3l/kasumi-browser](https://github.com/c4bo3l/kasumi-browser) · [Release notes](RELEASE_NOTES.md) · [PR checks](https://github.com/c4bo3l/kasumi-browser/actions/workflows/pr.yml)
 
-Current version: **0.11.0**. Version bumps land in release PRs and become official at merge, as required by [AGENTS.md](AGENTS.md).
+Current version: **0.12.0**. Version bumps land in release PRs and become official at merge, as required by [AGENTS.md](AGENTS.md).
 
 ---
 
@@ -19,14 +19,58 @@ Current version: **0.11.0**. Version bumps land in release PRs and become offici
 
 ## Features
 
-- Collapsible vertical workspace rail (208 px expanded / 44 px icon rail), pinned tabs, tab context menu, and per-workspace tab state.
-- Floating `Cmd/Ctrl+K` command palette for tab search, URL/search resolution, and native actions.
-- Native Workspaces, Incognito mode, Settings, downloads bubble, bookmark manager, tab menu, tooltips, and system notifications.
-- Native Web Notification API support: remembered per-site permission prompts, clickable notification cards above the page, and click-through to the originating tab when the card is activated. Incognito decisions stay in memory and never reach SQLite.
-- Native WebRTC media-access prompts for camera, microphone, and desktop audio/video capture, with remembered decisions for normal spaces. `getDisplayMedia` opens Kasumi's own display/window picker, with Material Symbols source icons, and passes the selected source to Chromium.
-- 24 DIP bottom HUDs for Command/DevTools and blocked-request/RAM status.
-- SQLite-backed history, bookmarks, downloads, pinned tabs, workspaces, preferences, and low-RAM session restore.
-- Chromium DevTools in a separate window; `F12`, rail button, tab menu, and command palette all open it.
+### Browsing and native chrome
+
+- **Zero WebUI:** tabs, rail, omnibox, settings, command palette, menus, tooltips, downloads bubble, find bar, and notifications are all drawn natively with `winit`, `wgpu`, and `egui`. Pages render in native child views with no OSR or second renderer.
+- **Native tabs:** create, switch, close, duplicate, reopen, and undo close; middle-click closes a tab, middle-clicking a link opens a live background tab, and Ctrl/Cmd+click opens a foreground tab. Tabs show favicons, animated loading spinners, active indicators, and hover close buttons.
+- **Pinned tabs:** pin/unpin from the tab context menu, command palette, or rail badge. Pinned tabs stay at the top of each workspace and survive session restore and undo-close.
+- **Tab context menu:** new tab, duplicate, copy URL, reload, close, close other tabs, close tabs below, reopen closed tab, move to workspace, and DevTools, with keyboard navigation and click-outside dismissal.
+- **Navigation:** back/forward, reload/stop, an omnibox that follows the committed URL, URL or search resolution through DuckDuckGo/Google/Bing, `view-source:` tab reuse, and copy URL with a native confirmation.
+- **Collapsible vertical workspace rail:** tab list, pinned section, Command button, New tab, Hibernate All, shield badge, RAM readout, address field, and workspace switcher in both expanded and icon-only modes.
+- **Native overlays:** the command palette, Settings, tab menus, tooltips, find bar, and notification cards render above the CEF child view in transparent native windows. Toast notifications are click-through and do not steal page input.
+- **Theme-aware UI:** native chrome follows the OS light/dark appearance live, with explicit Light/Dark overrides. Accent colour is applied only to browser chrome, never to page content.
+- **Bottom page HUDs:** Command/DevTools controls and live blocked-request/RAM status stay visible while browsing.
+- **Native DevTools window:** `F12`, the rail, the tab menu, and the command palette open or bring forward Chromium DevTools.
+
+### Find in page
+
+- `Cmd/Ctrl+F` opens a native find bar with match count, previous/next navigation, and close.
+- Native CEF find remains authoritative for substring match counts and ordinals; a bounded renderer bridge supplies rich snippet results.
+- Snippet results show surrounding text with bold/coloured matches, heading breadcrumbs, hover previews, and click-to-jump navigation.
+- Regex, whole-word, and multi-term modes, with inline invalid-regex feedback and per-term colour highlighting.
+- `This tab` and `All tabs` scopes, grouped cross-tab results with favicon/title/count metadata, and wake-and-search replay for hibernated tabs.
+- Copy matching lines, sentences, or hrefs, and optionally filter results by their source text.
+
+### Workspaces, commands, and settings
+
+- **Workspaces:** each workspace owns its pinned and regular tabs, selected tab, and default flag. Switch from the rail, choose a default startup space, and create, rename, or delete spaces. Deleting a workspace moves its tabs and archives its bookmark folder.
+- **Command palette:** `Cmd/Ctrl+K` searches tabs and bookmarks and resolves addresses or searches; `Cmd/Ctrl+L` opens it seeded with the active URL. It offers explicit open/search in this tab or a new tab, native actions, workspace labels, keyboard selection, immediate focus, and click-outside dismissal.
+- **Native Settings:** General, Workspaces, and Bookmarks pages with persisted preferences for theme, rail state, search provider, ad-block state, hibernation timeout, startup space, and download folder.
+
+### Privacy, performance, and web platform
+
+- **Incognito:** a reserved private workspace with a lazily created ephemeral CEF request context. Private tabs never write history, session, bookmarks, downloads, or site permissions to SQLite.
+- **Aggressive tab hibernation:** idle tabs are fully closed at the CEF `BrowserHost` level, with a configurable timeout, shortened timeout under high RAM pressure, and immediate hibernation of background tabs under critical pressure. Restored sessions reopen only the active tab live.
+- **Network-level blocking:** `adblock-rust` cancels ad and tracker subresource requests before Blink downloads or compiles them. Built-in starter rules work out of the box; optional EasyList/EasyPrivacy files can be added locally.
+- **Process consolidation:** Chromium switches enforce process-per-site and a renderer-process cap, with background networking and telemetry services disabled.
+- **WebRTC permissions:** native camera, microphone, and desktop audio/video prompts with per-origin decisions remembered for normal spaces. `getDisplayMedia` opens Kasumi's own display/window picker and passes the exact selected source to Chromium, with a video-only retry when macOS denies system audio.
+- **Web Notification API:** a renderer shim with remembered per-site permission prompts and clickable native notification cards. Activating a card focuses the source tab and dispatches `click`; closing dispatches `close`. Incognito decisions stay in memory.
+
+### Storage, downloads, and bookmarks
+
+- **Crash-safe SQLite WAL storage:** history, bookmarks, downloads, pinned tabs, workspaces, preferences, site permissions, and session snapshots, flushed cleanly on shutdown.
+- **Native download manager:** WAL-backed history plus active progress, speed, ETA, path, connection count, pause/resume/cancel, retry, remove-info, clear-finished, open-file, and show-in-folder controls. The rail button shows an active count badge.
+- **Segmented downloads:** HTTP(S) transfers use up to eight balanced `Range` requests through CEF into a `.kasumi.part` file, with resumable byte ranges and generation guards so late callbacks cannot corrupt a file. Non-range transfers fall back to a single native request.
+- **Download notifications:** transparent native toasts announce completed or failed transfers without blocking page input.
+- **Bookmark manager:** search by title, URL, or folder; edit titles and URLs; move between workspace-named folders; delete bookmarks; and toggle the current page with the rail/palette star. Bookmarks remain globally visible across workspaces.
+
+### Packaging and developer workflow
+
+- **Native app icons** for macOS, Windows, and Linux, with the bundled macOS app resolving the icon in Finder and the Dock.
+- **macOS bundle support** with camera, microphone, screen-recording, and system-audio usage descriptions, ad-hoc signing for local TCC prompts, and Developer ID/notarisation guidance for releases.
+- **Windows cross-build** from macOS via `make build-windows`, plus Authenticode signing instructions.
+- **Local launchers:** `./scripts/dev.sh` / `make dev` and `scripts\dev.bat`, with clean-cache, release, watch, and custom log-level options.
+- **Cross-platform PR CI** checks formatting, binaries, and unit tests on macOS 15 Intel, Windows, and Linux.
 
 ## Shortcuts
 
@@ -34,6 +78,7 @@ Current version: **0.11.0**. Version bumps land in release PRs and become offici
 | :--- | :--- |
 | `Ctrl/Cmd + T` / `W` | New tab / close tab |
 | `Ctrl/Cmd + K` / `L` | Command palette / palette with active URL |
+| `Ctrl/Cmd + F` | Find in page |
 | `Ctrl/Cmd + ,` | Settings |
 | `Ctrl/Cmd + J` | Downloads |
 | `Ctrl/Cmd + Shift + T` / `Z` | Reopen closed tab / undo close |
@@ -58,6 +103,7 @@ src/
 ├── browser/
 │   ├── client.rs           # CEF handlers (lifecycle, load, input, permissions, downloads)
 │   ├── adblocker.rs        # adblock-rust request interception
+│   ├── find.rs             # rich find shim, snippets, and result parser
 │   ├── notifications.rs    # Web Notification API shim and native bridge
 │   └── hibernation.rs      # TabManager, workspace state, RAM watchdog
 ├── storage/                # SQLite WAL schema and async worker
@@ -177,11 +223,11 @@ CI runs the same checks on macOS 15 Intel, Windows, and Linux.
 
 ## Known issues
 
-Windows and Linux native child-view, tooltip, download, bookmark, media-permission, and website-notification flows still need hands-on verification.
+Windows and Linux native child-view, tooltip, download, bookmark, media-permission, website-notification, and find-in-page flows still need hands-on verification.
 
 ## Roadmap
 
-Up next: find in page (`Cmd/Ctrl+F`), native print support, browser import, cross-platform verification, auto-update, PiP, local AI, and extension support. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for completed work and [Future development](RELEASE_NOTES.md#future-development) for deferred items.
+Up next: native print support (`Cmd/Ctrl+P`), browser import, cross-platform verification, auto-update, PiP, local AI, and extension support. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for completed work and [Future development](RELEASE_NOTES.md#future-development) for deferred items.
 
 ## Adblock filter lists
 

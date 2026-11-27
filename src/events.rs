@@ -563,6 +563,69 @@ pub enum BrowserEvent {
         tab_id: u64,
         id: String,
     },
+    /// Result of a CEF `find()` operation on a tab.
+    FindResult {
+        tab_id: u64,
+        identifier: i32,
+        count: i32,
+        active_match_ordinal: i32,
+        final_update: bool,
+    },
+    /// Result from the rich find shim installed in the renderer. This carries
+    /// context snippets and advanced-mode match metadata that CEF's native
+    /// `FindHandler` does not expose.
+    FindResultRich {
+        tab_id: u64,
+        request_id: u64,
+        count: i32,
+        active_ordinal: i32,
+        snippets: Vec<FindSnippet>,
+        error: String,
+        cleared: bool,
+    },
+}
+
+/// Options for a find request shared by the native CEF path and the rich
+/// JavaScript highlighter path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FindOptions {
+    pub regex: bool,
+    pub whole_word: bool,
+    pub multi_term: bool,
+    pub all_tabs: bool,
+}
+
+impl FindOptions {
+    /// True when the query needs the rich renderer shim instead of CEF's plain
+    /// substring matcher.
+    pub fn is_advanced(self) -> bool {
+        self.regex || self.whole_word || self.multi_term
+    }
+}
+
+/// One context snippet emitted by the rich find shim. All text is bounded by
+/// the renderer before it crosses the CEF bridge.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindSnippet {
+    #[serde(default)]
+    pub ordinal: i32,
+    #[serde(default)]
+    pub before: String,
+    #[serde(default)]
+    pub matched: String,
+    #[serde(default)]
+    pub after: String,
+    #[serde(default)]
+    pub heading: String,
+    #[serde(default)]
+    pub href: String,
+    #[serde(default)]
+    pub line: String,
+    #[serde(default)]
+    pub sentence: String,
+    #[serde(default)]
+    pub term_index: usize,
 }
 
 /// Native browser shortcuts mirrored from CEF's `on_pre_key_event`.
@@ -575,6 +638,7 @@ pub enum BrowserShortcut {
     ReopenClosedTab,
     OpenCommandPalette,
     OpenDevTools,
+    FindInPage,
     OpenSettings,
     OpenDownloads,
     OpenBookmarkManager,
@@ -729,6 +793,38 @@ impl std::fmt::Debug for BrowserEvent {
                 .debug_struct("WebNotificationClosed")
                 .field("tab_id", tab_id)
                 .field("id", id)
+                .finish(),
+            Self::FindResult {
+                tab_id,
+                identifier,
+                count,
+                active_match_ordinal,
+                final_update,
+            } => f
+                .debug_struct("FindResult")
+                .field("tab_id", tab_id)
+                .field("identifier", identifier)
+                .field("count", count)
+                .field("active_match_ordinal", active_match_ordinal)
+                .field("final_update", final_update)
+                .finish(),
+            Self::FindResultRich {
+                tab_id,
+                request_id,
+                count,
+                active_ordinal,
+                snippets,
+                error,
+                cleared,
+            } => f
+                .debug_struct("FindResultRich")
+                .field("tab_id", tab_id)
+                .field("request_id", request_id)
+                .field("count", count)
+                .field("active_ordinal", active_ordinal)
+                .field("snippets", &snippets.len())
+                .field("error", error)
+                .field("cleared", cleared)
                 .finish(),
             Self::ParallelDownload(event) => {
                 f.debug_tuple("ParallelDownload").field(event).finish()
@@ -909,13 +1005,36 @@ pub enum UiAction {
         tab_id: u64,
         notification_id: String,
     },
+    /// Run find on a tab (or every live tab when `all_tabs` is set).
+    FindInPage {
+        tab_id: u64,
+        query: String,
+        forward: bool,
+        match_case: bool,
+        find_next: bool,
+        options: FindOptions,
+    },
+    /// Focus and scroll to one rich find match.
+    JumpToFindMatch {
+        tab_id: u64,
+        ordinal: i32,
+    },
+    /// Stop an in-page find on a tab.
+    StopFinding {
+        tab_id: u64,
+        clear_selection: bool,
+    },
+    /// Stop every find session, used when the shared find bar closes.
+    StopFindingAll {
+        clear_selection: bool,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         normalize_permission_origin, permission_prompt_result_for_decision, DownloadEngine,
-        DownloadInfo, DownloadState, MediaAccessPermissions,
+        DownloadInfo, DownloadState, FindOptions, MediaAccessPermissions,
     };
 
     fn info(state: DownloadState) -> DownloadInfo {
@@ -1010,6 +1129,32 @@ mod tests {
             permission_prompt_result_for_decision(false),
             cef::PermissionRequestResult::DISMISS
         );
+    }
+
+    #[test]
+    fn scope_alone_stays_on_the_native_find_path() {
+        assert!(!FindOptions::default().is_advanced());
+        assert!(!FindOptions {
+            all_tabs: true,
+            ..FindOptions::default()
+        }
+        .is_advanced());
+        for options in [
+            FindOptions {
+                regex: true,
+                ..FindOptions::default()
+            },
+            FindOptions {
+                whole_word: true,
+                ..FindOptions::default()
+            },
+            FindOptions {
+                multi_term: true,
+                ..FindOptions::default()
+            },
+        ] {
+            assert!(options.is_advanced());
+        }
     }
 
     #[test]
