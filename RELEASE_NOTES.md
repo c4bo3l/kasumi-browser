@@ -748,3 +748,4 @@ Initial public source release: [github.com/c4bo3l/kasumi-browser](https://github
 - Picture-in-picture
 - Local AI
 - Extension support
+- Internationalization (i18n) and localization support
