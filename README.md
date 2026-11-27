@@ -4,7 +4,7 @@ A low-memory, daily-driver desktop browser written in Rust and powered by CEF (`
 
 Repository: [github.com/c4bo3l/kasumi-browser](https://github.com/c4bo3l/kasumi-browser) · [Release notes](RELEASE_NOTES.md) · [PR checks](https://github.com/c4bo3l/kasumi-browser/actions/workflows/pr.yml)
 
-Current version: **0.17.0**. Version bumps land in release PRs and become official at merge, as required by [AGENTS.md](AGENTS.md).
+Current version: **0.18.0**. Version bumps land in release PRs and become official at merge, as required by [AGENTS.md](AGENTS.md).
 
 ---
 
@@ -82,6 +82,8 @@ Current version: **0.17.0**. Version bumps land in release PRs and become offici
 | Shortcut | Action |
 | :--- | :--- |
 | `Ctrl/Cmd + T` / `W` | New tab / close tab |
+| `F5` (Windows/Linux) / `Ctrl/Cmd + R` | Reload active page |
+| `Shift/Ctrl + F5` (Windows/Linux) / `Ctrl/Cmd + Shift + R` | Hard reload (ignore cache) |
 | `Ctrl/Cmd + K` / `L` | Command palette / palette with active URL |
 | `Ctrl/Cmd + F` | Find in page |
 | `Ctrl/Cmd + P` | Print active page |

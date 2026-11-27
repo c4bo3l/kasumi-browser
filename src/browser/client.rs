@@ -591,11 +591,14 @@ const REPEAT_EVENT_FLAG: u32 = 8_192;
 const VK_B: i32 = 0x42;
 const VK_C: i32 = 0x43;
 const VK_F: i32 = 0x46;
+#[cfg(not(target_os = "macos"))]
+const VK_F5: i32 = 0x74;
 const VK_J: i32 = 0x4A;
 const VK_K: i32 = 0x4B;
 const VK_L: i32 = 0x4C;
 const VK_N: i32 = 0x4E;
 const VK_P: i32 = 0x50;
+const VK_R: i32 = 0x52;
 const VK_T: i32 = 0x54;
 const VK_W: i32 = 0x57;
 const VK_Y: i32 = 0x59;
@@ -649,6 +652,15 @@ pub(crate) fn browser_shortcut(
         return Some(BrowserShortcut::OpenDevTools);
     }
 
+    // F5 is the Windows/Linux reload convention. macOS leaves F5 to the
+    // system's brightness/media keys and uses Cmd+R instead.
+    #[cfg(not(target_os = "macos"))]
+    if key_code == VK_F5 && !alt {
+        return Some(BrowserShortcut::ReloadPage {
+            ignore_cache: primary || shift,
+        });
+    }
+
     if !primary || alt {
         return None;
     }
@@ -660,6 +672,9 @@ pub(crate) fn browser_shortcut(
         VK_W if !shift => Some(BrowserShortcut::CloseTab),
         VK_F if !shift => Some(BrowserShortcut::FindInPage),
         VK_P if !shift => Some(BrowserShortcut::Print),
+        VK_R => Some(BrowserShortcut::ReloadPage {
+            ignore_cache: shift,
+        }),
         VK_L | VK_K if !shift => Some(BrowserShortcut::OpenCommandPalette),
         VK_B if shift => Some(BrowserShortcut::OpenBookmarkManager),
         VK_C if shift => Some(BrowserShortcut::CopyUrl),
@@ -714,6 +729,9 @@ fn browser_shortcut_from_char(
         c if c == 'W' as u16 || c == 'w' as u16 => Some(BrowserShortcut::CloseTab),
         c if c == 'F' as u16 || c == 'f' as u16 => Some(BrowserShortcut::FindInPage),
         c if (c == 'P' as u16 || c == 'p' as u16) && !shift => Some(BrowserShortcut::Print),
+        c if c == 'R' as u16 || c == 'r' as u16 => Some(BrowserShortcut::ReloadPage {
+            ignore_cache: shift,
+        }),
         c if c == 'L' as u16 || c == 'l' as u16 || c == 'K' as u16 || c == 'k' as u16 => {
             Some(BrowserShortcut::OpenCommandPalette)
         }
@@ -1265,6 +1283,43 @@ mod tests {
         );
         assert_eq!(browser_shortcut(true, 0x50, 128 | 2), None);
         assert_eq!(
+            browser_shortcut(true, 0x52, 128),
+            Some(BrowserShortcut::ReloadPage {
+                ignore_cache: false
+            })
+        );
+        assert_eq!(
+            browser_shortcut(true, 0x52, 4),
+            Some(BrowserShortcut::ReloadPage {
+                ignore_cache: false
+            })
+        );
+        assert_eq!(
+            browser_shortcut(true, 0x52, 128 | 2),
+            Some(BrowserShortcut::ReloadPage { ignore_cache: true })
+        );
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                browser_shortcut(true, 0x74, 0),
+                Some(BrowserShortcut::ReloadPage {
+                    ignore_cache: false
+                })
+            );
+            assert_eq!(
+                browser_shortcut(true, 0x74, 128),
+                Some(BrowserShortcut::ReloadPage { ignore_cache: true })
+            );
+            assert_eq!(
+                browser_shortcut(true, 0x74, 2),
+                Some(BrowserShortcut::ReloadPage { ignore_cache: true })
+            );
+            // Alt+F5 stays with the page; macOS does not claim F5 at all.
+            assert_eq!(browser_shortcut(true, 0x74, 128 | 8), None);
+        }
+        #[cfg(target_os = "macos")]
+        assert_eq!(browser_shortcut(true, 0x74, 0), None);
+        assert_eq!(
             browser_shortcut(true, 0x4A, 128),
             Some(BrowserShortcut::OpenDownloads)
         );
@@ -1339,6 +1394,22 @@ mod tests {
             Some(BrowserShortcut::Print)
         );
         assert_eq!(browser_shortcut_from_char(true, 'p' as u16, 128 | 2), None);
+        assert_eq!(
+            browser_shortcut_from_char(true, 'r' as u16, 128),
+            Some(BrowserShortcut::ReloadPage {
+                ignore_cache: false
+            })
+        );
+        assert_eq!(
+            browser_shortcut_from_char(true, 'R' as u16, 4),
+            Some(BrowserShortcut::ReloadPage {
+                ignore_cache: false
+            })
+        );
+        assert_eq!(
+            browser_shortcut_from_char(true, 'r' as u16, 128 | 2),
+            Some(BrowserShortcut::ReloadPage { ignore_cache: true })
+        );
         assert_eq!(
             browser_shortcut_from_char(true, 'C' as u16, 128 | 2),
             Some(BrowserShortcut::CopyUrl)

@@ -17,7 +17,7 @@ Every single commit must honor three non-negotiable engineering goals:
 2. **Daily-Driver Reliability & Compatibility:**
    - Full support for modern web apps (YouTube, Google Docs, Figma, WebGL, WASM, WebRTC).
    - Crash-safe session persistence, history, and bookmarks stored in **SQLite (WAL mode)**.
-   - Complete keyboard-first ergonomics (`Ctrl/Cmd+T`, `W`, `L`, `Shift+T`, `Shift+C` (copy URL), `F`, `F12`, `Alt+H`, `Ctrl/Cmd+K`).
+   - Complete keyboard-first ergonomics (`Ctrl/Cmd+T`, `W`, `R`, `Shift+R`, `L`, `Shift+T`, `Shift+C` (copy URL), `F`, `F5` (Windows/Linux), `F12`, `Alt+H`, `Ctrl/Cmd+K`).
 3. **Maximum Execution Speed:**
    - Use `mimalloc` as the `#[global_allocator]`.
    - Use **Native Child Window Embedding** (`raw-window-handle` + platform child view), NOT Off-Screen Rendering (OSR), to preserve zero-copy GPU compositing and hardware video decoding.
@@ -59,7 +59,7 @@ Use these exact crate versions and release profile settings:
 ```toml
 [package]
 name = "kasumi-browser"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 
 [dependencies]
