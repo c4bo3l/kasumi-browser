@@ -16,7 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cef::{
     CefString, ContentSettingTypes, ContentSettingValues, ImplBrowser, ImplBrowserHost,
-    ImplDownloadItemCallback, ImplFrame, ImplRequestContext, ImplUrlrequest,
+    ImplDownloadItemCallback, ImplFrame, ImplPrintDialogCallback, ImplPrintJobCallback,
+    ImplRequestContext, ImplUrlrequest,
 };
 use crossbeam_channel::{Receiver, Sender};
 use sysinfo::{ProcessesToUpdate, System};
@@ -26,7 +27,7 @@ use crate::browser::find;
 use crate::browser::parallel_download::{
     self, part_path_for, safe_file_name, DownloadWriter, SegmentRange,
 };
-use crate::browser::{adblocker, client, display_capture};
+use crate::browser::{adblocker, client, display_capture, print};
 use crate::config::{
     BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
     PARALLEL_DOWNLOAD_SEGMENTS, RAM_CHECK_INTERVAL, RAM_CRITICAL_PRESSURE_THRESHOLD,
@@ -35,13 +36,13 @@ use crate::config::{
 use crate::events::{
     normalize_permission_origin, BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo,
     DownloadNotification, DownloadNotificationKind, DownloadState, FindOptions, FindSnippet,
-    MediaAccessPermissions, MediaPermissionCallback, ParallelDownloadEvent, UiAction,
+    MediaAccessPermissions, MediaPermissionCallback, ParallelDownloadEvent, PrintOptions, UiAction,
     WebNotification,
 };
 use crate::storage::db::{BookmarkItem, SessionTabSnapshot, SitePermission, StorageHandle};
 use crate::ui::chrome::{
     BookmarkInfo, ChromeState, DisplayMediaPicker, Favicon, PermissionPrompt, PermissionPromptKind,
-    TabDisplayState, TabInfo, WorkspaceInfo,
+    PrintDialogState, TabDisplayState, TabInfo, ToastKind, WorkspaceInfo,
 };
 use crate::ui::platform_view::{self, ContentRect};
 
@@ -387,6 +388,32 @@ struct PendingDisplayMediaPicker {
     picker: DisplayMediaPicker,
 }
 
+/// Linux's unresolved native print panel. The CEF callback lives only on the
+/// main UI thread and is continued or cancelled exactly once.
+struct PendingPrintDialog {
+    tab_id: u64,
+    has_selection: bool,
+    options: PrintOptions,
+    callback: cef::PrintDialogCallback,
+}
+
+impl std::fmt::Debug for PendingPrintDialog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingPrintDialog")
+            .field("tab_id", &self.tab_id)
+            .field("has_selection", &self.has_selection)
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Outcome of a CUPS print job waiting to become a native toast.
+#[derive(Debug, Clone)]
+struct PrintJobToast {
+    success: bool,
+    message: String,
+}
+
 /// Resolve a one-shot CEF callback on the UI thread. MediaAccess callbacks need
 /// the exact requested bitmask; Chrome-runtime prompt callbacks are dismissed
 /// because CEF's Accept/Deny paths unconditionally consume request callbacks.
@@ -625,6 +652,18 @@ pub struct TabManager {
     pending_notification_permission_queue: VecDeque<u64>,
     pending_display_media_pickers: HashMap<String, PendingDisplayMediaPicker>,
     pending_display_media_queue: VecDeque<String>,
+    /// Linux print dialog awaiting a user decision. Only one tab can print at
+    /// a time, so a single pending entry is sufficient.
+    pending_print_dialog: Option<PendingPrintDialog>,
+    /// Last native print panel selections, reused for the next print request.
+    print_options: PrintOptions,
+    /// Per-tab channels carrying the latest selections to CEF's print handler.
+    print_options_senders: HashMap<u64, Sender<PrintOptions>>,
+    /// CUPS destinations discovered off the UI thread.
+    print_printers: Vec<String>,
+    print_default_printer: String,
+    /// Print outcomes waiting to be shown as native toasts.
+    print_toasts: VecDeque<PrintJobToast>,
     /// Native web notifications waiting for the shell to surface them.
     web_notifications: VecDeque<WebNotification>,
     /// Notification ids a page closed before the shell could dismiss them.
@@ -714,6 +753,24 @@ fn normalize_workspace_selection(
     active_id
 }
 
+/// Merge CEF's fresh defaults with the user's durable choices. The printer and
+/// paper size are UI-only preferences; copies/orientation/colour come from CEF
+/// unless the user has already changed them in a previous dialog.
+fn merge_print_defaults(previous: &PrintOptions, defaults: &PrintOptions) -> PrintOptions {
+    PrintOptions {
+        printer: if defaults.printer.is_empty() {
+            previous.printer.clone()
+        } else {
+            defaults.printer.clone()
+        },
+        paper: previous.paper,
+        copies: defaults.copies.max(1),
+        landscape: defaults.landscape,
+        color: defaults.color,
+        selection_only: false,
+    }
+}
+
 impl TabManager {
     pub fn new(
         event_sender: Sender<BrowserEvent>,
@@ -791,6 +848,12 @@ impl TabManager {
             pending_notification_permission_queue: VecDeque::new(),
             pending_display_media_pickers: HashMap::new(),
             pending_display_media_queue: VecDeque::new(),
+            pending_print_dialog: None,
+            print_options: PrintOptions::default(),
+            print_options_senders: HashMap::new(),
+            print_printers: Vec::new(),
+            print_default_printer: String::new(),
+            print_toasts: VecDeque::new(),
             web_notifications: VecDeque::new(),
             closed_web_notifications: Vec::new(),
             saved_site_permissions: BTreeMap::new(),
@@ -2611,6 +2674,7 @@ impl TabManager {
         self.find_results.remove(&id);
         self.find_snippets.remove(&id);
         self.find_errors.remove(&id);
+        self.release_print_resources_for_tab(id);
         self.discard_media_permissions_for_tab(id);
         self.requested_favicons.retain(|(tab_id, _)| *tab_id != id);
         self.pending_favicon_urls.remove(&id);
@@ -2701,6 +2765,7 @@ impl TabManager {
             tab.state = TabState::Hibernated;
             tab.blocked_requests = 0;
             tab.is_loading = false;
+            self.release_print_resources_for_tab(id);
             self.sync_session();
         }
     }
@@ -3188,12 +3253,20 @@ impl TabManager {
         } else {
             None
         };
+        // Each browser gets a one-way channel for the latest native print
+        // options. CEF's Linux print handler drains it on the UI thread when
+        // the print-ready PDF is ready, without sharing a mutable lock.
+        let (print_options_sender, print_options_receiver) =
+            crossbeam_channel::unbounded::<PrintOptions>();
+        self.print_options_senders
+            .insert(tab_id, print_options_sender);
         let mut client = client::create_tab_client(
             tab_id,
             self.event_sender.clone(),
             self.adblock_engine.clone(),
             Arc::clone(&self.adblock_enabled),
             self.download_preferences.clone(),
+            print_options_receiver,
         );
         let bounds = cef::Rect {
             x: self.content_rect.x as i32,
@@ -3864,9 +3937,37 @@ impl TabManager {
                     },
                 );
             }
+            BrowserEvent::PrintDefaultsLoaded { tab_id: _, options } => {
+                let previous = self.print_options.clone();
+                self.print_options = merge_print_defaults(&previous, &options);
+            }
+            BrowserEvent::PrintDialogRequested {
+                tab_id,
+                has_selection,
+                callback,
+            } => self.handle_print_dialog_requested(tab_id, has_selection, callback),
+            BrowserEvent::PrintersDiscovered {
+                printers,
+                default_printer,
+            } => {
+                self.print_printers = printers;
+                self.print_default_printer = default_printer;
+                if let Some(pending) = self.pending_print_dialog.as_mut() {
+                    if pending.options.printer.is_empty() {
+                        pending.options.printer = self.print_default_printer.clone();
+                    }
+                }
+            }
+            BrowserEvent::PrintJobFinished {
+                tab_id,
+                success,
+                message,
+                callback,
+            } => self.handle_print_job_finished(tab_id, success, message, callback),
             BrowserEvent::BrowserClosed { tab_id } => {
                 self.pending_navigation_checks.remove(&tab_id);
                 self.discard_media_permissions_for_tab(tab_id);
+                self.release_print_resources_for_tab(tab_id);
                 // CEF browser is gone (user tab close, hibernation, or app shutdown).
                 // Never remove the tab metadata here — only release the handle.
                 tracing::info!(
@@ -3901,6 +4002,7 @@ impl TabManager {
                 BrowserShortcut::FindInPage => {
                     self.find_requested = true;
                 }
+                BrowserShortcut::Print => self.print(tab_id),
                 BrowserShortcut::OpenSettings => {
                     self.settings_requested = true;
                 }
@@ -4251,6 +4353,153 @@ impl TabManager {
         }
     }
 
+    /// Open the platform print dialog for a live tab's CEF view.
+    ///
+    /// Printing is driven from the main UI thread through `about_to_wait`; no
+    /// filesystem or database work happens here. A hibernated tab has no live
+    /// browser host, so the request is ignored with a warning rather than
+    /// waking a background page just to print it.
+    pub fn print(&self, tab_id: u64) {
+        let Some(host) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.browser.as_ref())
+            .and_then(|browser| browser.host())
+        else {
+            tracing::warn!("Print skipped for tab {tab_id}: no live browser host");
+            return;
+        };
+        host.print();
+    }
+
+    /// Cancel an unresolved print panel belonging to one tab without touching
+    /// that tab's option channel. A new dialog for the same browser must still
+    /// be able to deliver its selections to CEF.
+    fn cancel_print_dialog_for_tab(&mut self, tab_id: u64) {
+        let pending = self.pending_print_dialog.take();
+        match pending {
+            Some(pending) if pending.tab_id == tab_id => pending.callback.cancel(),
+            Some(pending) => self.pending_print_dialog = Some(pending),
+            None => {}
+        }
+    }
+
+    /// Drop all print state for a browser that is closing or hibernating.
+    fn release_print_resources_for_tab(&mut self, tab_id: u64) {
+        self.cancel_print_dialog_for_tab(tab_id);
+        self.print_options_senders.remove(&tab_id);
+    }
+
+    /// Open Kasumi's native Linux print panel from a CEF `PrintHandler`.
+    fn handle_print_dialog_requested(
+        &mut self,
+        tab_id: u64,
+        has_selection: bool,
+        callback: cef::PrintDialogCallback,
+    ) {
+        if !self.tabs.iter().any(|tab| tab.id == tab_id) {
+            callback.cancel();
+            return;
+        }
+        self.cancel_print_dialog_for_tab(tab_id);
+        self.print_options.selection_only = false;
+        let options = self.print_options.clone().sanitized();
+        self.pending_print_dialog = Some(PendingPrintDialog {
+            tab_id,
+            has_selection,
+            options,
+            callback,
+        });
+
+        // `lpstat` is deliberately off the CEF and winit threads.
+        self.print_printers.clear();
+        self.print_default_printer.clear();
+        let event_sender = self.event_sender.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("kasumi-printers".to_string())
+            .spawn(move || {
+                let (printers, default_printer) = print::discover_printers();
+                let _ = event_sender.send(BrowserEvent::PrintersDiscovered {
+                    printers,
+                    default_printer,
+                });
+            })
+        {
+            tracing::warn!("Could not query CUPS printers: {error}");
+        }
+    }
+
+    /// Resolve the native print panel on the main UI thread. CEF receives a
+    /// fully populated settings object and the CUPS worker receives the same
+    /// plain options through the tab's one-way channel.
+    fn respond_print_dialog(&mut self, tab_id: u64, accept: bool, options: PrintOptions) {
+        let Some(pending) = self.pending_print_dialog.take() else {
+            return;
+        };
+        if pending.tab_id != tab_id {
+            self.pending_print_dialog = Some(pending);
+            return;
+        }
+        if !accept {
+            pending.callback.cancel();
+            return;
+        }
+
+        let options = options.sanitized();
+        self.print_options = options.clone();
+        if let Some(sender) = self.print_options_senders.get(&tab_id) {
+            let _ = sender.send(options.clone());
+        }
+
+        let Some(mut settings) = cef::print_settings_create() else {
+            tracing::error!("CEF could not create print settings for tab {tab_id}");
+            pending.callback.cancel();
+            self.print_toasts.push_back(PrintJobToast {
+                success: false,
+                message: "CEF could not create print settings".to_string(),
+            });
+            return;
+        };
+        print::apply_print_settings(&mut settings, &options, pending.has_selection);
+        pending.callback.cont(Some(&mut settings));
+    }
+
+    /// CEF completed the print job on the UI thread; the CUPS worker has already
+    /// finished its blocking work. Continue the callback exactly once here.
+    fn handle_print_job_finished(
+        &mut self,
+        tab_id: u64,
+        success: bool,
+        message: String,
+        callback: cef::PrintJobCallback,
+    ) {
+        callback.cont();
+        tracing::info!("Print job for tab {tab_id}: {message}");
+        self.print_toasts
+            .push_back(PrintJobToast { success, message });
+    }
+
+    /// Native toasts raised by Linux print jobs, consumed by the shell.
+    pub fn consume_print_toasts(&mut self) -> Vec<(ToastKind, String, String)> {
+        self.print_toasts
+            .drain(..)
+            .map(|toast| {
+                let kind = if toast.success {
+                    ToastKind::Success
+                } else {
+                    ToastKind::Error
+                };
+                let title = if toast.success {
+                    "Print sent".to_string()
+                } else {
+                    "Print failed".to_string()
+                };
+                (kind, title, toast.message)
+            })
+            .collect()
+    }
+
     /// Dispatch user actions from egui chrome or keyboard shortcuts.
     pub fn handle_ui_action(&mut self, action: UiAction) {
         match action {
@@ -4575,6 +4824,12 @@ impl TabManager {
             UiAction::StopFindingAll { clear_selection } => {
                 self.stop_finding_all(clear_selection);
             }
+            UiAction::Print { tab_id } => self.print(tab_id),
+            UiAction::RespondPrintDialog {
+                tab_id,
+                accept,
+                options,
+            } => self.respond_print_dialog(tab_id, accept, options),
             // The winit handler persists the live rail toggle; tab state needs
             // no change for a chrome width update.
             UiAction::SetRailExpanded(_) => {}
@@ -4811,6 +5066,16 @@ impl TabManager {
         } else {
             None
         };
+        state.print_dialog = self
+            .pending_print_dialog
+            .as_ref()
+            .map(|pending| PrintDialogState {
+                tab_id: pending.tab_id,
+                has_selection: pending.has_selection,
+                options: pending.options.clone(),
+                printers: self.print_printers.clone(),
+                default_printer: self.print_default_printer.clone(),
+            });
         state.display_media_picker = self
             .active_display_media_token()
             .and_then(|token| self.pending_display_media_pickers.get(&token))
@@ -4822,9 +5087,9 @@ impl TabManager {
 mod tests {
     use super::{
         closed_tab_from, fallback_favicon_url, idle_timeout_for_pressure, insertion_index,
-        is_blank_navigation_url, is_critical_pressure, needs_initial_navigation,
-        next_navigation_retry_delay, normalize_workspace_selection, pinned_insert_index,
-        preferred_favicon_url, ram_pressure, record_media_permission,
+        is_blank_navigation_url, is_critical_pressure, merge_print_defaults,
+        needs_initial_navigation, next_navigation_retry_delay, normalize_workspace_selection,
+        pinned_insert_index, preferred_favicon_url, ram_pressure, record_media_permission,
         record_site_permission_decision, remembered_permission_decision, restore_insert_index,
         should_hibernate_tab, should_sync_omnibox, take_pending_permission, BrowserSpawnMode,
         PendingMediaPermission, Tab, TabManager, TabState,
@@ -4835,8 +5100,8 @@ mod tests {
     };
     use crate::events::{
         BrowserEvent, DownloadEngine, DownloadInfo, DownloadNotificationKind, DownloadState,
-        MediaAccessPermissions, MediaPermissionCallback, TestPermissionCallback, UiAction,
-        WebNotification,
+        MediaAccessPermissions, MediaPermissionCallback, PrintOptions, PrintPaperSize,
+        TestPermissionCallback, UiAction, WebNotification,
     };
     use crate::storage::db::{BookmarkItem, DbCommand, SessionTabSnapshot, StorageHandle};
     use crate::ui::chrome::{ChromeState, PermissionPromptKind};
@@ -4844,6 +5109,34 @@ mod tests {
     use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc::UnboundedReceiver;
+
+    #[test]
+    fn print_defaults_keep_ui_choices_but_refresh_cef_values() {
+        let previous = PrintOptions {
+            printer: "Office".to_string(),
+            paper: PrintPaperSize::A4,
+            copies: 7,
+            landscape: true,
+            color: false,
+            selection_only: true,
+        };
+        let defaults = PrintOptions {
+            printer: "Lab".to_string(),
+            paper: PrintPaperSize::Letter,
+            copies: 2,
+            landscape: false,
+            color: true,
+            selection_only: true,
+        };
+
+        let merged = merge_print_defaults(&previous, &defaults);
+        assert_eq!(merged.printer, "Lab");
+        assert_eq!(merged.paper, PrintPaperSize::A4);
+        assert_eq!(merged.copies, 2);
+        assert!(!merged.landscape);
+        assert!(merged.color);
+        assert!(!merged.selection_only);
+    }
 
     #[test]
     fn pending_permission_is_taken_once_and_removed_from_queue() {

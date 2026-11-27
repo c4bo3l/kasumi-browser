@@ -438,6 +438,7 @@ mod native_shortcuts {
             't' => Some(BrowserShortcut::NewTab),
             'w' if !shift => Some(BrowserShortcut::CloseTab),
             'f' if !shift => Some(BrowserShortcut::FindInPage),
+            'p' if !shift => Some(BrowserShortcut::Print),
             'l' | 'k' if !shift => Some(BrowserShortcut::OpenCommandPalette),
             'j' if !shift => Some(BrowserShortcut::OpenDownloads),
             ',' | '.' if !shift => Some(BrowserShortcut::OpenSettings),
@@ -503,6 +504,10 @@ fn setup_mac_application() {
         send_menu_shortcut(BrowserShortcut::OpenDownloads);
     }
 
+    extern "C" fn menu_print(_this: *mut c_void, _cmd: *mut c_void) {
+        send_menu_shortcut(BrowserShortcut::Print);
+    }
+
     extern "C" fn menu_quit(_this: *mut c_void, _cmd: *mut c_void) {
         send_menu_shortcut(BrowserShortcut::Quit);
     }
@@ -543,6 +548,7 @@ fn setup_mac_application() {
             register_action("kasumiCloseTab:", menu_close_tab);
             register_action("kasumiOpenSettings:", menu_open_settings);
             register_action("kasumiOpenDownloads:", menu_open_downloads);
+            register_action("kasumiPrint:", menu_print);
             register_action("kasumiQuitApp:", menu_quit);
 
             let proto_name = CString::new("CrAppControlProtocol").unwrap();
@@ -589,7 +595,7 @@ fn install_macos_main_menu() {
     let app_menu = NSMenu::new(mtm);
     let app_version = NSMenuItem::new(mtm);
     unsafe {
-        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.12.0"));
+        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.14.0"));
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
@@ -616,6 +622,7 @@ fn install_macos_main_menu() {
     add_item("Close Tab", objc2::sel!(kasumiCloseTab:), "w");
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     add_item("Downloads…", objc2::sel!(kasumiOpenDownloads:), "j");
+    add_item("Print…", objc2::sel!(kasumiPrint:), "p");
     add_item("Settings…", objc2::sel!(kasumiOpenSettings:), ",");
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
 
@@ -1440,6 +1447,13 @@ impl KasumiBrowserHandler {
             BrowserShortcut::FindInPage => {
                 self.chrome_state.open_find_bar();
             }
+            BrowserShortcut::Print => {
+                if let Some(tm) = self.tab_manager.as_mut() {
+                    if let Some(id) = tm.active_tab_id {
+                        tm.handle_ui_action(UiAction::Print { tab_id: id });
+                    }
+                }
+            }
             BrowserShortcut::OpenSettings => {
                 self.chrome_state.open_settings();
             }
@@ -1735,6 +1749,15 @@ fn is_new_private_window_shortcut(modifiers: ModifiersState, key: &Key) -> bool 
         && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("n"))
 }
 
+/// `Cmd/Ctrl+P` opens the platform print dialog for the active CEF view.
+/// Shift and Alt are excluded so page-specific print scripts keep their keys.
+fn is_print_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
+    is_primary_shortcut_modifier(modifiers)
+        && !modifiers.alt_key()
+        && !modifiers.shift_key()
+        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("p"))
+}
+
 /// Cmd/Ctrl+Q quits through the same deferred shutdown path as the window's
 /// close button, so SQLite and CEF are flushed before the process exits.
 fn is_quit_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
@@ -1964,6 +1987,7 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                 WindowEvent::CloseRequested => {
                     let mut actions = Vec::new();
                     self.chrome_state.dismiss_permission_prompt(&mut actions);
+                    self.chrome_state.dismiss_print_dialog(&mut actions);
                     if actions.is_empty() {
                         self.chrome_state.close_active_overlay();
                     } else {
@@ -2248,6 +2272,8 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                     self.handle_browser_shortcut(BrowserShortcut::CopyUrl);
                 } else if is_new_private_window_shortcut(self.modifiers, logical_key) {
                     self.handle_browser_shortcut(BrowserShortcut::NewPrivateWindow);
+                } else if is_print_shortcut(self.modifiers, logical_key) {
+                    self.handle_browser_shortcut(BrowserShortcut::Print);
                 } else if alt {
                     if let Key::Character(c) = logical_key {
                         if c.eq_ignore_ascii_case("h") {
@@ -2439,6 +2465,9 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             }
             for notification in tm.consume_web_notifications() {
                 self.chrome_state.show_web_notification(notification);
+            }
+            for (kind, title, message) in tm.consume_print_toasts() {
+                self.chrome_state.show_toast(kind, title, message);
             }
             for notification_id in tm.consume_closed_web_notifications() {
                 self.chrome_state.remove_web_notification(&notification_id);
@@ -2766,7 +2795,7 @@ fn main() {
 mod tests {
     use super::{
         effective_scale_factor, is_copy_url_shortcut, is_new_private_window_shortcut,
-        is_primary_shortcut_modifier, is_quit_shortcut, is_reopen_tab_shortcut,
+        is_primary_shortcut_modifier, is_print_shortcut, is_quit_shortcut, is_reopen_tab_shortcut,
         overlay_screen_position, pointer_is_past_rail, web_notification_physical_size,
         BrowserShortcut,
     };
@@ -2865,6 +2894,29 @@ mod tests {
         assert!(!is_new_private_window_shortcut(
             ModifiersState::SUPER | ModifiersState::SHIFT,
             &Key::Character("t".into())
+        ));
+    }
+
+    #[test]
+    fn print_shortcut_requires_primary_modifier_without_shift_or_alt() {
+        let p: Key = Key::Character("p".into());
+        let upper_p: Key = Key::Character("P".into());
+
+        assert!(is_print_shortcut(ModifiersState::CONTROL, &p));
+        assert!(is_print_shortcut(ModifiersState::SUPER, &upper_p));
+        assert!(!is_print_shortcut(ModifiersState::empty(), &p));
+        assert!(!is_print_shortcut(ModifiersState::SHIFT, &p));
+        assert!(!is_print_shortcut(
+            ModifiersState::SUPER | ModifiersState::SHIFT,
+            &p
+        ));
+        assert!(!is_print_shortcut(
+            ModifiersState::SUPER | ModifiersState::ALT,
+            &p
+        ));
+        assert!(!is_print_shortcut(
+            ModifiersState::CONTROL,
+            &Key::Character("f".into())
         ));
     }
 
@@ -2974,6 +3026,11 @@ mod tests {
             Some(BrowserShortcut::FindInPage)
         );
         assert_eq!(shortcut_from_parts('f', 0x03, cmd | shift), None);
+        assert_eq!(
+            shortcut_from_parts('p', 0x13, cmd),
+            Some(BrowserShortcut::Print)
+        );
+        assert_eq!(shortcut_from_parts('p', 0x13, cmd | shift), None);
         assert_eq!(
             shortcut_from_parts('j', 0x26, cmd),
             Some(BrowserShortcut::OpenDownloads)

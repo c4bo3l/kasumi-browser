@@ -331,6 +331,63 @@ pub struct DownloadNotification {
     pub kind: DownloadNotificationKind,
 }
 
+/// Paper size used by Kasumi's Linux print dialog. CEF only needs the physical
+/// dimensions in device units, so the UI keeps this as plain data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrintPaperSize {
+    Letter,
+    A4,
+}
+
+impl PrintPaperSize {
+    /// Width and height in inches in portrait orientation.
+    pub fn inches(self) -> (f64, f64) {
+        match self {
+            Self::Letter => (8.5, 11.0),
+            Self::A4 => (8.27, 11.69),
+        }
+    }
+}
+
+/// Plain-data print settings shared between the native print dialog, the CEF
+/// `PrintHandler`, and the CUPS spooler. No CEF objects are retained outside the
+/// main UI thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrintOptions {
+    /// CUPS destination name. Empty means the system default printer.
+    pub printer: String,
+    pub paper: PrintPaperSize,
+    pub copies: u32,
+    pub landscape: bool,
+    pub color: bool,
+    pub selection_only: bool,
+}
+
+impl Default for PrintOptions {
+    fn default() -> Self {
+        Self {
+            printer: String::new(),
+            paper: PrintPaperSize::Letter,
+            copies: 1,
+            landscape: false,
+            color: true,
+            selection_only: false,
+        }
+    }
+}
+
+impl PrintOptions {
+    /// Clamp UI input before it reaches CEF or `lp`.
+    pub fn sanitized(&self) -> Self {
+        Self {
+            printer: self.printer.trim().to_string(),
+            copies: self.copies.clamp(1, 999),
+            selection_only: self.selection_only,
+            ..*self
+        }
+    }
+}
+
 /// A Web Notification API notification mirrored from the renderer shim.
 /// Kept as plain owned data so CEF handler threads never retain page objects.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -583,6 +640,32 @@ pub enum BrowserEvent {
         error: String,
         cleared: bool,
     },
+    /// CEF supplied the default Linux print settings. The UI merges them with
+    /// the last used options before opening Kasumi's native print panel.
+    PrintDefaultsLoaded {
+        tab_id: u64,
+        options: PrintOptions,
+    },
+    /// Linux `PrintHandler` needs a native print panel. The callback is kept on
+    /// the main UI thread until the user confirms or cancels.
+    PrintDialogRequested {
+        tab_id: u64,
+        has_selection: bool,
+        callback: cef::PrintDialogCallback,
+    },
+    /// Available CUPS destinations discovered off the UI thread.
+    PrintersDiscovered {
+        printers: Vec<String>,
+        default_printer: String,
+    },
+    /// The CUPS worker finished a print job. `callback` is continued on the
+    /// main UI thread so no Chromium callback fires from the worker.
+    PrintJobFinished {
+        tab_id: u64,
+        success: bool,
+        message: String,
+        callback: cef::PrintJobCallback,
+    },
 }
 
 /// Options for a find request shared by the native CEF path and the rich
@@ -639,6 +722,7 @@ pub enum BrowserShortcut {
     OpenCommandPalette,
     OpenDevTools,
     FindInPage,
+    Print,
     OpenSettings,
     OpenDownloads,
     OpenBookmarkManager,
@@ -826,6 +910,39 @@ impl std::fmt::Debug for BrowserEvent {
                 .field("error", error)
                 .field("cleared", cleared)
                 .finish(),
+            Self::PrintDefaultsLoaded { tab_id, options } => f
+                .debug_struct("PrintDefaultsLoaded")
+                .field("tab_id", tab_id)
+                .field("options", options)
+                .finish(),
+            Self::PrintDialogRequested {
+                tab_id,
+                has_selection,
+                callback: _,
+            } => f
+                .debug_struct("PrintDialogRequested")
+                .field("tab_id", tab_id)
+                .field("has_selection", has_selection)
+                .finish(),
+            Self::PrintersDiscovered {
+                printers,
+                default_printer,
+            } => f
+                .debug_struct("PrintersDiscovered")
+                .field("printers", &printers.len())
+                .field("default_printer", default_printer)
+                .finish(),
+            Self::PrintJobFinished {
+                tab_id,
+                success,
+                message,
+                callback: _,
+            } => f
+                .debug_struct("PrintJobFinished")
+                .field("tab_id", tab_id)
+                .field("success", success)
+                .field("message", message)
+                .finish(),
             Self::ParallelDownload(event) => {
                 f.debug_tuple("ParallelDownload").field(event).finish()
             }
@@ -881,6 +998,17 @@ pub enum UiAction {
     HibernateAllBackground,
     OpenDevTools {
         tab_id: u64,
+    },
+    /// Open the platform print dialog for one tab's live CEF view.
+    Print {
+        tab_id: u64,
+    },
+    /// Resolve Kasumi's native Linux print panel. `accept: false` cancels the
+    /// pending CEF callback without sending a job to CUPS.
+    RespondPrintDialog {
+        tab_id: u64,
+        accept: bool,
+        options: PrintOptions,
     },
     /// Switch the visible native workspace and its active tab.
     SwitchWorkspace {

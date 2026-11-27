@@ -9,10 +9,11 @@ use crate::browser::notifications::{
 };
 use crate::events::{
     BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadState,
-    MediaAccessPermissions, MediaPermissionCallback, WebNotification, DISPLAY_MEDIA_CONSOLE_PREFIX,
+    MediaAccessPermissions, MediaPermissionCallback, PrintOptions, WebNotification,
+    DISPLAY_MEDIA_CONSOLE_PREFIX,
 };
 use cef::*;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -594,6 +595,7 @@ const VK_J: i32 = 0x4A;
 const VK_K: i32 = 0x4B;
 const VK_L: i32 = 0x4C;
 const VK_N: i32 = 0x4E;
+const VK_P: i32 = 0x50;
 const VK_T: i32 = 0x54;
 const VK_W: i32 = 0x57;
 const VK_Z: i32 = 0x5A;
@@ -656,6 +658,7 @@ pub(crate) fn browser_shortcut(
         VK_T => Some(BrowserShortcut::NewTab),
         VK_W if !shift => Some(BrowserShortcut::CloseTab),
         VK_F if !shift => Some(BrowserShortcut::FindInPage),
+        VK_P if !shift => Some(BrowserShortcut::Print),
         VK_L | VK_K if !shift => Some(BrowserShortcut::OpenCommandPalette),
         VK_B if shift => Some(BrowserShortcut::OpenBookmarkManager),
         VK_C if shift => Some(BrowserShortcut::CopyUrl),
@@ -708,6 +711,7 @@ fn browser_shortcut_from_char(
         }
         c if c == 'W' as u16 || c == 'w' as u16 => Some(BrowserShortcut::CloseTab),
         c if c == 'F' as u16 || c == 'f' as u16 => Some(BrowserShortcut::FindInPage),
+        c if (c == 'P' as u16 || c == 'p' as u16) && !shift => Some(BrowserShortcut::Print),
         c if c == 'L' as u16 || c == 'l' as u16 || c == 'K' as u16 || c == 'k' as u16 => {
             Some(BrowserShortcut::OpenCommandPalette)
         }
@@ -1017,6 +1021,9 @@ wrap_client! {
         keyboard_handler: KeyboardHandler,
         context_menu_handler: ContextMenuHandler,
         permission_handler: PermissionHandler,
+        // Linux overrides CEF's missing platform dialog; macOS/Windows keep
+        // the default handler by leaving this `None`.
+        print_handler: Option<PrintHandler>,
     }
 
     impl Client {
@@ -1047,6 +1054,9 @@ wrap_client! {
         fn permission_handler(&self) -> Option<PermissionHandler> {
             Some(self.permission_handler.clone())
         }
+        fn print_handler(&self) -> Option<PrintHandler> {
+            self.print_handler.clone()
+        }
     }
 }
 
@@ -1056,6 +1066,7 @@ pub fn create_tab_client(
     adblock_engine: std::sync::Arc<adblock::Engine>,
     adblock_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     download_preferences: SharedDownloadPreferences,
+    print_options_receiver: Receiver<PrintOptions>,
 ) -> Client {
     let life_span_handler = TabLifeSpanHandler::new(tab_id, event_sender.clone());
     let load_handler = TabLoadHandler::new(tab_id, event_sender.clone());
@@ -1064,6 +1075,8 @@ pub fn create_tab_client(
     let keyboard_handler = TabKeyboardHandler::new(tab_id, event_sender.clone());
     let context_menu_handler = TabContextMenuHandler::new(tab_id, event_sender.clone());
     let permission_handler = TabPermissionHandler::new(tab_id, event_sender.clone());
+    let print_handler =
+        super::print::create_print_handler(tab_id, event_sender.clone(), print_options_receiver);
     let download_handler =
         TabDownloadHandler::new(tab_id, event_sender.clone(), download_preferences);
     let request_handler = super::adblocker::create_tab_request_handler(
@@ -1083,6 +1096,7 @@ pub fn create_tab_client(
         keyboard_handler.into(),
         context_menu_handler.into(),
         permission_handler.into(),
+        print_handler,
     )
 }
 
@@ -1239,6 +1253,15 @@ mod tests {
         );
         assert_eq!(browser_shortcut(true, 0x46, 128 | 2), None);
         assert_eq!(
+            browser_shortcut(true, 0x50, 128),
+            Some(BrowserShortcut::Print)
+        );
+        assert_eq!(
+            browser_shortcut(true, 0x50, 4),
+            Some(BrowserShortcut::Print)
+        );
+        assert_eq!(browser_shortcut(true, 0x50, 128 | 2), None);
+        assert_eq!(
             browser_shortcut(true, 0x4A, 128),
             Some(BrowserShortcut::OpenDownloads)
         );
@@ -1293,6 +1316,11 @@ mod tests {
             browser_shortcut_from_char(true, 'j' as u16, 128),
             Some(BrowserShortcut::OpenDownloads)
         );
+        assert_eq!(
+            browser_shortcut_from_char(true, 'p' as u16, 128),
+            Some(BrowserShortcut::Print)
+        );
+        assert_eq!(browser_shortcut_from_char(true, 'p' as u16, 128 | 2), None);
         assert_eq!(
             browser_shortcut_from_char(true, 'C' as u16, 128 | 2),
             Some(BrowserShortcut::CopyUrl)

@@ -6,3 +6,4 @@ pub mod find;
 pub mod hibernation;
 pub mod notifications;
 pub mod parallel_download;
+pub mod print;
