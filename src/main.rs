@@ -595,7 +595,7 @@ fn install_macos_main_menu() {
     let app_menu = NSMenu::new(mtm);
     let app_version = NSMenuItem::new(mtm);
     unsafe {
-        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.14.0"));
+        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.15.0"));
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
@@ -2468,6 +2468,15 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             }
             for (kind, title, message) in tm.consume_print_toasts() {
                 self.chrome_state.show_toast(kind, title, message);
+            }
+            if let Some(profiles) = tm.consume_browser_profiles() {
+                self.chrome_state.set_browser_profiles(profiles);
+            }
+            if let Some(message) = tm.consume_browser_import_progress() {
+                self.chrome_state.set_browser_import_progress(message);
+            }
+            if let Some(report) = tm.consume_browser_import_report() {
+                self.chrome_state.set_browser_import_report(report);
             }
             for notification_id in tm.consume_closed_web_notifications() {
                 self.chrome_state.remove_web_notification(&notification_id);

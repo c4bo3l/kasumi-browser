@@ -10,6 +10,8 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection};
@@ -19,6 +21,7 @@ use crate::config::{
     BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, PREFERENCES_DB_KEY,
 };
 use crate::events::{DownloadEngine, DownloadInfo, DownloadState};
+use crate::storage::import::{ImportReport, ImportedBookmark, ImportedVisit};
 
 #[derive(Debug, Clone)]
 pub struct SessionTabSnapshot {
@@ -113,6 +116,16 @@ pub enum DbCommand {
         origin: String,
         permission: String,
     },
+    /// Apply one parsed browser-import batch in a single transaction. The reply
+    /// channel is waited on by the import worker thread, never by the UI or CEF
+    /// threads.
+    ImportBrowserData {
+        workspace_id: u64,
+        bookmarks: Vec<ImportedBookmark>,
+        history: Vec<ImportedVisit>,
+        cancel: Arc<AtomicBool>,
+        reply: std::sync::mpsc::SyncSender<ImportReport>,
+    },
     FlushWal,
 }
 
@@ -151,6 +164,23 @@ impl StorageHandle {
             url,
             title,
             folder,
+        });
+    }
+
+    pub fn import_browser_data(
+        &self,
+        workspace_id: u64,
+        bookmarks: Vec<ImportedBookmark>,
+        history: Vec<ImportedVisit>,
+        cancel: Arc<AtomicBool>,
+        reply: std::sync::mpsc::SyncSender<ImportReport>,
+    ) {
+        self.send(DbCommand::ImportBrowserData {
+            workspace_id,
+            bookmarks,
+            history,
+            cancel,
+            reply,
         });
     }
 
@@ -863,10 +893,111 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
                 tracing::warn!("Failed to clear site permission: {}", e);
             }
         }
+        DbCommand::ImportBrowserData {
+            workspace_id,
+            bookmarks,
+            history,
+            cancel,
+            reply,
+        } => apply_browser_import(conn, workspace_id, bookmarks, history, cancel, reply),
         DbCommand::FlushWal => {
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         }
     }
+}
+
+/// Apply all imported rows atomically. The caller performs this on the SQLite
+/// worker thread and waits on `reply` from a separate import thread.
+fn apply_browser_import(
+    conn: &mut Connection,
+    workspace_id: u64,
+    bookmarks: Vec<ImportedBookmark>,
+    history: Vec<ImportedVisit>,
+    cancel: Arc<AtomicBool>,
+    reply: std::sync::mpsc::SyncSender<ImportReport>,
+) {
+    let mut report = ImportReport {
+        bookmarks_found: bookmarks.len(),
+        history_found: history.len(),
+        ..ImportReport::default()
+    };
+    let mut canceled = false;
+
+    let result = (|| -> Result<(), String> {
+        if cancel.load(Ordering::Relaxed) {
+            canceled = true;
+            return Ok(());
+        }
+
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("Could not begin import transaction: {error}"))?;
+
+        for bookmark in &bookmarks {
+            if cancel.load(Ordering::Relaxed) {
+                canceled = true;
+                return Ok(());
+            }
+            let changed = tx
+                .execute(
+                    "INSERT INTO bookmarks (workspace_id, url, title, folder, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(workspace_id, url) DO UPDATE SET
+                         title = CASE WHEN excluded.title != '' THEN excluded.title ELSE bookmarks.title END,
+                         folder = excluded.folder",
+                    params![
+                        workspace_id as i64,
+                        bookmark.url,
+                        bookmark.title,
+                        bookmark.folder,
+                        now_epoch_secs() as i64,
+                    ],
+                )
+                .map_err(|error| format!("Could not import a bookmark: {error}"))?;
+            report.bookmarks_added += changed;
+        }
+
+        for visit in &history {
+            if cancel.load(Ordering::Relaxed) {
+                canceled = true;
+                return Ok(());
+            }
+            let changed = tx
+                .execute(
+                    "INSERT INTO history (url, title, visit_count, last_visited)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(url) DO UPDATE SET
+                         visit_count = history.visit_count + excluded.visit_count,
+                         last_visited = MAX(history.last_visited, excluded.last_visited),
+                         title = CASE WHEN excluded.title != '' THEN excluded.title ELSE history.title END",
+                    params![
+                        visit.url,
+                        visit.title,
+                        visit.visit_count as i64,
+                        visit.last_visited,
+                    ],
+                )
+                .map_err(|error| format!("Could not import a history entry: {error}"))?;
+            report.history_added += changed;
+        }
+
+        if cancel.load(Ordering::Relaxed) {
+            canceled = true;
+            return Ok(());
+        }
+        tx.commit()
+            .map_err(|error| format!("Could not commit import transaction: {error}"))?;
+        Ok(())
+    })();
+
+    if canceled {
+        report = ImportReport::canceled();
+        report.bookmarks_found = bookmarks.len();
+        report.history_found = history.len();
+    } else if let Err(error) = result {
+        report.errors.push(error);
+    }
+    let _ = reply.send(report);
 }
 
 fn run_worker_loop(db_path: PathBuf, mut rx: UnboundedReceiver<DbCommand>) {
@@ -893,8 +1024,11 @@ mod tests {
     use super::{apply_command, DbCommand, SessionTabSnapshot, SitePermission, StorageManager};
     use crate::config::{BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon};
     use crate::events::{DownloadEngine, DownloadInfo, DownloadState};
+    use crate::storage::import::{ImportedBookmark, ImportedVisit};
     use rusqlite::params;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_db_path(label: &str) -> PathBuf {
@@ -1357,6 +1491,115 @@ mod tests {
         assert_eq!(folder, "Reading");
 
         apply_command(&mut conn, DbCommand::FlushWal);
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn browser_import_applies_bookmarks_and_history_in_one_batch() {
+        let (path, mut conn) = fresh_db("browser-import");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+
+        apply_command(
+            &mut conn,
+            DbCommand::ImportBrowserData {
+                workspace_id: 7,
+                bookmarks: vec![
+                    ImportedBookmark {
+                        url: "https://example.com/".to_string(),
+                        title: "Example".to_string(),
+                        folder: "Imported Browser / Bookmarks bar".to_string(),
+                    },
+                    ImportedBookmark {
+                        url: "https://example.com/".to_string(),
+                        title: "Duplicate".to_string(),
+                        folder: "Imported Browser / Other".to_string(),
+                    },
+                ],
+                history: vec![ImportedVisit {
+                    url: "https://example.com/".to_string(),
+                    title: "Example".to_string(),
+                    visit_count: 4,
+                    last_visited: 1_700_000_000,
+                }],
+                cancel: Arc::new(AtomicBool::new(false)),
+                reply: tx,
+            },
+        );
+
+        let report = rx.try_recv().expect("import report");
+        assert!(report.success());
+        assert_eq!(report.bookmarks_found, 2);
+        assert_eq!(report.bookmarks_added, 2);
+        assert_eq!(report.history_added, 1);
+
+        let bookmark_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bookmarks", [], |row| row.get(0))
+            .expect("bookmark count");
+        assert_eq!(bookmark_count, 1);
+
+        let (workspace_id, folder): (i64, String) = conn
+            .query_row(
+                "SELECT workspace_id, folder FROM bookmarks WHERE url = ?1",
+                params!["https://example.com/"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("bookmark row");
+        assert_eq!(workspace_id, 7);
+        assert_eq!(folder, "Imported Browser / Other");
+
+        let (visits, last_visited): (i64, i64) = conn
+            .query_row(
+                "SELECT visit_count, last_visited FROM history WHERE url = ?1",
+                params!["https://example.com/"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("history row");
+        assert_eq!(visits, 4);
+        assert_eq!(last_visited, 1_700_000_000);
+
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn browser_import_cancel_rolls_back_the_batch() {
+        let (path, mut conn) = fresh_db("browser-import-cancel");
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        apply_command(
+            &mut conn,
+            DbCommand::ImportBrowserData {
+                workspace_id: 7,
+                bookmarks: vec![ImportedBookmark {
+                    url: "https://cancel.example".to_string(),
+                    title: "Canceled".to_string(),
+                    folder: "Imported Browser".to_string(),
+                }],
+                history: vec![ImportedVisit {
+                    url: "https://cancel.example".to_string(),
+                    title: "Canceled".to_string(),
+                    visit_count: 1,
+                    last_visited: 1_700_000_000,
+                }],
+                cancel,
+                reply: tx,
+            },
+        );
+
+        let report = rx.try_recv().expect("canceled import report");
+        assert!(report.canceled);
+        assert!(!report.success());
+        let bookmark_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bookmarks", [], |row| row.get(0))
+            .expect("bookmark count");
+        let history_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .expect("history count");
+        assert_eq!(bookmark_count, 0);
+        assert_eq!(history_count, 0);
+
         drop(conn);
         remove_test_db(&path);
     }
