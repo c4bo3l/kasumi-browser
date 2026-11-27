@@ -745,6 +745,10 @@ pub enum BrowserShortcut {
     NewPrivateWindow,
     CloseTab,
     ReopenClosedTab,
+    /// Reload the active tab. `ignore_cache` performs a hard reload.
+    ReloadPage {
+        ignore_cache: bool,
+    },
     OpenCommandPalette,
     OpenDevTools,
     FindInPage,

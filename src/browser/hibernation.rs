@@ -4086,6 +4086,12 @@ impl TabManager {
                 BrowserShortcut::ReopenClosedTab => {
                     self.reopen_closed_tab();
                 }
+                BrowserShortcut::ReloadPage { ignore_cache } => {
+                    self.handle_ui_action(UiAction::Reload {
+                        tab_id,
+                        ignore_cache,
+                    });
+                }
                 BrowserShortcut::OpenCommandPalette => {
                     self.command_palette_requested = true;
                 }

@@ -439,6 +439,9 @@ mod native_shortcuts {
             'w' if !shift => Some(BrowserShortcut::CloseTab),
             'f' if !shift => Some(BrowserShortcut::FindInPage),
             'p' if !shift => Some(BrowserShortcut::Print),
+            'r' => Some(BrowserShortcut::ReloadPage {
+                ignore_cache: shift,
+            }),
             'l' | 'k' if !shift => Some(BrowserShortcut::OpenCommandPalette),
             'j' if !shift => Some(BrowserShortcut::OpenDownloads),
             'y' if !shift => Some(BrowserShortcut::OpenHistory),
@@ -1465,6 +1468,16 @@ impl KasumiBrowserHandler {
             BrowserShortcut::FindInPage => {
                 self.chrome_state.open_find_bar();
             }
+            BrowserShortcut::ReloadPage { ignore_cache } => {
+                if let Some(tm) = self.tab_manager.as_mut() {
+                    if let Some(id) = tm.active_tab_id {
+                        tm.handle_ui_action(UiAction::Reload {
+                            tab_id: id,
+                            ignore_cache,
+                        });
+                    }
+                }
+            }
             BrowserShortcut::Print => {
                 if let Some(tm) = self.tab_manager.as_mut() {
                     if let Some(id) = tm.active_tab_id {
@@ -1789,6 +1802,28 @@ fn is_print_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
         && !modifiers.alt_key()
         && !modifiers.shift_key()
         && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("p"))
+}
+
+/// Resolve a reload shortcut to its `ignore_cache` flag. `F5` is a Windows and
+/// Linux convention; macOS keeps its brightness keys untouched and uses
+/// `Cmd+R`. Shift or the primary modifier promotes either form to a hard
+/// reload.
+fn reload_shortcut(modifiers: ModifiersState, key: &Key) -> Option<bool> {
+    if modifiers.alt_key() {
+        return None;
+    }
+    let primary = is_primary_shortcut_modifier(modifiers);
+    let shift = modifiers.shift_key();
+
+    #[cfg(not(target_os = "macos"))]
+    if matches!(key, Key::Named(NamedKey::F5)) {
+        return Some(primary || shift);
+    }
+
+    match key {
+        Key::Character(c) if primary && c.eq_ignore_ascii_case("r") => Some(shift),
+        _ => None,
+    }
 }
 
 /// Cmd/Ctrl+Q quits through the same deferred shutdown path as the window's
@@ -2312,6 +2347,8 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                     self.handle_browser_shortcut(BrowserShortcut::NewPrivateWindow);
                 } else if is_print_shortcut(self.modifiers, logical_key) {
                     self.handle_browser_shortcut(BrowserShortcut::Print);
+                } else if let Some(ignore_cache) = reload_shortcut(self.modifiers, logical_key) {
+                    self.handle_browser_shortcut(BrowserShortcut::ReloadPage { ignore_cache });
                 } else if alt {
                     if let Key::Character(c) = logical_key {
                         if c.eq_ignore_ascii_case("h") {
@@ -2851,11 +2888,14 @@ mod tests {
         effective_scale_factor, is_copy_url_shortcut, is_history_shortcut,
         is_new_private_window_shortcut, is_primary_shortcut_modifier, is_print_shortcut,
         is_quit_shortcut, is_reopen_tab_shortcut, overlay_screen_position, pointer_is_past_rail,
-        web_notification_physical_size, BrowserShortcut,
+        reload_shortcut, web_notification_physical_size, BrowserShortcut,
     };
     use crate::config::rail_width;
     use winit::dpi::{PhysicalPosition, PhysicalSize};
     use winit::keyboard::{Key, ModifiersState};
+
+    #[cfg(not(target_os = "macos"))]
+    use winit::keyboard::NamedKey;
 
     #[cfg(target_os = "macos")]
     use {
@@ -2998,6 +3038,48 @@ mod tests {
     }
 
     #[test]
+    fn reload_shortcut_maps_normal_and_hard_reloads() {
+        let r: Key = Key::Character("r".into());
+        let upper_r: Key = Key::Character("R".into());
+
+        assert_eq!(reload_shortcut(ModifiersState::CONTROL, &r), Some(false));
+        assert_eq!(
+            reload_shortcut(ModifiersState::SUPER, &upper_r),
+            Some(false)
+        );
+        assert_eq!(
+            reload_shortcut(ModifiersState::CONTROL | ModifiersState::SHIFT, &r),
+            Some(true)
+        );
+        assert_eq!(
+            reload_shortcut(ModifiersState::SUPER | ModifiersState::SHIFT, &upper_r),
+            Some(true)
+        );
+        assert_eq!(reload_shortcut(ModifiersState::empty(), &r), None);
+        assert_eq!(reload_shortcut(ModifiersState::SHIFT, &r), None);
+        assert_eq!(
+            reload_shortcut(ModifiersState::SUPER | ModifiersState::ALT, &r),
+            None
+        );
+        assert_eq!(
+            reload_shortcut(ModifiersState::CONTROL, &Key::Character("f".into())),
+            None
+        );
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let f5: Key = Key::Named(NamedKey::F5);
+            assert_eq!(reload_shortcut(ModifiersState::empty(), &f5), Some(false));
+            assert_eq!(reload_shortcut(ModifiersState::CONTROL, &f5), Some(true));
+            assert_eq!(reload_shortcut(ModifiersState::SHIFT, &f5), Some(true));
+            assert_eq!(
+                reload_shortcut(ModifiersState::CONTROL | ModifiersState::ALT, &f5),
+                None
+            );
+        }
+    }
+
+    #[test]
     fn quit_shortcut_requires_primary_modifier_without_other_modifiers() {
         let q: Key = Key::Character("q".into());
         let upper_q: Key = Key::Character("Q".into());
@@ -3108,6 +3190,16 @@ mod tests {
             Some(BrowserShortcut::Print)
         );
         assert_eq!(shortcut_from_parts('p', 0x13, cmd | shift), None);
+        assert_eq!(
+            shortcut_from_parts('r', 0x0F, cmd),
+            Some(BrowserShortcut::ReloadPage {
+                ignore_cache: false
+            })
+        );
+        assert_eq!(
+            shortcut_from_parts('r', 0x0F, cmd | shift),
+            Some(BrowserShortcut::ReloadPage { ignore_cache: true })
+        );
         assert_eq!(
             shortcut_from_parts('j', 0x26, cmd),
             Some(BrowserShortcut::OpenDownloads)

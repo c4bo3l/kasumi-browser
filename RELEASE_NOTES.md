@@ -4,7 +4,26 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
-## v0.17.0 — Unreleased
+## v0.18.0 — Unreleased
+
+### Added
+
+- `F5` (Windows/Linux) and `Cmd/Ctrl+R` reload the active tab. `Ctrl/Shift+F5` and `Cmd/Ctrl+Shift+R` perform a hard reload that bypasses the cache. Shortcuts are captured consistently from the native macOS event monitor, the winit window, and CEF's pre-key event path, including the UTF-16 character fallback used by native child views. macOS leaves `F5` to the system brightness keys.
+
+### Changed
+
+- Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.17.0` to `0.18.0`.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bins` — 264 browser tests plus 4 bundle tests
+- `cargo build --release`
+
+---
+
+## v0.17.0 — 2026-11-27
 
 ### Added
 
