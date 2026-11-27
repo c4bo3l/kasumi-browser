@@ -4,7 +4,7 @@ A low-memory, daily-driver desktop browser written in Rust and powered by CEF (`
 
 Repository: [github.com/c4bo3l/kasumi-browser](https://github.com/c4bo3l/kasumi-browser) · [Release notes](RELEASE_NOTES.md) · [PR checks](https://github.com/c4bo3l/kasumi-browser/actions/workflows/pr.yml)
 
-Current version: **0.15.0**. Version bumps land in release PRs and become official at merge, as required by [AGENTS.md](AGENTS.md).
+Current version: **0.16.0**. Version bumps land in release PRs and become official at merge, as required by [AGENTS.md](AGENTS.md).
 
 ---
 
@@ -27,7 +27,7 @@ Current version: **0.15.0**. Version bumps land in release PRs and become offici
 - **Tab context menu:** new tab, duplicate, copy URL, reload, close, close other tabs, close tabs below, reopen closed tab, move to workspace, and DevTools, with keyboard navigation and click-outside dismissal.
 - **Navigation:** back/forward, reload/stop, an omnibox that follows the committed URL, URL or search resolution through DuckDuckGo/Google/Bing, `view-source:` tab reuse, and copy URL with a native confirmation.
 - **Collapsible vertical workspace rail:** tab list, pinned section, Command button, New tab, Hibernate All, shield badge, RAM readout, address field, and workspace switcher in both expanded and icon-only modes.
-- **Native overlays:** the command palette, Settings, tab menus, tooltips, find bar, and notification cards render above the CEF child view in transparent native windows. Toast notifications are click-through and do not steal page input.
+- **Native overlays:** the command palette, Settings, bookmark and history managers, tab menus, tooltips, find bar, and notification cards render above the CEF child view in transparent native windows. Toast notifications are click-through and do not steal page input.
 - **Theme-aware UI:** native chrome follows the OS light/dark appearance live, with explicit Light/Dark overrides. Accent colour is applied only to browser chrome, never to page content.
 - **Bottom page HUDs:** Command/DevTools controls and live blocked-request/RAM status stay visible while browsing.
 - **Native DevTools window:** `F12`, the rail, the tab menu, and the command palette open or bring forward Chromium DevTools.
@@ -45,8 +45,9 @@ Current version: **0.15.0**. Version bumps land in release PRs and become offici
 ### Workspaces, commands, and settings
 
 - **Workspaces:** each workspace owns its pinned and regular tabs, selected tab, and default flag. Switch from the rail, choose a default startup space, and create, rename, or delete spaces. Deleting a workspace moves its tabs and archives its bookmark folder.
-- **Command palette:** `Cmd/Ctrl+K` searches tabs and bookmarks and resolves addresses or searches; `Cmd/Ctrl+L` opens it seeded with the active URL. It offers explicit open/search in this tab or a new tab, native actions, workspace labels, keyboard selection, immediate focus, and click-outside dismissal.
+- **Command palette:** `Cmd/Ctrl+K` searches tabs, bookmarks, and native actions and resolves addresses or searches; `Cmd/Ctrl+L` opens it seeded with the active URL. It offers explicit open/search in this tab or a new tab, workspace labels, Material Symbols icons, keyboard selection, immediate focus, and click-outside dismissal.
 - **Native Settings:** General, Workspaces, Import, and Bookmarks pages with persisted preferences for theme, rail state, search provider, ad-block state, hibernation timeout, startup space, and download folder.
+- **macOS app menu:** New Tab, New Incognito Window, Close Tab, Downloads, Bookmarks, History, Print, Settings, and Quit. Bookmarks and History mirror their native keyboard shortcuts.
 
 ### Privacy, performance, and web platform
 
@@ -60,7 +61,8 @@ Current version: **0.15.0**. Version bumps land in release PRs and become offici
 ### Storage, downloads, and bookmarks
 
 - **Crash-safe SQLite WAL storage:** history, bookmarks, downloads, pinned tabs, workspaces, preferences, site permissions, and session snapshots, flushed cleanly on shutdown.
-- **Browser data import:** detect local Chrome/Chromium, Edge, Firefox, and Safari profiles, then import bookmarks and history with normalized URLs, preserved titles/folders/visit counts, deduplication, progress, and cooperative cancel. Passwords are never imported. Discovery and parsing run off the UI and CEF threads.
+- **Browser data import:** detect local Chrome/Chromium, Edge, Firefox, and Safari profiles, then import bookmarks and history with normalized URLs, preserved titles/folders/visit counts, deduplication, progress, and cooperative cancel. Passwords are never imported. Discovery and parsing run off the UI and CEF threads; imported rows refresh the native managers immediately after commit.
+- **Native history manager:** `Cmd/Ctrl+Y` opens a searchable list of visited pages with titles, URLs, visit counts, relative timestamps, reopen and delete controls, and a two-click guard around Clear all history. The bounded snapshot loads on the SQLite worker and renders in pages so large histories do not slow the UI.
 - **Native download manager:** WAL-backed history plus active progress, speed, ETA, path, connection count, pause/resume/cancel, retry, remove-info, clear-finished, open-file, and show-in-folder controls. The rail button shows an active count badge.
 - **Segmented downloads:** HTTP(S) transfers use up to eight balanced `Range` requests through CEF into a `.kasumi.part` file, with resumable byte ranges and generation guards so late callbacks cannot corrupt a file. Non-range transfers fall back to a single native request.
 - **Download notifications:** transparent native toasts announce completed or failed transfers without blocking page input.
@@ -84,6 +86,7 @@ Current version: **0.15.0**. Version bumps land in release PRs and become offici
 | `Ctrl/Cmd + P` | Print active page |
 | `Ctrl/Cmd + ,` | Settings |
 | `Ctrl/Cmd + J` | Downloads |
+| `Ctrl/Cmd + Y` | History manager |
 | `Ctrl/Cmd + Shift + T` / `Z` | Reopen closed tab / undo close |
 | `Ctrl/Cmd + Shift + N` | Incognito space or new private tab |
 | `Ctrl/Cmd + Shift + C` | Copy active page URL |
@@ -226,7 +229,7 @@ CI runs the same checks on macOS 15 Intel, Windows, and Linux.
 
 ## Known issues
 
-Windows and Linux native child-view, tooltip, download, bookmark, media-permission, website-notification, find-in-page, printing, and browser-import flows still need hands-on verification. Linux printing also needs a desktop check with real CUPS destinations; it is implemented with a CEF `PrintHandler`, Kasumi's native print panel, and `lp`/`lpstat` spooling. Browser import needs confirmation against real Chrome, Edge, Firefox, and Safari profiles; Safari history is intentionally unsupported.
+Windows and Linux native child-view, tooltip, download, bookmark, history-manager, media-permission, website-notification, find-in-page, printing, and browser-import flows still need hands-on verification. Linux printing also needs a desktop check with real CUPS destinations; it is implemented with a CEF `PrintHandler`, Kasumi's native print panel, and `lp`/`lpstat` spooling. Browser import needs confirmation against real Chrome, Edge, Firefox, and Safari profiles; Safari history is intentionally unsupported.
 
 ## Roadmap
 

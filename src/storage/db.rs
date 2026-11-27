@@ -44,7 +44,7 @@ pub struct BookmarkItem {
     pub folder: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryItem {
     pub url: String,
     pub title: String,
@@ -97,6 +97,19 @@ pub enum DbCommand {
         from: String,
         to: String,
     },
+    /// Read the current bookmark list on the SQLite worker and return it to a
+    /// background waiter. Never block the winit or CEF threads on this reply.
+    LoadBookmarks {
+        reply: std::sync::mpsc::SyncSender<Vec<BookmarkItem>>,
+    },
+    /// Read a bounded recent history snapshot on the SQLite worker.
+    LoadHistory {
+        reply: std::sync::mpsc::SyncSender<Vec<HistoryItem>>,
+    },
+    DeleteHistory {
+        url: String,
+    },
+    ClearHistory,
     SavePreferences {
         preferences: BrowserPreferences,
     },
@@ -213,6 +226,25 @@ impl StorageHandle {
             from,
             to,
         });
+    }
+
+    /// Queue a bookmark refresh. The caller waits on `reply` from a background
+    /// thread, so the SQLite worker can answer without stalling chrome or CEF.
+    pub fn request_bookmarks(&self, reply: std::sync::mpsc::SyncSender<Vec<BookmarkItem>>) {
+        self.send(DbCommand::LoadBookmarks { reply });
+    }
+
+    /// Queue a bounded history refresh. The caller waits off-thread.
+    pub fn request_history(&self, reply: std::sync::mpsc::SyncSender<Vec<HistoryItem>>) {
+        self.send(DbCommand::LoadHistory { reply });
+    }
+
+    pub fn delete_history(&self, url: String) {
+        self.send(DbCommand::DeleteHistory { url });
+    }
+
+    pub fn clear_history(&self) {
+        self.send(DbCommand::ClearHistory);
     }
 
     pub fn save_preferences(&self, preferences: BrowserPreferences) {
@@ -459,6 +491,12 @@ impl StorageManager {
     /// Load bookmarks across every workspace folder.
     pub fn load_bookmarks(db_path: &Path) -> Result<Vec<BookmarkItem>, rusqlite::Error> {
         let conn = Self::init_db(db_path)?;
+        Self::load_bookmarks_from(&conn)
+    }
+
+    /// Query bookmarks from an already-open connection. The SQLite worker uses
+    /// this to refresh the UI after a bulk import commits.
+    fn load_bookmarks_from(conn: &Connection) -> Result<Vec<BookmarkItem>, rusqlite::Error> {
         let mut stmt = conn.prepare(
             "SELECT id, workspace_id, url, title, folder
              FROM bookmarks ORDER BY folder ASC, id ASC",
@@ -480,6 +518,33 @@ impl StorageManager {
             }
         }
         Ok(bookmarks)
+    }
+
+    fn load_history_from(
+        conn: &Connection,
+        limit: usize,
+    ) -> Result<Vec<HistoryItem>, rusqlite::Error> {
+        // Keep the ordering identical to `idx_history_last_visited` so SQLite
+        // can stream the newest rows without building a temporary sort table.
+        let mut stmt = conn.prepare(
+            "SELECT url, title, visit_count, last_visited FROM history
+             ORDER BY last_visited DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok(HistoryItem {
+                url: row.get(0)?,
+                title: row.get(1)?,
+                visit_count: row.get::<_, i64>(2)? as u32,
+                last_visited: row.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        let mut history = Vec::new();
+        for row in rows {
+            if let Ok(item) = row {
+                history.push(item);
+            }
+        }
+        Ok(history)
     }
 
     /// Load persisted downloads, newest first, for the native downloads bubble.
@@ -635,7 +700,7 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
     Ok(false)
 }
 
-fn now_epoch_secs() -> u64 {
+pub(crate) fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -785,6 +850,36 @@ fn apply_command(conn: &mut Connection, cmd: DbCommand) {
             );
             if let Err(e) = res {
                 tracing::warn!("Failed to rename bookmark folder: {}", e);
+            }
+        }
+        DbCommand::LoadBookmarks { reply } => match StorageManager::load_bookmarks_from(conn) {
+            Ok(bookmarks) => {
+                let _ = reply.send(bookmarks);
+            }
+            Err(error) => {
+                tracing::warn!("Failed to reload bookmarks: {error}");
+                let _ = reply.send(Vec::new());
+            }
+        },
+        DbCommand::LoadHistory { reply } => {
+            match StorageManager::load_history_from(conn, crate::config::HISTORY_LOAD_LIMIT) {
+                Ok(history) => {
+                    let _ = reply.send(history);
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to reload history: {error}");
+                    let _ = reply.send(Vec::new());
+                }
+            }
+        }
+        DbCommand::DeleteHistory { url } => {
+            if let Err(error) = conn.execute("DELETE FROM history WHERE url = ?1", params![url]) {
+                tracing::warn!("Failed to delete history entry: {error}");
+            }
+        }
+        DbCommand::ClearHistory => {
+            if let Err(error) = conn.execute("DELETE FROM history", []) {
+                tracing::warn!("Failed to clear history: {error}");
             }
         }
         DbCommand::SavePreferences { preferences } => {
@@ -1028,6 +1123,7 @@ mod tests {
     use rusqlite::params;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::sync_channel;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1837,6 +1933,74 @@ mod tests {
         let loaded = StorageManager::load_site_permissions(&path).expect("load permissions");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].permission, "microphone");
+
+        apply_command(&mut conn, DbCommand::FlushWal);
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn load_bookmarks_command_returns_fresh_rows() {
+        let (path, mut conn) = fresh_db("bookmark-reload");
+        apply_command(
+            &mut conn,
+            DbCommand::AddBookmark {
+                workspace_id: 1,
+                url: "https://fresh.example".to_string(),
+                title: "Fresh".to_string(),
+                folder: "Personal".to_string(),
+            },
+        );
+
+        let (reply_tx, reply_rx) = sync_channel(1);
+        apply_command(&mut conn, DbCommand::LoadBookmarks { reply: reply_tx });
+        let bookmarks = reply_rx.try_recv().expect("bookmark reload reply");
+        assert_eq!(bookmarks.len(), 1);
+        assert_eq!(bookmarks[0].url, "https://fresh.example");
+
+        drop(conn);
+        remove_test_db(&path);
+    }
+
+    #[test]
+    fn history_commands_load_delete_and_clear_entries() {
+        let (path, mut conn) = fresh_db("history-manager");
+        for (url, title, visits, visited) in [
+            ("https://old.example", "Old", 1_i64, 100_i64),
+            ("https://new.example", "New", 3_i64, 200_i64),
+        ] {
+            conn.execute(
+                "INSERT INTO history (url, title, visit_count, last_visited)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![url, title, visits, visited],
+            )
+            .expect("insert history fixture");
+        }
+
+        let (reply_tx, reply_rx) = sync_channel(1);
+        apply_command(&mut conn, DbCommand::LoadHistory { reply: reply_tx });
+        let items = reply_rx.try_recv().expect("history load reply");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].url, "https://new.example");
+        assert_eq!(items[0].visit_count, 3);
+
+        apply_command(
+            &mut conn,
+            DbCommand::DeleteHistory {
+                url: "https://old.example".to_string(),
+            },
+        );
+        let (reply_tx, reply_rx) = sync_channel(1);
+        apply_command(&mut conn, DbCommand::LoadHistory { reply: reply_tx });
+        let items = reply_rx.try_recv().expect("history load reply");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].url, "https://new.example");
+
+        apply_command(&mut conn, DbCommand::ClearHistory);
+        let (reply_tx, reply_rx) = sync_channel(1);
+        apply_command(&mut conn, DbCommand::LoadHistory { reply: reply_tx });
+        let items = reply_rx.try_recv().expect("history load reply");
+        assert!(items.is_empty());
 
         apply_command(&mut conn, DbCommand::FlushWal);
         drop(conn);

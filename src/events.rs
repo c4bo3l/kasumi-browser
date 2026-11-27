@@ -679,6 +679,14 @@ pub enum BrowserEvent {
     BrowserImportFinished {
         report: ImportReport,
     },
+    /// Fresh bookmark snapshot read on the SQLite worker after a bulk import.
+    BookmarksReloaded {
+        bookmarks: Vec<crate::storage::db::BookmarkItem>,
+    },
+    /// Fresh bounded history snapshot read on the SQLite worker.
+    HistoryLoaded {
+        items: Vec<crate::storage::db::HistoryItem>,
+    },
 }
 
 /// Options for a find request shared by the native CEF path and the rich
@@ -739,6 +747,7 @@ pub enum BrowserShortcut {
     OpenSettings,
     OpenDownloads,
     OpenBookmarkManager,
+    OpenHistory,
     /// Copy the active page URL to the system clipboard. The clipboard is owned
     /// by egui, so the shell defers the write to the next chrome frame.
     CopyUrl,
@@ -968,6 +977,14 @@ impl std::fmt::Debug for BrowserEvent {
                 .debug_struct("BrowserImportFinished")
                 .field("report", report)
                 .finish(),
+            Self::BookmarksReloaded { bookmarks } => f
+                .debug_struct("BookmarksReloaded")
+                .field("bookmarks", bookmarks)
+                .finish(),
+            Self::HistoryLoaded { items } => f
+                .debug_struct("HistoryLoaded")
+                .field("items", items)
+                .finish(),
             Self::ParallelDownload(event) => {
                 f.debug_tuple("ParallelDownload").field(event).finish()
             }
@@ -1091,6 +1108,18 @@ pub enum UiAction {
     },
     /// Open the native downloads bubble.
     OpenDownloads,
+    /// Open the standalone native history manager and refresh its snapshot.
+    OpenHistory,
+    /// Open a history entry in a new tab.
+    OpenHistoryUrl {
+        url: String,
+    },
+    /// Remove one visited URL from SQLite history.
+    DeleteHistory {
+        url: String,
+    },
+    /// Remove every visited URL from SQLite history.
+    ClearHistory,
     /// Pause an active download through its CEF item callback.
     PauseDownload {
         download_id: u32,
