@@ -9,10 +9,11 @@ use crate::browser::notifications::{
 };
 use crate::events::{
     BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadState,
-    MediaAccessPermissions, MediaPermissionCallback, WebNotification, DISPLAY_MEDIA_CONSOLE_PREFIX,
+    MediaAccessPermissions, MediaPermissionCallback, PrintOptions, WebNotification,
+    DISPLAY_MEDIA_CONSOLE_PREFIX,
 };
 use cef::*;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -1020,6 +1021,9 @@ wrap_client! {
         keyboard_handler: KeyboardHandler,
         context_menu_handler: ContextMenuHandler,
         permission_handler: PermissionHandler,
+        // Linux overrides CEF's missing platform dialog; macOS/Windows keep
+        // the default handler by leaving this `None`.
+        print_handler: Option<PrintHandler>,
     }
 
     impl Client {
@@ -1050,6 +1054,9 @@ wrap_client! {
         fn permission_handler(&self) -> Option<PermissionHandler> {
             Some(self.permission_handler.clone())
         }
+        fn print_handler(&self) -> Option<PrintHandler> {
+            self.print_handler.clone()
+        }
     }
 }
 
@@ -1059,6 +1066,7 @@ pub fn create_tab_client(
     adblock_engine: std::sync::Arc<adblock::Engine>,
     adblock_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     download_preferences: SharedDownloadPreferences,
+    print_options_receiver: Receiver<PrintOptions>,
 ) -> Client {
     let life_span_handler = TabLifeSpanHandler::new(tab_id, event_sender.clone());
     let load_handler = TabLoadHandler::new(tab_id, event_sender.clone());
@@ -1067,6 +1075,8 @@ pub fn create_tab_client(
     let keyboard_handler = TabKeyboardHandler::new(tab_id, event_sender.clone());
     let context_menu_handler = TabContextMenuHandler::new(tab_id, event_sender.clone());
     let permission_handler = TabPermissionHandler::new(tab_id, event_sender.clone());
+    let print_handler =
+        super::print::create_print_handler(tab_id, event_sender.clone(), print_options_receiver);
     let download_handler =
         TabDownloadHandler::new(tab_id, event_sender.clone(), download_preferences);
     let request_handler = super::adblocker::create_tab_request_handler(
@@ -1086,6 +1096,7 @@ pub fn create_tab_client(
         keyboard_handler.into(),
         context_menu_handler.into(),
         permission_handler.into(),
+        print_handler,
     )
 }
 

@@ -34,7 +34,7 @@ use crate::config::{
 };
 use crate::events::{
     DownloadEngine, DownloadInfo, DownloadNotification, DownloadNotificationKind, DownloadState,
-    FindOptions, FindSnippet, UiAction, WebNotification,
+    FindOptions, FindSnippet, PrintOptions, PrintPaperSize, UiAction, WebNotification,
 };
 
 /// Light or dark chrome appearance. The OS theme decides the default, and
@@ -495,6 +495,7 @@ const DOWNLOADS_BOTTOM_MARGIN: f32 = 18.0;
 const DOWNLOADS_RAIL_GAP: f32 = 12.0;
 const PERMISSION_PROMPT_WIDTH: f32 = 420.0;
 const PERMISSION_PROMPT_TOP_OFFSET: f32 = 72.0;
+const PRINT_DIALOG_WIDTH: f32 = 440.0;
 const DISPLAY_PICKER_WIDTH: f32 = 540.0;
 const DISPLAY_PICKER_TOP_OFFSET: f32 = 64.0;
 const DISPLAY_PICKER_MAX_HEIGHT: f32 = 560.0;
@@ -540,6 +541,7 @@ enum RailIcon {
     Sidebar,
     Settings,
     Download,
+    Print,
     Pause,
     Play,
     Retry,
@@ -764,6 +766,17 @@ pub struct DisplayMediaPicker {
     pub sources: Vec<DisplayMediaSource>,
 }
 
+/// Native Linux print panel mirrored from `TabManager`. It is painted in the
+/// transparent overlay so the page stays visible and no web view is used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrintDialogState {
+    pub tab_id: u64,
+    pub has_selection: bool,
+    pub options: PrintOptions,
+    pub printers: Vec<String>,
+    pub default_printer: String,
+}
+
 /// Commands offered by the rail tab context menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RailMenuAction {
@@ -876,6 +889,8 @@ pub struct ChromeState {
     pub permission_prompt: Option<PermissionPrompt>,
     /// Native display/window picker for a `getDisplayMedia` request.
     pub display_media_picker: Option<DisplayMediaPicker>,
+    /// Linux print panel waiting for a user decision.
+    pub print_dialog: Option<PrintDialogState>,
     /// Highlighted row in the display picker.
     pub display_media_selection: usize,
     /// True when at least one closed tab can be restored with Cmd/Ctrl+Z.
@@ -982,6 +997,7 @@ impl Default for ChromeState {
             downloads_open: false,
             permission_prompt: None,
             display_media_picker: None,
+            print_dialog: None,
             display_media_selection: 0,
             can_reopen_tab: false,
             find_bar_open: false,
@@ -1205,6 +1221,7 @@ impl ChromeState {
     /// True when the shared overlay must capture pointer/keyboard input.
     pub fn has_modal_overlay(&self) -> bool {
         self.permission_prompt.is_some()
+            || self.print_dialog.is_some()
             || self.display_media_picker.is_some()
             || self.find_bar_open
             || self.command_palette_open
@@ -1412,6 +1429,17 @@ impl ChromeState {
             actions.push(UiAction::ResolveDisplayMediaPicker {
                 token: picker.token.clone(),
                 device_id: None,
+            });
+        }
+    }
+
+    /// Cancel the native print panel without sending a job to CUPS.
+    pub fn dismiss_print_dialog(&self, actions: &mut Vec<UiAction>) {
+        if let Some(dialog) = self.print_dialog.as_ref() {
+            actions.push(UiAction::RespondPrintDialog {
+                tab_id: dialog.tab_id,
+                accept: false,
+                options: dialog.options.clone(),
             });
         }
     }
@@ -3135,6 +3163,186 @@ impl ChromeRenderer {
             )
         }) {
             state.dismiss_display_media_picker(actions);
+        }
+    }
+
+    /// Draw Kasumi's native Linux print panel above the page. CEF has no
+    /// platform print dialog on Linux, so this collects plain settings that
+    /// `TabManager` applies to CEF and then spools through CUPS.
+    pub fn build_print_dialog(
+        ctx: &egui::Context,
+        state: &mut ChromeState,
+        actions: &mut Vec<UiAction>,
+    ) {
+        let Some(dialog) = state.print_dialog.clone() else {
+            return;
+        };
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            state.dismiss_print_dialog(actions);
+            return;
+        }
+
+        let tab_id = dialog.tab_id;
+        let has_selection = dialog.has_selection;
+        let printers = dialog.printers.clone();
+        let default_printer = dialog.default_printer.clone();
+        let mut options = dialog.options.sanitized();
+
+        let palette = state.palette();
+        let screen = ctx.viewport_rect();
+        let width = PRINT_DIALOG_WIDTH.min((screen.width() - 24.0).max(280.0));
+        let x = (screen.width() - width) / 2.0;
+        let y = PERMISSION_PROMPT_TOP_OFFSET.min((screen.height() - 320.0).max(4.0));
+
+        egui::Area::new(egui::Id::new("print_dialog_scrim"))
+            .order(Order::Foreground)
+            .fixed_pos(screen.min)
+            .movable(false)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::hover());
+                ui.painter()
+                    .rect_filled(rect, CornerRadius::ZERO, palette.scrim);
+            });
+
+        let mut card_rect = egui::Rect::from_min_size(pos2(x, y), vec2(width, 0.0));
+        let mut print_clicked = false;
+        egui::Area::new(egui::Id::new("print_dialog"))
+            .order(Order::Foreground)
+            .fixed_pos(pos2(x, y))
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                card_rect = Frame::NONE
+                    .fill(palette.palette_bg)
+                    .stroke(Stroke::new(1.0_f32, palette.palette_border))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(16, 14))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(rail_icon_glyph(RailIcon::Print))
+                                    .font(FontId::new(16.0, FontFamily::Monospace)),
+                            );
+                            ui.label(RichText::new("Print").size(14.0).color(palette.text_strong));
+                        });
+                        ui.label(
+                            RichText::new("Render this page with CEF and send the PDF to CUPS.")
+                                .size(10.0)
+                                .color(palette.palette_subtext),
+                        );
+                        ui.add_space(10.0);
+                        ui.separator();
+
+                        let printer_label = if options.printer.is_empty() {
+                            if default_printer.is_empty() {
+                                "Default printer".to_string()
+                            } else {
+                                format!("Default ({default_printer})")
+                            }
+                        } else {
+                            options.printer.clone()
+                        };
+                        egui::ComboBox::from_label("Printer")
+                            .selected_text(printer_label)
+                            .width(width - 120.0)
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut options.printer,
+                                    String::new(),
+                                    "Default printer",
+                                );
+                                for printer in &printers {
+                                    ui.selectable_value(
+                                        &mut options.printer,
+                                        printer.clone(),
+                                        printer,
+                                    );
+                                }
+                            });
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let mut paper = options.paper;
+                            let paper_label = match paper {
+                                PrintPaperSize::Letter => "Letter",
+                                PrintPaperSize::A4 => "A4",
+                            };
+                            egui::ComboBox::from_label("Paper")
+                                .selected_text(paper_label)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut paper,
+                                        PrintPaperSize::Letter,
+                                        "Letter",
+                                    );
+                                    ui.selectable_value(&mut paper, PrintPaperSize::A4, "A4");
+                                });
+                            options.paper = paper;
+
+                            ui.add_space(12.0);
+                            ui.label("Copies");
+                            ui.add(egui::DragValue::new(&mut options.copies).range(1..=999));
+                        });
+                        ui.add_space(8.0);
+                        ui.checkbox(&mut options.landscape, "Landscape");
+                        ui.checkbox(&mut options.color, "Print in color");
+                        if has_selection {
+                            ui.checkbox(&mut options.selection_only, "Print selection only");
+                        }
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    print_clicked = material_button(
+                                        ui,
+                                        RailIcon::Print,
+                                        "Print",
+                                        MaterialButtonStyle::Filled,
+                                        &palette,
+                                        true,
+                                    )
+                                    .clicked();
+                                    let cancel_clicked = material_button(
+                                        ui,
+                                        RailIcon::Close,
+                                        "Cancel",
+                                        MaterialButtonStyle::Tonal,
+                                        &palette,
+                                        true,
+                                    )
+                                    .clicked();
+                                    if cancel_clicked {
+                                        state.dismiss_print_dialog(actions);
+                                    }
+                                },
+                            );
+                        });
+                    })
+                    .response
+                    .rect
+                    .expand(8.0);
+            });
+
+        if let Some(active) = state.print_dialog.as_mut() {
+            active.options = options.clone();
+        }
+        if print_clicked || ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            actions.push(UiAction::RespondPrintDialog {
+                tab_id,
+                accept: true,
+                options: options.sanitized(),
+            });
+        } else if ctx.input(|i| {
+            command_palette_click_outside(
+                card_rect,
+                i.pointer.latest_pos(),
+                i.pointer.primary_clicked(),
+            )
+        }) {
+            state.dismiss_print_dialog(actions);
         }
     }
 
@@ -5989,12 +6197,13 @@ impl ChromeOverlayRenderer {
         state.promote_pending_toast();
         // Only one surface may own the shared overlay. A native permission
         // prompt always wins because a WebRTC request must not be hidden behind
-        // Settings or the palette. Then come Settings, bookmark manager,
-        // context menu, command palette, and downloads bubble. A toast paints
-        // only when no modal surface is active.
+        // Settings or the palette. Linux's print panel and the display picker
+        // also own CEF callbacks, so they take priority over ordinary chrome.
         let permission_open = state.permission_prompt.is_some();
-        let display_picker_open = state.display_media_picker.is_some() && !permission_open;
-        let modal_open = permission_open || display_picker_open;
+        let print_open = state.print_dialog.is_some() && !permission_open;
+        let display_picker_open =
+            state.display_media_picker.is_some() && !permission_open && !print_open;
+        let modal_open = permission_open || print_open || display_picker_open;
         if modal_open {
             state.dismiss_find_for_overlay();
         }
@@ -6053,6 +6262,8 @@ impl ChromeOverlayRenderer {
             let ctx = ui.ctx().clone();
             if permission_open {
                 ChromeRenderer::build_permission_prompt(&ctx, state, &mut actions);
+            } else if print_open {
+                ChromeRenderer::build_print_dialog(&ctx, state, &mut actions);
             } else if display_picker_open {
                 ChromeRenderer::build_display_media_picker(&ctx, state, &mut actions);
             } else if settings_open {
@@ -6993,8 +7204,8 @@ fn rail_icon_glyph(icon: RailIcon) -> &'static str {
         ICON_CHEVRON_RIGHT, ICON_CLOSE, ICON_CODE, ICON_CONTENT_COPY, ICON_DELETE,
         ICON_DESKTOP_WINDOWS, ICON_DOWNLOAD, ICON_EDIT, ICON_FOLDER_OPEN, ICON_MEMORY,
         ICON_MUSIC_NOTE, ICON_NEW_WINDOW, ICON_NOTIFICATIONS, ICON_OPEN_IN_NEW, ICON_PALETTE,
-        ICON_PAUSE, ICON_PIN, ICON_PLAY_ARROW, ICON_PUBLIC, ICON_PUSH_PIN, ICON_REFRESH,
-        ICON_ROCKET, ICON_SCHOOL, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD, ICON_STAR,
+        ICON_PAUSE, ICON_PIN, ICON_PLAY_ARROW, ICON_PRINT, ICON_PUBLIC, ICON_PUSH_PIN,
+        ICON_REFRESH, ICON_ROCKET, ICON_SCHOOL, ICON_SEARCH, ICON_SETTINGS, ICON_SHIELD, ICON_STAR,
         ICON_VIEW_SIDEBAR, ICON_VISIBILITY_OFF, ICON_WORK,
     };
 
@@ -7018,6 +7229,7 @@ fn rail_icon_glyph(icon: RailIcon) -> &'static str {
         RailIcon::Sidebar => ICON_VIEW_SIDEBAR.into(),
         RailIcon::Settings => ICON_SETTINGS.into(),
         RailIcon::Download => ICON_DOWNLOAD.into(),
+        RailIcon::Print => ICON_PRINT.into(),
         RailIcon::Pause => ICON_PAUSE.into(),
         RailIcon::Play => ICON_PLAY_ARROW.into(),
         RailIcon::Retry => ICON_REFRESH.into(),
@@ -8183,9 +8395,10 @@ mod tests {
         resolve_omnibox_with_search, tab_close_center, tab_status_center, tooltip_size_for_text,
         truncate_title, workspace_form_actions, BookmarkInfo, ChromePalette, ChromeRenderer,
         ChromeState, ChromeTheme, CommandAction, DownloadBadge, DownloadSummary, PermissionPrompt,
-        PermissionPromptKind, RailMenuAction, SettingsTab, TabDisplayState, TabInfo, ToastKind,
-        WorkspaceInfo, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED, RAIL_STATUS_ICON_EXPANDED,
-        TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED, TOOLTIP_MAX_WIDTH,
+        PermissionPromptKind, PrintDialogState, RailMenuAction, SettingsTab, TabDisplayState,
+        TabInfo, ToastKind, WorkspaceInfo, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED,
+        RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED,
+        TOOLTIP_MAX_WIDTH,
     };
     use crate::config::{
         BrowserPreferences, SearchEngine, ThemePreference, Workspace, WorkspaceColor,
@@ -8194,7 +8407,7 @@ mod tests {
     };
     use crate::events::{
         DownloadEngine, DownloadInfo, DownloadNotification, DownloadNotificationKind,
-        DownloadState, UiAction, WebNotification,
+        DownloadState, PrintOptions, PrintPaperSize, UiAction, WebNotification,
     };
 
     fn tab(id: u64, title: &str, url: &str) -> TabInfo {
@@ -8254,6 +8467,40 @@ mod tests {
                 request_id: 42,
                 granted: false,
                 persist: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn print_dialog_is_modal_and_dismissal_cancels_the_job() {
+        let mut state = ChromeState::default();
+        let options = PrintOptions {
+            printer: "Office".to_string(),
+            paper: PrintPaperSize::A4,
+            copies: 2,
+            landscape: true,
+            color: false,
+            selection_only: false,
+        };
+        state.print_dialog = Some(PrintDialogState {
+            tab_id: 7,
+            has_selection: true,
+            options: options.clone(),
+            printers: vec!["Office".to_string()],
+            default_printer: "Office".to_string(),
+        });
+
+        assert!(state.has_modal_overlay());
+        assert!(!state.is_toast_only());
+
+        let mut actions = Vec::new();
+        state.dismiss_print_dialog(&mut actions);
+        assert_eq!(
+            actions,
+            vec![UiAction::RespondPrintDialog {
+                tab_id: 7,
+                accept: false,
+                options,
             }]
         );
     }
