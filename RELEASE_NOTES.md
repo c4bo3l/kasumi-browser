@@ -4,7 +4,28 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
-## v0.12.0 — Unreleased
+## v0.13.0 — Unreleased
+
+### Added
+
+- Native printing through CEF's platform print path. `Cmd/Ctrl+P` works from the main window, the macOS app menu, the native command palette, and the CEF web view while the page has keyboard focus.
+- A command-palette action for printing the active page, with the same shortcut label shown in the palette and app menu.
+
+### Changed
+
+- Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.12.0` to `0.13.0`.
+- Documented that Linux printing still requires a CEF `PrintHandler`; macOS and Windows use CEF's default platform dialog.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bins` — 231 browser tests plus 4 bundle tests
+- `cargo build --release`
+
+---
+
+## v0.12.0 — 2026-11-27
 
 ### Added
 
@@ -658,7 +679,7 @@ Initial public source release: [github.com/c4bo3l/kasumi-browser](https://github
 
 ## Future development
 
-- Native print support (`Cmd/Ctrl+P`)
+- Linux CEF `PrintHandler` for native print dialog and print-job spooling
 - Browser import
 - Full Windows and Linux validation
 - Automated cross-platform integration tests

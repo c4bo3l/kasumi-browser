@@ -594,6 +594,7 @@ const VK_J: i32 = 0x4A;
 const VK_K: i32 = 0x4B;
 const VK_L: i32 = 0x4C;
 const VK_N: i32 = 0x4E;
+const VK_P: i32 = 0x50;
 const VK_T: i32 = 0x54;
 const VK_W: i32 = 0x57;
 const VK_Z: i32 = 0x5A;
@@ -656,6 +657,7 @@ pub(crate) fn browser_shortcut(
         VK_T => Some(BrowserShortcut::NewTab),
         VK_W if !shift => Some(BrowserShortcut::CloseTab),
         VK_F if !shift => Some(BrowserShortcut::FindInPage),
+        VK_P if !shift => Some(BrowserShortcut::Print),
         VK_L | VK_K if !shift => Some(BrowserShortcut::OpenCommandPalette),
         VK_B if shift => Some(BrowserShortcut::OpenBookmarkManager),
         VK_C if shift => Some(BrowserShortcut::CopyUrl),
@@ -708,6 +710,7 @@ fn browser_shortcut_from_char(
         }
         c if c == 'W' as u16 || c == 'w' as u16 => Some(BrowserShortcut::CloseTab),
         c if c == 'F' as u16 || c == 'f' as u16 => Some(BrowserShortcut::FindInPage),
+        c if (c == 'P' as u16 || c == 'p' as u16) && !shift => Some(BrowserShortcut::Print),
         c if c == 'L' as u16 || c == 'l' as u16 || c == 'K' as u16 || c == 'k' as u16 => {
             Some(BrowserShortcut::OpenCommandPalette)
         }
@@ -1239,6 +1242,15 @@ mod tests {
         );
         assert_eq!(browser_shortcut(true, 0x46, 128 | 2), None);
         assert_eq!(
+            browser_shortcut(true, 0x50, 128),
+            Some(BrowserShortcut::Print)
+        );
+        assert_eq!(
+            browser_shortcut(true, 0x50, 4),
+            Some(BrowserShortcut::Print)
+        );
+        assert_eq!(browser_shortcut(true, 0x50, 128 | 2), None);
+        assert_eq!(
             browser_shortcut(true, 0x4A, 128),
             Some(BrowserShortcut::OpenDownloads)
         );
@@ -1293,6 +1305,11 @@ mod tests {
             browser_shortcut_from_char(true, 'j' as u16, 128),
             Some(BrowserShortcut::OpenDownloads)
         );
+        assert_eq!(
+            browser_shortcut_from_char(true, 'p' as u16, 128),
+            Some(BrowserShortcut::Print)
+        );
+        assert_eq!(browser_shortcut_from_char(true, 'p' as u16, 128 | 2), None);
         assert_eq!(
             browser_shortcut_from_char(true, 'C' as u16, 128 | 2),
             Some(BrowserShortcut::CopyUrl)

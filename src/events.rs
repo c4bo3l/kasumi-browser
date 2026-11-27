@@ -639,6 +639,7 @@ pub enum BrowserShortcut {
     OpenCommandPalette,
     OpenDevTools,
     FindInPage,
+    Print,
     OpenSettings,
     OpenDownloads,
     OpenBookmarkManager,
@@ -880,6 +881,10 @@ pub enum UiAction {
     },
     HibernateAllBackground,
     OpenDevTools {
+        tab_id: u64,
+    },
+    /// Open the platform print dialog for one tab's live CEF view.
+    Print {
         tab_id: u64,
     },
     /// Switch the visible native workspace and its active tab.

@@ -664,6 +664,7 @@ pub enum CommandAction {
     HibernateAll,
     ToggleRail,
     OpenDevTools,
+    Print,
     OpenSettings,
     OpenDownloads,
     BookmarkActiveTab,
@@ -7849,6 +7850,14 @@ pub fn command_palette_items(
             subtitle: "Native parallel downloads and history".to_string(),
             action: CommandAction::OpenDownloads,
         });
+        if active_tab_id.is_some() {
+            items.push(CommandPaletteItem {
+                icon: "⎙",
+                label: "Print active page (Cmd/Ctrl+P)".to_string(),
+                subtitle: "Open the native print dialog".to_string(),
+                action: CommandAction::Print,
+            });
+        }
         items.extend(tabs.iter().take(12).map(tab_item));
         if let Some(item) = bookmark_item() {
             items.push(item);
@@ -7919,6 +7928,15 @@ pub fn command_palette_items(
         }
     }
 
+    if needle.contains("print") && active_tab_id.is_some() {
+        items.push(CommandPaletteItem {
+            icon: "⎙",
+            label: "Print active page".to_string(),
+            subtitle: "Open the native print dialog".to_string(),
+            action: CommandAction::Print,
+        });
+    }
+
     if needle.contains("setting") || needle.contains("preference") {
         items.push(CommandPaletteItem {
             icon: "⚙",
@@ -7983,6 +8001,11 @@ fn apply_command_item(
         CommandAction::OpenDevTools => {
             if let Some(tab_id) = state.active_tab_id {
                 actions.push(UiAction::OpenDevTools { tab_id });
+            }
+        }
+        CommandAction::Print => {
+            if let Some(tab_id) = state.active_tab_id {
+                actions.push(UiAction::Print { tab_id });
             }
         }
         CommandAction::OpenSettings => state.open_settings(),
@@ -8972,10 +8995,11 @@ mod tests {
         assert_eq!(items[3].action, CommandAction::ToggleRail);
         assert_eq!(items[4].action, CommandAction::OpenSettings);
         assert_eq!(items[5].action, CommandAction::OpenDownloads);
-        assert_eq!(items[6].action, CommandAction::SelectTab(1));
-        assert_eq!(items[7].action, CommandAction::BookmarkActiveTab);
-        assert_eq!(items[8].action, CommandAction::OpenBookmarkManager);
-        assert_eq!(items[9].action, CommandAction::NewPrivateWindow);
+        assert_eq!(items[6].action, CommandAction::Print);
+        assert_eq!(items[7].action, CommandAction::SelectTab(1));
+        assert_eq!(items[8].action, CommandAction::BookmarkActiveTab);
+        assert_eq!(items[9].action, CommandAction::OpenBookmarkManager);
+        assert_eq!(items[10].action, CommandAction::NewPrivateWindow);
     }
 
     #[test]
@@ -9190,6 +9214,20 @@ mod tests {
         let mut actions = Vec::new();
         apply_command_item(&CommandAction::OpenDevTools, &mut state, &mut actions);
         assert_eq!(actions, vec![UiAction::OpenDevTools { tab_id: 7 }]);
+        assert!(!state.command_palette_open);
+    }
+
+    #[test]
+    fn palette_offers_print_action() {
+        let items = command_palette_items("print", &[], Some(7), &BrowserPreferences::default());
+        assert!(items.iter().any(|item| item.action == CommandAction::Print));
+
+        let mut state = ChromeState::default();
+        state.active_tab_id = Some(7);
+        state.command_palette_open = true;
+        let mut actions = Vec::new();
+        apply_command_item(&CommandAction::Print, &mut state, &mut actions);
+        assert_eq!(actions, vec![UiAction::Print { tab_id: 7 }]);
         assert!(!state.command_palette_open);
     }
 

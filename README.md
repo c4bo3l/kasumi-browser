@@ -4,7 +4,7 @@ A low-memory, daily-driver desktop browser written in Rust and powered by CEF (`
 
 Repository: [github.com/c4bo3l/kasumi-browser](https://github.com/c4bo3l/kasumi-browser) · [Release notes](RELEASE_NOTES.md) · [PR checks](https://github.com/c4bo3l/kasumi-browser/actions/workflows/pr.yml)
 
-Current version: **0.12.0**. Version bumps land in release PRs and become official at merge, as required by [AGENTS.md](AGENTS.md).
+Current version: **0.13.0**. Version bumps land in release PRs and become official at merge, as required by [AGENTS.md](AGENTS.md).
 
 ---
 
@@ -31,6 +31,7 @@ Current version: **0.12.0**. Version bumps land in release PRs and become offici
 - **Theme-aware UI:** native chrome follows the OS light/dark appearance live, with explicit Light/Dark overrides. Accent colour is applied only to browser chrome, never to page content.
 - **Bottom page HUDs:** Command/DevTools controls and live blocked-request/RAM status stay visible while browsing.
 - **Native DevTools window:** `F12`, the rail, the tab menu, and the command palette open or bring forward Chromium DevTools.
+- **Native printing:** `Cmd/Ctrl+P` and the command palette open CEF's platform print dialog for the active tab.
 
 ### Find in page
 
@@ -79,6 +80,7 @@ Current version: **0.12.0**. Version bumps land in release PRs and become offici
 | `Ctrl/Cmd + T` / `W` | New tab / close tab |
 | `Ctrl/Cmd + K` / `L` | Command palette / palette with active URL |
 | `Ctrl/Cmd + F` | Find in page |
+| `Ctrl/Cmd + P` | Print active page |
 | `Ctrl/Cmd + ,` | Settings |
 | `Ctrl/Cmd + J` | Downloads |
 | `Ctrl/Cmd + Shift + T` / `Z` | Reopen closed tab / undo close |
@@ -223,11 +225,11 @@ CI runs the same checks on macOS 15 Intel, Windows, and Linux.
 
 ## Known issues
 
-Windows and Linux native child-view, tooltip, download, bookmark, media-permission, website-notification, and find-in-page flows still need hands-on verification.
+Windows and Linux native child-view, tooltip, download, bookmark, media-permission, website-notification, find-in-page, and printing flows still need hands-on verification. Linux printing also requires a CEF `PrintHandler` before the platform dialog and spooler path are supported.
 
 ## Roadmap
 
-Up next: native print support (`Cmd/Ctrl+P`), browser import, cross-platform verification, auto-update, PiP, local AI, and extension support. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for completed work and [Future development](RELEASE_NOTES.md#future-development) for deferred items.
+Up next: Linux print handler, browser import, cross-platform verification, auto-update, PiP, local AI, and extension support. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for completed work and [Future development](RELEASE_NOTES.md#future-development) for deferred items.
 
 ## Adblock filter lists
 

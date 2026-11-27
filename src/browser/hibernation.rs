@@ -3901,6 +3901,7 @@ impl TabManager {
                 BrowserShortcut::FindInPage => {
                     self.find_requested = true;
                 }
+                BrowserShortcut::Print => self.print(tab_id),
                 BrowserShortcut::OpenSettings => {
                     self.settings_requested = true;
                 }
@@ -4251,6 +4252,26 @@ impl TabManager {
         }
     }
 
+    /// Open the platform print dialog for a live tab's CEF view.
+    ///
+    /// Printing is driven from the main UI thread through `about_to_wait`; no
+    /// filesystem or database work happens here. A hibernated tab has no live
+    /// browser host, so the request is ignored with a warning rather than
+    /// waking a background page just to print it.
+    pub fn print(&self, tab_id: u64) {
+        let Some(host) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.browser.as_ref())
+            .and_then(|browser| browser.host())
+        else {
+            tracing::warn!("Print skipped for tab {tab_id}: no live browser host");
+            return;
+        };
+        host.print();
+    }
+
     /// Dispatch user actions from egui chrome or keyboard shortcuts.
     pub fn handle_ui_action(&mut self, action: UiAction) {
         match action {
@@ -4575,6 +4596,7 @@ impl TabManager {
             UiAction::StopFindingAll { clear_selection } => {
                 self.stop_finding_all(clear_selection);
             }
+            UiAction::Print { tab_id } => self.print(tab_id),
             // The winit handler persists the live rail toggle; tab state needs
             // no change for a chrome width update.
             UiAction::SetRailExpanded(_) => {}
