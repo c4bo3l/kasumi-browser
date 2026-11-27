@@ -40,6 +40,7 @@ use crate::events::{
     WebNotification,
 };
 use crate::storage::db::{BookmarkItem, SessionTabSnapshot, SitePermission, StorageHandle};
+use crate::storage::import::{read_profile, BrowserProfile, ImportReport, ImportedBrowserData};
 use crate::ui::chrome::{
     BookmarkInfo, ChromeState, DisplayMediaPicker, Favicon, PermissionPrompt, PermissionPromptKind,
     PrintDialogState, TabDisplayState, TabInfo, ToastKind, WorkspaceInfo,
@@ -664,6 +665,14 @@ pub struct TabManager {
     print_default_printer: String,
     /// Print outcomes waiting to be shown as native toasts.
     print_toasts: VecDeque<PrintJobToast>,
+    /// Profiles discovered by the browser-import worker, consumed by chrome.
+    browser_import_profiles: Option<Vec<BrowserProfile>>,
+    /// Latest import stage message, consumed by chrome on the next UI tick.
+    browser_import_progress: Option<String>,
+    /// Completed import outcome, consumed by chrome on the next UI tick.
+    browser_import_report: Option<ImportReport>,
+    /// Shared cooperative cancellation flag for the active import worker.
+    browser_import_cancel: Option<Arc<AtomicBool>>,
     /// Native web notifications waiting for the shell to surface them.
     web_notifications: VecDeque<WebNotification>,
     /// Notification ids a page closed before the shell could dismiss them.
@@ -854,6 +863,10 @@ impl TabManager {
             print_printers: Vec::new(),
             print_default_printer: String::new(),
             print_toasts: VecDeque::new(),
+            browser_import_profiles: None,
+            browser_import_progress: None,
+            browser_import_report: None,
+            browser_import_cancel: None,
             web_notifications: VecDeque::new(),
             closed_web_notifications: Vec::new(),
             saved_site_permissions: BTreeMap::new(),
@@ -4169,6 +4182,16 @@ impl TabManager {
                     );
                 }
             }
+            BrowserEvent::BrowserProfilesDetected { profiles } => {
+                self.browser_import_profiles = Some(profiles);
+            }
+            BrowserEvent::BrowserImportProgress { message } => {
+                self.browser_import_progress = Some(message);
+            }
+            BrowserEvent::BrowserImportFinished { report } => {
+                self.browser_import_cancel = None;
+                self.browser_import_report = Some(report);
+            }
         }
     }
 
@@ -4500,6 +4523,169 @@ impl TabManager {
             .collect()
     }
 
+    /// Discover local browser profiles on a dedicated thread. Filesystem scans
+    /// never run on the winit loop or a CEF callback thread.
+    fn detect_browser_profiles(&self) {
+        let sender = self.event_sender.clone();
+        let spawned = std::thread::Builder::new()
+            .name("browser-import-discovery".to_string())
+            .spawn(move || {
+                let profiles = crate::storage::import::detect_profiles();
+                let _ = sender.send(BrowserEvent::BrowserProfilesDetected { profiles });
+            });
+        if let Err(error) = spawned {
+            tracing::warn!("Could not start browser profile discovery: {error}");
+        }
+    }
+
+    /// Parse the selected profile on a background thread, then hand the parsed
+    /// batch to the SQLite worker. Both CEF and winit stay responsive while a
+    /// large browser profile is being read.
+    fn start_browser_import(&mut self, profile: BrowserProfile, bookmarks: bool, history: bool) {
+        if self
+            .browser_import_cancel
+            .as_ref()
+            .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+        {
+            return;
+        }
+
+        let sender = self.event_sender.clone();
+        let workspace_id = self.active_workspace_id;
+        let Some(storage) = self.storage.clone() else {
+            let _ = sender.send(BrowserEvent::BrowserImportFinished {
+                report: ImportReport {
+                    errors: vec!["Browser storage is unavailable".to_string()],
+                    ..ImportReport::default()
+                },
+            });
+            return;
+        };
+        if Self::is_private_workspace(workspace_id) {
+            let _ = sender.send(BrowserEvent::BrowserImportFinished {
+                report: ImportReport {
+                    errors: vec!["Browser import is unavailable in a private space".to_string()],
+                    ..ImportReport::default()
+                },
+            });
+            return;
+        }
+        if !bookmarks && !history {
+            let _ = sender.send(BrowserEvent::BrowserImportFinished {
+                report: ImportReport {
+                    errors: vec!["Choose bookmarks, history, or both".to_string()],
+                    ..ImportReport::default()
+                },
+            });
+            return;
+        }
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.browser_import_cancel = Some(cancel.clone());
+        let spawned = std::thread::Builder::new()
+            .name("browser-import-worker".to_string())
+            .spawn(move || {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = sender.send(BrowserEvent::BrowserImportFinished {
+                        report: ImportReport::canceled(),
+                    });
+                    return;
+                }
+
+                let parsed = read_profile(&profile, bookmarks, history, |message| {
+                    let _ = sender.send(BrowserEvent::BrowserImportProgress {
+                        message: message.to_string(),
+                    });
+                });
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = sender.send(BrowserEvent::BrowserImportFinished {
+                        report: ImportReport::canceled(),
+                    });
+                    return;
+                }
+                let data: ImportedBrowserData = match parsed {
+                    Ok(data) => data,
+                    Err(error) => {
+                        let _ = sender.send(BrowserEvent::BrowserImportFinished {
+                            report: ImportReport {
+                                errors: vec![error],
+                                ..ImportReport::default()
+                            },
+                        });
+                        return;
+                    }
+                };
+                if data.is_empty() {
+                    let _ = sender.send(BrowserEvent::BrowserImportFinished {
+                        report: ImportReport {
+                            errors: vec!["No importable bookmarks or history found".to_string()],
+                            ..ImportReport::default()
+                        },
+                    });
+                    return;
+                }
+
+                let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+                storage.import_browser_data(
+                    workspace_id,
+                    data.bookmarks,
+                    data.history,
+                    cancel.clone(),
+                    reply_tx,
+                );
+                let report = match reply_rx.recv_timeout(Duration::from_secs(60)) {
+                    Ok(report) => report,
+                    Err(error) => ImportReport {
+                        errors: vec![format!("SQLite import timed out: {error}")],
+                        ..ImportReport::default()
+                    },
+                };
+                let _ = sender.send(BrowserEvent::BrowserImportFinished { report });
+            });
+        if let Err(error) = spawned {
+            self.browser_import_cancel = None;
+            tracing::warn!("Could not start browser import: {error}");
+            let _ = self.event_sender.send(BrowserEvent::BrowserImportFinished {
+                report: ImportReport {
+                    errors: vec![format!("Could not start browser import: {error}")],
+                    ..ImportReport::default()
+                },
+            });
+        }
+    }
+
+    /// Ask the active import worker to stop before it commits any rows. Parsing
+    /// and SQLite writes poll this flag; the shell stays fully responsive.
+    fn cancel_browser_import(&self) {
+        if self
+            .browser_import_cancel
+            .as_ref()
+            .is_some_and(|flag| !flag.load(Ordering::Relaxed))
+        {
+            if let Some(flag) = &self.browser_import_cancel {
+                flag.store(true, Ordering::Relaxed);
+            }
+            let _ = self.event_sender.send(BrowserEvent::BrowserImportProgress {
+                message: "Canceling import…".to_string(),
+            });
+        }
+    }
+
+    /// Take the latest profile-discovery result for native chrome.
+    pub fn consume_browser_profiles(&mut self) -> Option<Vec<BrowserProfile>> {
+        self.browser_import_profiles.take()
+    }
+
+    /// Take the latest import stage message for native chrome.
+    pub fn consume_browser_import_progress(&mut self) -> Option<String> {
+        self.browser_import_progress.take()
+    }
+
+    /// Take a completed import report for native chrome.
+    pub fn consume_browser_import_report(&mut self) -> Option<ImportReport> {
+        self.browser_import_report.take()
+    }
+
     /// Dispatch user actions from egui chrome or keyboard shortcuts.
     pub fn handle_ui_action(&mut self, action: UiAction) {
         match action {
@@ -4780,6 +4966,13 @@ impl TabManager {
             UiAction::ApplyPreferences(preferences) => {
                 self.apply_preferences(&preferences);
             }
+            UiAction::DetectBrowserProfiles => self.detect_browser_profiles(),
+            UiAction::StartBrowserImport {
+                profile,
+                bookmarks,
+                history,
+            } => self.start_browser_import(profile, bookmarks, history),
+            UiAction::CancelBrowserImport => self.cancel_browser_import(),
             UiAction::ResolveMediaAccessPermission {
                 request_id,
                 granted,

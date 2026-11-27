@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::config::{BrowserPreferences, WorkspaceColor, WorkspaceIcon};
+use crate::storage::import::{BrowserProfile, ImportReport};
 use cef::{ImplMediaAccessCallback, ImplPermissionPromptCallback};
 
 /// CEF media-access bit values (`cef_media_access_permission_types_t`).
@@ -666,6 +667,18 @@ pub enum BrowserEvent {
         message: String,
         callback: cef::PrintJobCallback,
     },
+    /// Local browser profiles discovered on a background thread.
+    BrowserProfilesDetected {
+        profiles: Vec<BrowserProfile>,
+    },
+    /// Stage message emitted by the browser-import worker before SQLite writes.
+    BrowserImportProgress {
+        message: String,
+    },
+    /// Final import outcome after the SQLite worker committed its batch.
+    BrowserImportFinished {
+        report: ImportReport,
+    },
 }
 
 /// Options for a find request shared by the native CEF path and the rich
@@ -943,6 +956,18 @@ impl std::fmt::Debug for BrowserEvent {
                 .field("success", success)
                 .field("message", message)
                 .finish(),
+            Self::BrowserProfilesDetected { profiles } => f
+                .debug_struct("BrowserProfilesDetected")
+                .field("profiles", profiles)
+                .finish(),
+            Self::BrowserImportProgress { message } => f
+                .debug_struct("BrowserImportProgress")
+                .field("message", message)
+                .finish(),
+            Self::BrowserImportFinished { report } => f
+                .debug_struct("BrowserImportFinished")
+                .field("report", report)
+                .finish(),
             Self::ParallelDownload(event) => {
                 f.debug_tuple("ParallelDownload").field(event).finish()
             }
@@ -1100,6 +1125,18 @@ pub enum UiAction {
     SetRailExpanded(bool),
     /// Apply preferences changed in the native Settings overlay.
     ApplyPreferences(BrowserPreferences),
+    /// Discover local Chrome, Edge, Firefox, and Safari profiles off-thread.
+    DetectBrowserProfiles,
+    /// Parse one discovered profile and apply the selected data through the
+    /// SQLite worker. All filesystem work happens on a dedicated thread.
+    StartBrowserImport {
+        profile: BrowserProfile,
+        bookmarks: bool,
+        history: bool,
+    },
+    /// Cooperatively cancel the active browser import. Parsing and SQLite
+    /// writes check the shared flag before applying any partial batch.
+    CancelBrowserImport,
     /// Resolve a native media-access prompt. `TabManager` owns the one-shot CEF
     /// callback; this action carries only its request id so UI state stays Clone.
     /// `persist` is false for Escape/click-outside dismissal so a transient

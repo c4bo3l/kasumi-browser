@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(&output_dir)?;
 
         let resources_path = Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icons"));
-        let version = semver::Version::new(0, 14, 0);
+        let version = semver::Version::new(0, 15, 0);
         let bundle_info = BundleInfo::new(
             "KasumiBrowser",
             "com.kasumi.browser",

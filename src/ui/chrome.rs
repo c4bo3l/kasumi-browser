@@ -36,6 +36,7 @@ use crate::events::{
     DownloadEngine, DownloadInfo, DownloadNotification, DownloadNotificationKind, DownloadState,
     FindOptions, FindSnippet, PrintOptions, PrintPaperSize, UiAction, WebNotification,
 };
+use crate::storage::import::{BrowserProfile, BrowserSource, ImportReport};
 
 /// Light or dark chrome appearance. The OS theme decides the default, and
 /// `ChromeTheme::from_winit` maps live `ThemeChanged` events into this enum.
@@ -668,6 +669,7 @@ pub enum CommandAction {
     OpenDevTools,
     Print,
     OpenSettings,
+    OpenBrowserImport,
     OpenDownloads,
     BookmarkActiveTab,
     OpenBookmarkManager,
@@ -811,6 +813,7 @@ pub enum SettingsTab {
     #[default]
     General,
     Workspaces,
+    Import,
 }
 
 /// One row in the rail tab context menu.
@@ -955,6 +958,20 @@ pub struct ChromeState {
     pub workspace_new_name_draft: String,
     pub workspace_new_icon_draft: WorkspaceIcon,
     pub workspace_new_color_draft: WorkspaceColor,
+    /// Local browser profiles discovered off the UI thread.
+    pub browser_import_profiles: Vec<BrowserProfile>,
+    /// True while profile discovery is running.
+    pub browser_import_detecting: bool,
+    /// Profile currently selected in the Import settings page.
+    pub browser_import_selected_source: Option<BrowserSource>,
+    pub browser_import_bookmarks: bool,
+    pub browser_import_history: bool,
+    /// True while a parsed batch is being applied by the SQLite worker.
+    pub browser_import_running: bool,
+    /// Latest worker stage message shown in the Import page.
+    pub browser_import_progress: String,
+    /// Outcome of the most recent import attempt.
+    pub browser_import_report: Option<ImportReport>,
 }
 
 impl Default for ChromeState {
@@ -1031,6 +1048,14 @@ impl Default for ChromeState {
             workspace_new_name_draft: "New workspace".to_string(),
             workspace_new_icon_draft: WorkspaceIcon::default(),
             workspace_new_color_draft: WorkspaceColor::default(),
+            browser_import_profiles: Vec::new(),
+            browser_import_detecting: false,
+            browser_import_selected_source: None,
+            browser_import_bookmarks: true,
+            browser_import_history: true,
+            browser_import_running: false,
+            browser_import_progress: String::new(),
+            browser_import_report: None,
         }
     }
 }
@@ -1369,6 +1394,45 @@ impl ChromeState {
     pub fn open_settings(&mut self) {
         self.dismiss_find_for_overlay();
         self.open_settings_tab(SettingsTab::General);
+    }
+
+    /// Open Settings directly on the browser-import page.
+    pub fn open_browser_import(&mut self) {
+        self.dismiss_find_for_overlay();
+        self.open_settings_tab(SettingsTab::Import);
+    }
+
+    /// Install discovered profiles and keep the selection valid when a refresh
+    /// removes a previously selected browser.
+    pub fn set_browser_profiles(&mut self, profiles: Vec<BrowserProfile>) {
+        self.browser_import_profiles = profiles;
+        self.browser_import_detecting = false;
+        self.browser_import_progress.clear();
+        if let Some(source) = self.browser_import_selected_source {
+            if !self
+                .browser_import_profiles
+                .iter()
+                .any(|profile| profile.source == source)
+            {
+                self.browser_import_selected_source = None;
+            }
+        }
+    }
+
+    pub fn set_browser_import_progress(&mut self, message: String) {
+        self.browser_import_progress = message;
+    }
+
+    pub fn set_browser_import_report(&mut self, report: ImportReport) {
+        self.browser_import_running = false;
+        self.browser_import_progress.clear();
+        self.browser_import_report = Some(report);
+    }
+
+    pub fn reset_browser_import_result(&mut self) {
+        self.browser_import_running = false;
+        self.browser_import_progress.clear();
+        self.browser_import_report = None;
     }
 
     /// Open the Arc/Edge-style downloads bubble in the shared overlay.
@@ -4807,6 +4871,215 @@ impl ChromeRenderer {
         }
     }
 
+    /// Draw the browser-import page. Detection, parsing, and SQLite writes are
+    /// all performed off-thread; this function only edits native UI state and
+    /// emits `UiAction`s.
+    fn build_browser_import_page(
+        ui: &mut Ui,
+        state: &mut ChromeState,
+        actions: &mut Vec<UiAction>,
+        palette: &ChromePalette,
+    ) {
+        ui.label(
+            RichText::new("BROWSER DATA")
+                .size(10.0)
+                .strong()
+                .color(palette.section_label),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new("Bring bookmarks and history from a locally installed browser. Passwords are not imported.")
+                .size(11.0)
+                .color(palette.palette_subtext),
+        );
+        ui.add_space(8.0);
+
+        let detect_label = if state.browser_import_profiles.is_empty() {
+            "Detect installed browsers"
+        } else {
+            "Refresh browser detection"
+        };
+        if material_button(
+            ui,
+            RailIcon::Download,
+            detect_label,
+            MaterialButtonStyle::Tonal,
+            palette,
+            !state.browser_import_detecting && !state.browser_import_running,
+        )
+        .clicked()
+        {
+            state.browser_import_detecting = true;
+            state.browser_import_progress = "Discovering local browser profiles…".to_string();
+            state.browser_import_report = None;
+            actions.push(UiAction::DetectBrowserProfiles);
+        }
+
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("DETECTED PROFILES")
+                .size(10.0)
+                .strong()
+                .color(palette.section_label),
+        );
+        ui.add_space(3.0);
+
+        let profiles = state.browser_import_profiles.clone();
+        if state.browser_import_detecting {
+            ui.label(
+                RichText::new(&state.browser_import_progress)
+                    .size(11.0)
+                    .color(palette.palette_subtext),
+            );
+        } else if profiles.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No supported profiles found. Install or launch Chrome, Edge, Firefox, or Safari, then refresh.",
+                )
+                .size(11.0)
+                .color(palette.palette_hint),
+            );
+        }
+        for profile in &profiles {
+            let path = profile
+                .bookmarks_path
+                .as_deref()
+                .or(profile.history_path.as_deref())
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Local profile".to_string());
+            let selected = state.browser_import_selected_source == Some(profile.source);
+            if ui
+                .selectable_label(selected, format!("{} — {}", profile.source.label(), path))
+                .clicked()
+                && !state.browser_import_running
+            {
+                state.browser_import_selected_source = Some(profile.source);
+                state.browser_import_bookmarks = profile.supports_bookmarks();
+                state.browser_import_history = profile.supports_history();
+                state.reset_browser_import_result();
+            }
+        }
+
+        let selected_profile = state.browser_import_selected_source.and_then(|source| {
+            profiles
+                .iter()
+                .find(|profile| profile.source == source)
+                .cloned()
+        });
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("IMPORT")
+                .size(10.0)
+                .strong()
+                .color(palette.section_label),
+        );
+        ui.add_space(3.0);
+
+        let mut want_bookmarks = state.browser_import_bookmarks;
+        let mut want_history = state.browser_import_history;
+        let inputs_enabled = !state.browser_import_running && !state.browser_import_detecting;
+        let bookmarks_available = inputs_enabled
+            && selected_profile
+                .as_ref()
+                .is_some_and(BrowserProfile::supports_bookmarks);
+        let history_available = inputs_enabled
+            && selected_profile
+                .as_ref()
+                .is_some_and(BrowserProfile::supports_history);
+        ui.add_enabled(
+            bookmarks_available,
+            egui::Checkbox::new(&mut want_bookmarks, "Bookmarks"),
+        );
+        ui.add_enabled(
+            history_available,
+            egui::Checkbox::new(&mut want_history, "History"),
+        );
+        state.browser_import_bookmarks = want_bookmarks;
+        state.browser_import_history = want_history;
+
+        let can_import =
+            selected_profile.is_some() && (want_bookmarks || want_history) && inputs_enabled;
+        ui.horizontal(|ui| {
+            if material_button(
+                ui,
+                RailIcon::Download,
+                "Import selected data",
+                MaterialButtonStyle::Filled,
+                palette,
+                can_import,
+            )
+            .clicked()
+            {
+                if let Some(profile) = selected_profile.clone() {
+                    state.browser_import_running = true;
+                    state.browser_import_progress = "Preparing import…".to_string();
+                    state.browser_import_report = None;
+                    actions.push(UiAction::StartBrowserImport {
+                        profile,
+                        bookmarks: want_bookmarks,
+                        history: want_history,
+                    });
+                }
+            }
+            if state.browser_import_running
+                && material_button(
+                    ui,
+                    RailIcon::Close,
+                    "Cancel",
+                    MaterialButtonStyle::Tonal,
+                    palette,
+                    true,
+                )
+                .clicked()
+            {
+                state.browser_import_progress = "Canceling import…".to_string();
+                actions.push(UiAction::CancelBrowserImport);
+            }
+        });
+
+        if !state.browser_import_progress.is_empty() && !state.browser_import_detecting {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(&state.browser_import_progress)
+                    .size(11.0)
+                    .color(palette.palette_subtext),
+            );
+        }
+        if let Some(report) = &state.browser_import_report {
+            ui.add_space(8.0);
+            if report.canceled {
+                ui.label(
+                    RichText::new("Import canceled. No partial data was applied.")
+                        .size(11.0)
+                        .color(palette.palette_hint),
+                );
+            } else if report.success() {
+                ui.label(
+                    RichText::new(format!(
+                        "Imported {} bookmark(s) and {} history entries.",
+                        report.bookmarks_added, report.history_added
+                    ))
+                    .size(11.0)
+                    .color(palette.shield_ok),
+                );
+            } else {
+                for error in &report.errors {
+                    ui.label(
+                        RichText::new(error)
+                            .size(11.0)
+                            .color(Color32::from_rgb(255, 148, 148)),
+                    );
+                }
+            }
+        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new("Imported bookmarks are placed in an “Imported Browser” folder in the current workspace. Duplicate URLs are updated in place.")
+                .size(10.0)
+                .color(palette.palette_hint),
+        );
+    }
+
     /// Draw the native Settings card in the shared transparent overlay.
     ///
     /// Controls commit immediately to `ChromeState` and emit one
@@ -4918,6 +5191,7 @@ impl ChromeRenderer {
                             for (tab, label) in [
                                 (SettingsTab::General, "General"),
                                 (SettingsTab::Workspaces, "Workspaces"),
+                                (SettingsTab::Import, "Import"),
                             ] {
                                 if ui.selectable_label(settings_tab == tab, label).clicked() {
                                     settings_tab = tab;
@@ -4933,6 +5207,7 @@ impl ChromeRenderer {
                         let scroll_id = match settings_tab {
                             SettingsTab::General => "kasumi_settings_general",
                             SettingsTab::Workspaces => "kasumi_settings_workspaces",
+                            SettingsTab::Import => "kasumi_settings_import",
                         };
                         egui::ScrollArea::vertical()
                             .id_salt(scroll_id)
@@ -5388,6 +5663,11 @@ impl ChromeRenderer {
                                             );
                                         }
                                     }
+                                }
+                                SettingsTab::Import => {
+                                    ChromeRenderer::build_browser_import_page(
+                                        ui, state, actions, palette,
+                                    );
                                 }
                                 }
                             });
@@ -8027,6 +8307,12 @@ pub fn command_palette_items(
         subtitle: "Search, edit, move, and delete saved pages".to_string(),
         action: CommandAction::OpenBookmarkManager,
     };
+    let browser_import_item = || CommandPaletteItem {
+        icon: "⇪",
+        label: "Import browser data".to_string(),
+        subtitle: "Bring bookmarks and history from Chrome, Edge, Firefox, or Safari".to_string(),
+        action: CommandAction::OpenBrowserImport,
+    };
 
     if trimmed.is_empty() {
         items.push(CommandPaletteItem {
@@ -8056,6 +8342,7 @@ pub fn command_palette_items(
             subtitle: "Theme, search, privacy, and performance".to_string(),
             action: CommandAction::OpenSettings,
         });
+        items.push(browser_import_item());
         items.push(CommandPaletteItem {
             icon: "⇩",
             label: "Open Downloads".to_string(),
@@ -8158,6 +8445,10 @@ pub fn command_palette_items(
         });
     }
 
+    if needle.contains("import") || needle.contains("browser data") {
+        items.push(browser_import_item());
+    }
+
     if needle.contains("download") {
         items.push(CommandPaletteItem {
             icon: "⇩",
@@ -8221,6 +8512,7 @@ fn apply_command_item(
             }
         }
         CommandAction::OpenSettings => state.open_settings(),
+        CommandAction::OpenBrowserImport => state.open_browser_import(),
         CommandAction::OpenDownloads => state.open_downloads(),
         CommandAction::OpenBookmarkManager => state.open_bookmark_manager(),
         CommandAction::BookmarkActiveTab => {
@@ -8380,6 +8672,7 @@ pub fn resolve_omnibox_with_search(input: &str, search_url_prefix: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use egui::{pos2, vec2, Color32};
+    use std::path::PathBuf;
 
     use super::{
         active_bookmark_key, advance_command_selection, apply_command_item, bookmark_star_points,
@@ -8409,6 +8702,7 @@ mod tests {
         DownloadEngine, DownloadInfo, DownloadNotification, DownloadNotificationKind,
         DownloadState, PrintOptions, PrintPaperSize, UiAction, WebNotification,
     };
+    use crate::storage::import::{BrowserProfile, BrowserSource, ImportReport};
 
     fn tab(id: u64, title: &str, url: &str) -> TabInfo {
         TabInfo {
@@ -9241,12 +9535,13 @@ mod tests {
         assert_eq!(items[2].action, CommandAction::HibernateAll);
         assert_eq!(items[3].action, CommandAction::ToggleRail);
         assert_eq!(items[4].action, CommandAction::OpenSettings);
-        assert_eq!(items[5].action, CommandAction::OpenDownloads);
-        assert_eq!(items[6].action, CommandAction::Print);
-        assert_eq!(items[7].action, CommandAction::SelectTab(1));
-        assert_eq!(items[8].action, CommandAction::BookmarkActiveTab);
-        assert_eq!(items[9].action, CommandAction::OpenBookmarkManager);
-        assert_eq!(items[10].action, CommandAction::NewPrivateWindow);
+        assert_eq!(items[5].action, CommandAction::OpenBrowserImport);
+        assert_eq!(items[6].action, CommandAction::OpenDownloads);
+        assert_eq!(items[7].action, CommandAction::Print);
+        assert_eq!(items[8].action, CommandAction::SelectTab(1));
+        assert_eq!(items[9].action, CommandAction::BookmarkActiveTab);
+        assert_eq!(items[10].action, CommandAction::OpenBookmarkManager);
+        assert_eq!(items[11].action, CommandAction::NewPrivateWindow);
     }
 
     #[test]
@@ -10082,6 +10377,50 @@ mod tests {
 
         assert!(state.settings_open);
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn command_palette_open_import_action_opens_import_settings() {
+        let mut state = ChromeState::default();
+        let mut actions = Vec::new();
+        apply_command_item(&CommandAction::OpenBrowserImport, &mut state, &mut actions);
+
+        assert!(state.settings_open);
+        assert_eq!(state.settings_tab, SettingsTab::Import);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn browser_import_state_tracks_profiles_progress_and_report() {
+        let mut state = ChromeState::default();
+        let profile = BrowserProfile {
+            source: BrowserSource::Chrome,
+            bookmarks_path: Some(PathBuf::from("/profiles/chrome/Bookmarks")),
+            history_path: Some(PathBuf::from("/profiles/chrome/History")),
+        };
+        state.browser_import_detecting = true;
+        state.set_browser_profiles(vec![profile.clone()]);
+        assert!(!state.browser_import_detecting);
+        assert_eq!(state.browser_import_profiles, vec![profile]);
+
+        state.set_browser_import_progress("Reading bookmarks".to_string());
+        assert_eq!(state.browser_import_progress, "Reading bookmarks");
+
+        state.browser_import_running = true;
+        state.set_browser_import_report(ImportReport {
+            bookmarks_added: 3,
+            history_added: 7,
+            ..ImportReport::default()
+        });
+        assert!(!state.browser_import_running);
+        assert!(state.browser_import_progress.is_empty());
+        assert_eq!(
+            state
+                .browser_import_report
+                .as_ref()
+                .map(|r| r.bookmarks_added),
+            Some(3)
+        );
     }
 
     #[test]

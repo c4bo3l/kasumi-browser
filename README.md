@@ -4,7 +4,7 @@ A low-memory, daily-driver desktop browser written in Rust and powered by CEF (`
 
 Repository: [github.com/c4bo3l/kasumi-browser](https://github.com/c4bo3l/kasumi-browser) · [Release notes](RELEASE_NOTES.md) · [PR checks](https://github.com/c4bo3l/kasumi-browser/actions/workflows/pr.yml)
 
-Current version: **0.14.0**. Version bumps land in release PRs and become official at merge, as required by [AGENTS.md](AGENTS.md).
+Current version: **0.15.0**. Version bumps land in release PRs and become official at merge, as required by [AGENTS.md](AGENTS.md).
 
 ---
 
@@ -46,7 +46,7 @@ Current version: **0.14.0**. Version bumps land in release PRs and become offici
 
 - **Workspaces:** each workspace owns its pinned and regular tabs, selected tab, and default flag. Switch from the rail, choose a default startup space, and create, rename, or delete spaces. Deleting a workspace moves its tabs and archives its bookmark folder.
 - **Command palette:** `Cmd/Ctrl+K` searches tabs and bookmarks and resolves addresses or searches; `Cmd/Ctrl+L` opens it seeded with the active URL. It offers explicit open/search in this tab or a new tab, native actions, workspace labels, keyboard selection, immediate focus, and click-outside dismissal.
-- **Native Settings:** General, Workspaces, and Bookmarks pages with persisted preferences for theme, rail state, search provider, ad-block state, hibernation timeout, startup space, and download folder.
+- **Native Settings:** General, Workspaces, Import, and Bookmarks pages with persisted preferences for theme, rail state, search provider, ad-block state, hibernation timeout, startup space, and download folder.
 
 ### Privacy, performance, and web platform
 
@@ -60,6 +60,7 @@ Current version: **0.14.0**. Version bumps land in release PRs and become offici
 ### Storage, downloads, and bookmarks
 
 - **Crash-safe SQLite WAL storage:** history, bookmarks, downloads, pinned tabs, workspaces, preferences, site permissions, and session snapshots, flushed cleanly on shutdown.
+- **Browser data import:** detect local Chrome/Chromium, Edge, Firefox, and Safari profiles, then import bookmarks and history with normalized URLs, preserved titles/folders/visit counts, deduplication, progress, and cooperative cancel. Passwords are never imported. Discovery and parsing run off the UI and CEF threads.
 - **Native download manager:** WAL-backed history plus active progress, speed, ETA, path, connection count, pause/resume/cancel, retry, remove-info, clear-finished, open-file, and show-in-folder controls. The rail button shows an active count badge.
 - **Segmented downloads:** HTTP(S) transfers use up to eight balanced `Range` requests through CEF into a `.kasumi.part` file, with resumable byte ranges and generation guards so late callbacks cannot corrupt a file. Non-range transfers fall back to a single native request.
 - **Download notifications:** transparent native toasts announce completed or failed transfers without blocking page input.
@@ -225,11 +226,11 @@ CI runs the same checks on macOS 15 Intel, Windows, and Linux.
 
 ## Known issues
 
-Windows and Linux native child-view, tooltip, download, bookmark, media-permission, website-notification, find-in-page, and printing flows still need hands-on verification. Linux printing also needs a desktop check with real CUPS destinations; it is implemented with a CEF `PrintHandler`, Kasumi's native print panel, and `lp`/`lpstat` spooling.
+Windows and Linux native child-view, tooltip, download, bookmark, media-permission, website-notification, find-in-page, printing, and browser-import flows still need hands-on verification. Linux printing also needs a desktop check with real CUPS destinations; it is implemented with a CEF `PrintHandler`, Kasumi's native print panel, and `lp`/`lpstat` spooling. Browser import needs confirmation against real Chrome, Edge, Firefox, and Safari profiles; Safari history is intentionally unsupported.
 
 ## Roadmap
 
-Up next: browser import, cross-platform verification, auto-update, PiP, local AI, and extension support. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for completed work and [Future development](RELEASE_NOTES.md#future-development) for deferred items.
+Up next: cross-platform verification, auto-update, PiP, local AI, and extension support. See [RELEASE_NOTES.md](RELEASE_NOTES.md) for completed work and [Future development](RELEASE_NOTES.md#future-development) for deferred items.
 
 ## Adblock filter lists
 

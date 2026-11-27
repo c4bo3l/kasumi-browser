@@ -4,7 +4,32 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
-## v0.14.0 — Unreleased
+## v0.15.0 — Unreleased
+
+### Added
+
+- Native browser data import from locally installed Chrome/Chromium, Edge, Firefox, and Safari profiles. The Import page in Settings discovers profiles off-thread and lets the user choose bookmarks, history, or both.
+- Parsers read Chromium JSON bookmarks and SQLite history, Firefox `places.sqlite`, and Safari `Bookmarks.plist` via `plutil`. Only HTTP(S) URLs are imported, with normalized URLs, preserved titles/folders/visit counts, bounded field lengths, and per-batch deduplication.
+- Import progress is surfaced in the native Import page, with a Cancel action that cooperatively stops parsing and rolls back the SQLite transaction before commit.
+- A command-palette entry and `SettingsTab::Import` page provide a keyboard-first path to browser import.
+
+### Changed
+
+- Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.14.0` to `0.15.0`.
+- Imported bookmarks are placed in an `Imported Browser` or `Imported Firefox` / `Imported Safari` folder in the active normal workspace. Duplicate URLs are updated in place; private spaces reject imports.
+- Browser import never touches passwords or credential vaults; Safari history remains unsupported.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bins` — 250 browser tests plus 4 bundle tests
+- `cargo build --release`
+- Cross-platform PR checks on macOS 15 Intel, Windows, and Linux
+
+---
+
+## v0.14.0 — 2026-11-27
 
 ### Added
 
