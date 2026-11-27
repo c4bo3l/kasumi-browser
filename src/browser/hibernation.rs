@@ -29,9 +29,10 @@ use crate::browser::parallel_download::{
 };
 use crate::browser::{adblocker, client, display_capture, print};
 use crate::config::{
-    BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon, WorkspaceStartupBehavior,
-    PARALLEL_DOWNLOAD_SEGMENTS, RAM_CHECK_INTERVAL, RAM_CRITICAL_PRESSURE_THRESHOLD,
-    RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_PRESSURE, TAB_WATCHDOG_TICK_INTERVAL,
+    default_download_directory, BrowserPreferences, Workspace, WorkspaceColor, WorkspaceIcon,
+    WorkspaceStartupBehavior, PARALLEL_DOWNLOAD_SEGMENTS, RAM_CHECK_INTERVAL,
+    RAM_CRITICAL_PRESSURE_THRESHOLD, RAM_HIGH_PRESSURE_THRESHOLD, TAB_IDLE_TIMEOUT_PRESSURE,
+    TAB_WATCHDOG_TICK_INTERVAL,
 };
 use crate::events::{
     normalize_permission_origin, BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo,
@@ -42,6 +43,7 @@ use crate::events::{
 use crate::storage::db::{
     BookmarkItem, HistoryItem, SessionTabSnapshot, SitePermission, StorageHandle,
 };
+use crate::storage::export::export_data;
 use crate::storage::import::{read_profile, BrowserProfile, ImportReport, ImportedBrowserData};
 use crate::ui::chrome::{
     BookmarkInfo, ChromeState, DisplayMediaPicker, Favicon, PermissionPrompt, PermissionPromptKind,
@@ -417,6 +419,13 @@ struct PrintJobToast {
     message: String,
 }
 
+/// Outcome of a portable data export waiting to become a native toast.
+#[derive(Debug, Clone)]
+struct ExportToast {
+    success: bool,
+    message: String,
+}
+
 /// Resolve a one-shot CEF callback on the UI thread. MediaAccess callbacks need
 /// the exact requested bitmask; Chrome-runtime prompt callbacks are dismissed
 /// because CEF's Accept/Deny paths unconditionally consume request callbacks.
@@ -669,6 +678,8 @@ pub struct TabManager {
     print_default_printer: String,
     /// Print outcomes waiting to be shown as native toasts.
     print_toasts: VecDeque<PrintJobToast>,
+    /// Export outcomes waiting to be shown as native toasts.
+    export_toasts: VecDeque<ExportToast>,
     /// Profiles discovered by the browser-import worker, consumed by chrome.
     browser_import_profiles: Option<Vec<BrowserProfile>>,
     /// Latest import stage message, consumed by chrome on the next UI tick.
@@ -871,6 +882,7 @@ impl TabManager {
             print_printers: Vec::new(),
             print_default_printer: String::new(),
             print_toasts: VecDeque::new(),
+            export_toasts: VecDeque::new(),
             browser_import_profiles: None,
             browser_import_progress: None,
             browser_import_report: None,
@@ -4272,6 +4284,21 @@ impl TabManager {
                     self.request_history_refresh();
                 }
             }
+            BrowserEvent::BrowserDataExported { files, errors } => {
+                let success = errors.is_empty() && !files.is_empty();
+                let message = if success {
+                    format!(
+                        "Saved {} export file(s) to your download folder.",
+                        files.len()
+                    )
+                } else if errors.is_empty() {
+                    "No export files were written.".to_string()
+                } else {
+                    errors.join(" ")
+                };
+                self.export_toasts
+                    .push_back(ExportToast { success, message });
+            }
             BrowserEvent::BookmarksReloaded { mut bookmarks } => {
                 bookmarks.retain(|bookmark| !Self::is_private_workspace(bookmark.workspace_id));
                 self.bookmarks = bookmarks;
@@ -4610,6 +4637,26 @@ impl TabManager {
             .collect()
     }
 
+    /// Native toasts raised by portable data exports, consumed by the shell.
+    pub fn consume_export_toasts(&mut self) -> Vec<(ToastKind, String, String)> {
+        self.export_toasts
+            .drain(..)
+            .map(|toast| {
+                let kind = if toast.success {
+                    ToastKind::Success
+                } else {
+                    ToastKind::Error
+                };
+                let title = if toast.success {
+                    "Export complete".to_string()
+                } else {
+                    "Export failed".to_string()
+                };
+                (kind, title, toast.message)
+            })
+            .collect()
+    }
+
     /// Discover local browser profiles on a dedicated thread. Filesystem scans
     /// never run on the winit loop or a CEF callback thread.
     fn detect_browser_profiles(&self) {
@@ -4622,6 +4669,109 @@ impl TabManager {
             });
         if let Err(error) = spawned {
             tracing::warn!("Could not start browser profile discovery: {error}");
+        }
+    }
+
+    /// Write portable export files on a background thread. Bookmarks and the
+    /// full history snapshot come from SQLite workers; winit and CEF never wait
+    /// on the filesystem or a large query.
+    fn export_browser_data(&self, want_bookmarks: bool, want_history: bool) {
+        let sender = self.event_sender.clone();
+        if !want_bookmarks && !want_history {
+            let _ = sender.send(BrowserEvent::BrowserDataExported {
+                files: Vec::new(),
+                errors: vec!["Choose bookmarks, history, or both".to_string()],
+            });
+            return;
+        }
+        if Self::is_private_workspace(self.active_workspace_id) {
+            let _ = sender.send(BrowserEvent::BrowserDataExported {
+                files: Vec::new(),
+                errors: vec!["Export is unavailable in a private space".to_string()],
+            });
+            return;
+        }
+
+        let configured = self.download_preferences.download_directory();
+        let directory = if configured.trim().is_empty() {
+            default_download_directory()
+        } else {
+            PathBuf::from(configured)
+        };
+        let storage = self.storage.clone();
+        let fallback_bookmarks = self.bookmarks.clone();
+        let fallback_history = self.history.clone();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+
+        let worker_sender = sender.clone();
+        let spawned = std::thread::Builder::new()
+            .name("browser-data-export".to_string())
+            .spawn(move || {
+                let mut bookmarks_data = None;
+                let mut history_data = None;
+
+                if let Some(storage) = storage {
+                    if want_bookmarks {
+                        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+                        storage.request_bookmarks(reply_tx);
+                        bookmarks_data = Some(
+                            reply_rx
+                                .recv_timeout(Duration::from_secs(30))
+                                .unwrap_or_else(|error| {
+                                    tracing::warn!("Could not load bookmarks for export: {error}");
+                                    fallback_bookmarks.clone()
+                                }),
+                        );
+                    }
+                    if want_history {
+                        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+                        storage.request_all_history(reply_tx);
+                        history_data = Some(
+                            reply_rx
+                                .recv_timeout(Duration::from_secs(30))
+                                .unwrap_or_else(|error| {
+                                    tracing::warn!("Could not load history for export: {error}");
+                                    fallback_history.clone()
+                                }),
+                        );
+                    }
+                } else {
+                    if want_bookmarks {
+                        bookmarks_data = Some(fallback_bookmarks);
+                    }
+                    if want_history {
+                        history_data = Some(fallback_history);
+                    }
+                }
+
+                let result = export_data(
+                    &directory,
+                    stamp,
+                    bookmarks_data.as_deref(),
+                    history_data.as_deref(),
+                );
+                if !result.success() {
+                    tracing::warn!("Browser data export did not write every requested file");
+                }
+                let files = result
+                    .files
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect();
+                let _ = worker_sender.send(BrowserEvent::BrowserDataExported {
+                    files,
+                    errors: result.errors,
+                });
+            });
+        if let Err(error) = spawned {
+            tracing::warn!("Could not start browser data export: {error}");
+            let _ = sender.send(BrowserEvent::BrowserDataExported {
+                files: Vec::new(),
+                errors: vec![format!("Could not start export: {error}")],
+            });
         }
     }
 
@@ -5080,6 +5230,9 @@ impl TabManager {
                 history,
             } => self.start_browser_import(profile, bookmarks, history),
             UiAction::CancelBrowserImport => self.cancel_browser_import(),
+            UiAction::ExportBrowserData { bookmarks, history } => {
+                self.export_browser_data(bookmarks, history);
+            }
             UiAction::ResolveMediaAccessPermission {
                 request_id,
                 granted,

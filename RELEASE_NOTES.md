@@ -4,7 +4,29 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
-## v0.16.0 — Unreleased
+## v0.17.0 — Unreleased
+
+### Added
+
+- Portable bookmark and history export from the Import / Export page and command palette. Bookmarks are written as Netscape bookmark HTML for Chrome, Edge, Firefox, and Safari import; history is written as CSV with Unix epoch and ISO-8601 UTC timestamps because browsers do not share a history import format.
+- Export files are written to the configured download folder by a background worker, with SQLite reads off the UI and CEF threads and a native success/failure toast. Private spaces refuse exports.
+- Regression tests for bookmark HTML nesting and escaping, CSV quoting and UTC conversion, requested-file selection, palette export actions, and command dispatch.
+
+### Changed
+
+- The Settings Import page is now Import / Export and includes export format guidance.
+- Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.16.0` to `0.17.0`.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bins` — 263 browser tests plus 4 bundle tests
+- `cargo build --release`
+
+---
+
+## v0.16.0 — 2026-11-27
 
 ### Added
 

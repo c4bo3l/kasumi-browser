@@ -679,6 +679,11 @@ pub enum BrowserEvent {
     BrowserImportFinished {
         report: ImportReport,
     },
+    /// Export files written by the background export worker.
+    BrowserDataExported {
+        files: Vec<String>,
+        errors: Vec<String>,
+    },
     /// Fresh bookmark snapshot read on the SQLite worker after a bulk import.
     BookmarksReloaded {
         bookmarks: Vec<crate::storage::db::BookmarkItem>,
@@ -977,6 +982,11 @@ impl std::fmt::Debug for BrowserEvent {
                 .debug_struct("BrowserImportFinished")
                 .field("report", report)
                 .finish(),
+            Self::BrowserDataExported { files, errors } => f
+                .debug_struct("BrowserDataExported")
+                .field("files", files)
+                .field("errors", errors)
+                .finish(),
             Self::BookmarksReloaded { bookmarks } => f
                 .debug_struct("BookmarksReloaded")
                 .field("bookmarks", bookmarks)
@@ -1166,6 +1176,12 @@ pub enum UiAction {
     /// Cooperatively cancel the active browser import. Parsing and SQLite
     /// writes check the shared flag before applying any partial batch.
     CancelBrowserImport,
+    /// Write portable bookmark/history export files into the download folder.
+    /// All SQLite reads and disk writes happen on a background thread.
+    ExportBrowserData {
+        bookmarks: bool,
+        history: bool,
+    },
     /// Resolve a native media-access prompt. `TabManager` owns the one-shot CEF
     /// callback; this action carries only its request id so UI state stays Clone.
     /// `persist` is false for Escape/click-outside dismissal so a transient
