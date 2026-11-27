@@ -29,13 +29,14 @@ use egui_wgpu::ScreenDescriptor;
 use crate::config::{
     rail_width, BrowserPreferences, SearchEngine, ThemePreference, Workspace, WorkspaceColor,
     WorkspaceIcon, WorkspaceStartupBehavior, COMMAND_PALETTE_TOP_OFFSET, COMMAND_PALETTE_WIDTH,
-    DEFAULT_SEARCH_URL_PREFIX, MAX_IDLE_TIMEOUT_MINUTES, MIN_IDLE_TIMEOUT_MINUTES, PAGE_HUD_HEIGHT,
-    PAGE_HUD_MARGIN,
+    DEFAULT_SEARCH_URL_PREFIX, HISTORY_VISIBLE_PAGE_SIZE, MAX_IDLE_TIMEOUT_MINUTES,
+    MIN_IDLE_TIMEOUT_MINUTES, PAGE_HUD_HEIGHT, PAGE_HUD_MARGIN,
 };
 use crate::events::{
     DownloadEngine, DownloadInfo, DownloadNotification, DownloadNotificationKind, DownloadState,
     FindOptions, FindSnippet, PrintOptions, PrintPaperSize, UiAction, WebNotification,
 };
+use crate::storage::db::HistoryItem;
 use crate::storage::import::{BrowserProfile, BrowserSource, ImportReport};
 
 /// Light or dark chrome appearance. The OS theme decides the default, and
@@ -671,6 +672,7 @@ pub enum CommandAction {
     OpenSettings,
     OpenBrowserImport,
     OpenDownloads,
+    OpenHistory,
     BookmarkActiveTab,
     OpenBookmarkManager,
 }
@@ -831,6 +833,17 @@ pub struct ChromeState {
     pub workspaces: Vec<WorkspaceInfo>,
     pub active_workspace_id: u64,
     pub bookmarks: Vec<BookmarkInfo>,
+    /// Recent visited pages mirrored from SQLite for the native history manager.
+    pub history: Vec<HistoryItem>,
+    /// True while the standalone history manager owns the shared overlay.
+    pub history_open: bool,
+    /// In-memory filter applied to `history` by the native manager.
+    pub history_query: String,
+    /// Number of matching rows currently laid out; additional rows are shown
+    /// in pages so a large snapshot never blocks the winit frame loop.
+    pub history_visible_count: usize,
+    /// Second-click guard for the destructive Clear history action.
+    pub history_clear_confirm: bool,
     /// Native bookmark manager search and single-row editor drafts.
     pub bookmark_search_query: String,
     pub selected_bookmark_key: Option<(u64, String)>,
@@ -982,6 +995,11 @@ impl Default for ChromeState {
             workspaces: Vec::new(),
             active_workspace_id: 1,
             bookmarks: Vec::new(),
+            history: Vec::new(),
+            history_open: false,
+            history_query: String::new(),
+            history_visible_count: HISTORY_VISIBLE_PAGE_SIZE,
+            history_clear_confirm: false,
             bookmark_search_query: String::new(),
             selected_bookmark_key: None,
             bookmark_title_draft: String::new(),
@@ -1253,6 +1271,7 @@ impl ChromeState {
             || self.menu.is_some()
             || self.settings_open
             || self.bookmark_manager_open
+            || self.history_open
             || self.downloads_open
     }
 
@@ -1279,6 +1298,7 @@ impl ChromeState {
         self.close_tab_menu();
         self.settings_open = false;
         self.bookmark_manager_open = false;
+        self.history_open = false;
         self.downloads_open = false;
     }
 
@@ -1341,6 +1361,7 @@ impl ChromeState {
         self.close_tab_menu();
         self.settings_open = false;
         self.bookmark_manager_open = false;
+        self.history_open = false;
         self.downloads_open = false;
     }
 
@@ -1382,6 +1403,7 @@ impl ChromeState {
         self.menu_selection = 0;
         self.tooltip = None;
         self.settings_open = false;
+        self.history_open = false;
         self.downloads_open = false;
     }
 
@@ -1447,6 +1469,7 @@ impl ChromeState {
         self.tooltip = None;
         self.settings_open = false;
         self.bookmark_manager_open = false;
+        self.history_open = false;
         self.downloads_open = true;
     }
 
@@ -1520,6 +1543,7 @@ impl ChromeState {
         self.close_tab_menu();
         self.tooltip = None;
         self.bookmark_manager_open = false;
+        self.history_open = false;
         self.downloads_open = false;
         self.settings_tab = tab;
         self.settings_draft = self.preferences.clone();
@@ -1581,6 +1605,7 @@ impl ChromeState {
         self.close_tab_menu();
         self.tooltip = None;
         self.settings_open = false;
+        self.history_open = false;
         self.downloads_open = false;
         self.reset_bookmark_editor();
         self.bookmark_manager_open = true;
@@ -1591,12 +1616,60 @@ impl ChromeState {
         self.reset_bookmark_editor();
     }
 
+    /// Open the standalone history manager on the shared native overlay.
+    pub fn open_history(&mut self) {
+        self.history_clear_confirm = false;
+        self.history_visible_count = HISTORY_VISIBLE_PAGE_SIZE;
+        self.dismiss_find_for_overlay();
+        self.command_palette_open = false;
+        self.command_palette_query.clear();
+        self.command_selection = 0;
+        self.command_palette_focus_requested = false;
+        self.command_palette_select_all_requested = false;
+        self.close_tab_menu();
+        self.tooltip = None;
+        self.settings_open = false;
+        self.bookmark_manager_open = false;
+        self.downloads_open = false;
+        self.history_open = true;
+    }
+
+    pub fn toggle_history(&mut self) {
+        if self.history_open {
+            self.close_history();
+        } else {
+            self.open_history();
+        }
+    }
+
+    pub fn close_history(&mut self) {
+        self.history_open = false;
+        self.history_query.clear();
+        self.history_visible_count = HISTORY_VISIBLE_PAGE_SIZE;
+        self.history_clear_confirm = false;
+        self.tooltip = None;
+    }
+
+    pub fn set_history(&mut self, items: Vec<HistoryItem>) {
+        self.history = items;
+        self.history_visible_count = HISTORY_VISIBLE_PAGE_SIZE;
+    }
+
+    /// Reveal one additional page of history rows from the in-memory snapshot.
+    pub fn show_more_history(&mut self) {
+        self.history_visible_count = self
+            .history_visible_count
+            .saturating_add(HISTORY_VISIBLE_PAGE_SIZE);
+    }
+
     /// Close whichever shared overlay is currently visible.
     pub fn close_active_overlay(&mut self) {
         if self.settings_open {
             self.close_settings();
         } else if self.bookmark_manager_open {
             self.close_bookmark_manager();
+        } else if self.history_open {
+            self.close_history();
         } else if self.menu.is_some() {
             self.close_tab_menu();
         } else if self.command_palette_open {
@@ -3426,7 +3499,7 @@ impl ChromeRenderer {
         if active_bookmark_key(state).is_some() {
             for item in &mut items {
                 if item.action == CommandAction::BookmarkActiveTab {
-                    item.icon = "☆";
+                    item.icon = egui_material_icons::icons::ICON_BOOKMARK_REMOVE.into();
                     item.label = "Remove bookmark".to_string();
                     item.subtitle = "Remove the active page from its workspace folder".to_string();
                 }
@@ -3522,7 +3595,11 @@ impl ChromeRenderer {
                                 ui.scope_builder(UiBuilder::new().max_rect(row_rect), |ui| {
                                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                         ui.add_space(8.0);
-                                        ui.label(RichText::new(item.icon).size(14.0));
+                                        ui.label(
+                                            RichText::new(item.icon)
+                                                .font(FontId::new(16.0, FontFamily::Proportional))
+                                                .color(palette.text_strong),
+                                        );
                                         ui.add_space(4.0);
                                         ui.label(
                                             RichText::new(&item.label)
@@ -5907,6 +5984,223 @@ impl ChromeRenderer {
         }
     }
 
+    /// Draw the dedicated history manager dialog in the shared native overlay.
+    /// Searching and row actions stay in memory; SQLite work is queued through
+    /// `UiAction`s so neither winit nor CEF ever blocks on disk.
+    pub fn build_history(
+        ctx: &egui::Context,
+        state: &mut ChromeState,
+        actions: &mut Vec<UiAction>,
+    ) {
+        if !state.history_open {
+            return;
+        }
+
+        // Borrow the snapshot instead of cloning every row each frame. Egui
+        // only needs the rows we actually lay out, so filtering produces
+        // indices and pagination caps widget construction at a small page.
+        let history = &state.history;
+        let mut query = state.history_query.clone();
+        let query_before = query.clone();
+        let mut visible_count = state.history_visible_count.max(HISTORY_VISIBLE_PAGE_SIZE);
+        let mut show_more_clicked = false;
+        let mut clear_confirm = state.history_clear_confirm;
+        let now = crate::storage::db::now_epoch_secs();
+        let palette = state.palette();
+        let screen = ctx.viewport_rect();
+        let width = SETTINGS_WIDTH.min((screen.width() - 24.0).max(280.0));
+        let content_height = SETTINGS_MAX_CONTENT_HEIGHT.min((screen.height() - 120.0).max(160.0));
+        let mut card_rect = egui::Rect::from_min_size(screen.center(), vec2(width, 0.0));
+        let mut done_clicked = false;
+        let mut clear_clicked = false;
+        let mut opened_url = None;
+        let mut deleted_urls = Vec::new();
+        let requested_close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+
+        egui::Area::new(egui::Id::new("kasumi_history_manager"))
+            .order(Order::Foreground)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .fixed_pos(screen.center())
+            .movable(false)
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                card_rect = Frame::NONE
+                    .fill(palette.palette_bg)
+                    .stroke(Stroke::new(1.0_f32, palette.palette_border))
+                    .corner_radius(CornerRadius::same(12))
+                    .inner_margin(egui::Margin::symmetric(20, 18))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("History")
+                                    .size(16.0)
+                                    .strong()
+                                    .color(palette.text_strong),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                done_clicked = material_button(
+                                    ui,
+                                    RailIcon::Check,
+                                    "Done",
+                                    MaterialButtonStyle::Tonal,
+                                    &palette,
+                                    true,
+                                )
+                                .clicked();
+                            });
+                        });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        ui.add_sized(
+                            [width - 40.0, 28.0],
+                            egui::TextEdit::singleline(&mut query)
+                                .hint_text("Search titles and URLs")
+                                .font(FontId::new(12.0, FontFamily::Proportional)),
+                        );
+                        ui.add_space(8.0);
+
+                        if query != query_before {
+                            visible_count = HISTORY_VISIBLE_PAGE_SIZE;
+                        }
+                        let matches = filter_history_indices(history, &query);
+                        let total_matches = matches.len();
+                        let shown = visible_count.min(total_matches);
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("kasumi_history_manager_contents")
+                            .max_height(content_height)
+                            .show(ui, |ui| {
+                                if matches.is_empty() {
+                                    ui.label(
+                                        RichText::new(if history.is_empty() {
+                                            "No visited pages loaded yet."
+                                        } else {
+                                            "No history entries match this search."
+                                        })
+                                        .color(palette.palette_subtext),
+                                    );
+                                    return;
+                                }
+                                for &index in matches.iter().take(visible_count) {
+                                    let item = &history[index];
+                                    ui.vertical(|ui| {
+                                        ui.horizontal(|ui| {
+                                            let title = if item.title.trim().is_empty() {
+                                                item.url.clone()
+                                            } else {
+                                                item.title.clone()
+                                            };
+                                            ui.label(
+                                                RichText::new(truncate_title(&title, 64))
+                                                    .size(12.0)
+                                                    .color(palette.text_strong),
+                                            );
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if ui.button("Delete").clicked() {
+                                                        deleted_urls.push(item.url.clone());
+                                                    }
+                                                    if ui.button("Open").clicked() {
+                                                        opened_url = Some(item.url.clone());
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.label(
+                                            RichText::new(truncate_title(&item.url, 78))
+                                                .size(10.0)
+                                                .color(palette.palette_subtext),
+                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "{} visit{} · {}",
+                                                    item.visit_count,
+                                                    if item.visit_count == 1 { "" } else { "s" },
+                                                    format_history_time(item.last_visited, now)
+                                                ))
+                                                .size(10.0)
+                                                .color(palette.palette_hint),
+                                            );
+                                        });
+                                    });
+                                    ui.separator();
+                                }
+                            });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("Showing {shown} of {total_matches}"))
+                                    .size(10.0)
+                                    .color(palette.palette_hint),
+                            );
+                            if total_matches > visible_count && ui.button("Show more").clicked() {
+                                show_more_clicked = true;
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button(if clear_confirm {
+                                    "Confirm clear all history"
+                                } else {
+                                    "Clear all history"
+                                })
+                                .clicked()
+                            {
+                                if clear_confirm {
+                                    clear_clicked = true;
+                                    clear_confirm = false;
+                                } else {
+                                    clear_confirm = true;
+                                }
+                            }
+                            if clear_confirm {
+                                ui.label(
+                                    RichText::new("Click again to remove every visited page.")
+                                        .size(10.0)
+                                        .color(palette.palette_subtext),
+                                );
+                            }
+                        });
+                    })
+                    .response
+                    .rect
+                    .expand(8.0);
+            });
+
+        let outside_click = ctx.input(|i| {
+            command_palette_click_outside(
+                card_rect,
+                i.pointer.latest_pos(),
+                i.pointer.primary_clicked(),
+            )
+        });
+
+        if show_more_clicked {
+            visible_count = visible_count.saturating_add(HISTORY_VISIBLE_PAGE_SIZE);
+        }
+        state.history_query = query;
+        state.history_visible_count = visible_count;
+        state.history_clear_confirm = clear_confirm;
+
+        if let Some(url) = opened_url {
+            actions.push(UiAction::OpenHistoryUrl { url });
+            state.close_history();
+        }
+        for url in deleted_urls {
+            actions.push(UiAction::DeleteHistory { url });
+        }
+        if clear_clicked {
+            actions.push(UiAction::ClearHistory);
+        }
+        if requested_close || done_clicked || outside_click {
+            state.close_history();
+        }
+    }
+
     /// Record a tooltip for the hovered rail row. It is painted later by a
     /// transparent overlay window so it appears above the native CEF view.
     fn chrome_tooltip(
@@ -6491,15 +6785,22 @@ impl ChromeOverlayRenderer {
         let settings_open = state.settings_open && !modal_open && !find_open;
         let bookmark_manager_open =
             state.bookmark_manager_open && !settings_open && !modal_open && !find_open;
+        let history_open = state.history_open
+            && !settings_open
+            && !bookmark_manager_open
+            && !modal_open
+            && !find_open;
         let menu_open = state.menu.is_some()
             && !settings_open
             && !bookmark_manager_open
+            && !history_open
             && !modal_open
             && !find_open;
         let palette_open = state.command_palette_open
             && !menu_open
             && !settings_open
             && !bookmark_manager_open
+            && !history_open
             && !modal_open
             && !find_open;
         let downloads_open = state.downloads_open
@@ -6507,10 +6808,12 @@ impl ChromeOverlayRenderer {
             && !menu_open
             && !settings_open
             && !bookmark_manager_open
+            && !history_open
             && !modal_open;
         let toast_open = state.toast.is_some()
             && !settings_open
             && !bookmark_manager_open
+            && !history_open
             && !menu_open
             && !palette_open
             && !find_open
@@ -6550,6 +6853,8 @@ impl ChromeOverlayRenderer {
                 ChromeRenderer::build_settings(&ctx, state, &mut actions);
             } else if bookmark_manager_open {
                 ChromeRenderer::build_bookmark_manager(&ctx, state, &mut actions);
+            } else if history_open {
+                ChromeRenderer::build_history(&ctx, state, &mut actions);
             } else if menu_open {
                 ChromeRenderer::build_tab_menu(&ctx, state, &mut actions);
             } else if palette_open {
@@ -8251,18 +8556,24 @@ pub fn command_palette_items(
     active_tab_id: Option<u64>,
     preferences: &BrowserPreferences,
 ) -> Vec<CommandPaletteItem> {
+    use egui_material_icons::icons::{
+        ICON_ADD, ICON_BEDTIME, ICON_BOOKMARK_ADD, ICON_BOOKMARK_MANAGER, ICON_DOWNLOAD,
+        ICON_HISTORY, ICON_OPEN_IN_NEW, ICON_PRINT, ICON_PUSH_PIN, ICON_SETTINGS, ICON_TAB,
+        ICON_TERMINAL, ICON_UPLOAD, ICON_VIEW_SIDEBAR, ICON_VISIBILITY_OFF,
+    };
+
     let trimmed = query.trim();
     let mut items = Vec::new();
 
     let tab_item = |tab: &TabInfo| CommandPaletteItem {
         icon: if Workspace::is_private_id(tab.workspace_id) {
-            "🕶"
+            ICON_VISIBILITY_OFF.into()
         } else if tab.is_pinned {
-            "📌"
+            ICON_PUSH_PIN.into()
         } else if tab.display_state == TabDisplayState::Hibernated {
-            "💤"
+            ICON_BEDTIME.into()
         } else {
-            "◧"
+            ICON_TAB.into()
         },
         label: if tab.title.is_empty() {
             "New Tab".to_string()
@@ -8280,7 +8591,7 @@ pub fn command_palette_items(
                 .find(|tab| tab.id == tab_id)
                 .is_some_and(|tab| tab.is_pinned);
             CommandPaletteItem {
-                icon: "📌",
+                icon: ICON_PUSH_PIN.into(),
                 label: if is_pinned {
                     "Unpin active tab"
                 } else {
@@ -8295,28 +8606,34 @@ pub fn command_palette_items(
 
     let bookmark_item = || {
         active_tab_id.map(|_| CommandPaletteItem {
-            icon: "★",
+            icon: ICON_BOOKMARK_ADD.into(),
             label: "Bookmark this page".to_string(),
             subtitle: "Save or remove the active page bookmark".to_string(),
             action: CommandAction::BookmarkActiveTab,
         })
     };
     let bookmark_manager_item = || CommandPaletteItem {
-        icon: "☆",
+        icon: ICON_BOOKMARK_MANAGER.into(),
         label: "Open bookmark manager (Cmd/Ctrl+Shift+B)".to_string(),
         subtitle: "Search, edit, move, and delete saved pages".to_string(),
         action: CommandAction::OpenBookmarkManager,
     };
     let browser_import_item = || CommandPaletteItem {
-        icon: "⇪",
+        icon: ICON_UPLOAD.into(),
         label: "Import browser data".to_string(),
         subtitle: "Bring bookmarks and history from Chrome, Edge, Firefox, or Safari".to_string(),
         action: CommandAction::OpenBrowserImport,
     };
+    let history_item = || CommandPaletteItem {
+        icon: ICON_HISTORY.into(),
+        label: "Open history manager (Cmd/Ctrl+Y)".to_string(),
+        subtitle: "Search, reopen, and remove visited pages".to_string(),
+        action: CommandAction::OpenHistory,
+    };
 
     if trimmed.is_empty() {
         items.push(CommandPaletteItem {
-            icon: "＋",
+            icon: ICON_ADD.into(),
             label: "New tab".to_string(),
             subtitle: "Open a fresh tab".to_string(),
             action: CommandAction::NewTab(None),
@@ -8325,33 +8642,34 @@ pub fn command_palette_items(
             items.push(item);
         }
         items.push(CommandPaletteItem {
-            icon: "💤",
+            icon: ICON_BEDTIME.into(),
             label: "Hibernate all background tabs".to_string(),
             subtitle: "Immediately close background browser views".to_string(),
             action: CommandAction::HibernateAll,
         });
         items.push(CommandPaletteItem {
-            icon: "▤",
+            icon: ICON_VIEW_SIDEBAR.into(),
             label: "Toggle workspace rail".to_string(),
             subtitle: "Expand or collapse the left rail".to_string(),
             action: CommandAction::ToggleRail,
         });
         items.push(CommandPaletteItem {
-            icon: "⚙",
+            icon: ICON_SETTINGS.into(),
             label: "Open Settings".to_string(),
             subtitle: "Theme, search, privacy, and performance".to_string(),
             action: CommandAction::OpenSettings,
         });
         items.push(browser_import_item());
         items.push(CommandPaletteItem {
-            icon: "⇩",
+            icon: ICON_DOWNLOAD.into(),
             label: "Open Downloads".to_string(),
             subtitle: "Native parallel downloads and history".to_string(),
             action: CommandAction::OpenDownloads,
         });
+        items.push(history_item());
         if active_tab_id.is_some() {
             items.push(CommandPaletteItem {
-                icon: "⎙",
+                icon: ICON_PRINT.into(),
                 label: "Print active page (Cmd/Ctrl+P)".to_string(),
                 subtitle: "Open the native print dialog".to_string(),
                 action: CommandAction::Print,
@@ -8363,7 +8681,7 @@ pub fn command_palette_items(
         }
         items.push(bookmark_manager_item());
         items.push(CommandPaletteItem {
-            icon: "🕶",
+            icon: ICON_VISIBILITY_OFF.into(),
             label: "New Incognito Window (Cmd/Ctrl+Shift+N)".to_string(),
             subtitle: "Private space with no history, cookies, or session writes".to_string(),
             action: CommandAction::NewPrivateWindow,
@@ -8382,7 +8700,7 @@ pub fn command_palette_items(
     // and the new-tab variant must be visible without scrolling past matches.
     if let Some(tab_id) = active_tab_id {
         items.push(CommandPaletteItem {
-            icon: "↗",
+            icon: ICON_OPEN_IN_NEW.into(),
             label: if looks_like_address {
                 "Open in this tab".to_string()
             } else {
@@ -8396,7 +8714,7 @@ pub fn command_palette_items(
         });
     }
     items.push(CommandPaletteItem {
-        icon: "＋",
+        icon: ICON_ADD.into(),
         label: if looks_like_address {
             "Open in a new tab".to_string()
         } else {
@@ -8418,7 +8736,7 @@ pub fn command_palette_items(
     if needle.contains("devtool") {
         if let Some(tab_id) = active_tab_id {
             items.push(CommandPaletteItem {
-                icon: "⌘",
+                icon: ICON_TERMINAL.into(),
                 label: "Open DevTools".to_string(),
                 subtitle: "Inspect the active tab in a new window".to_string(),
                 action: CommandAction::OpenDevTools,
@@ -8429,7 +8747,7 @@ pub fn command_palette_items(
 
     if needle.contains("print") && active_tab_id.is_some() {
         items.push(CommandPaletteItem {
-            icon: "⎙",
+            icon: ICON_PRINT.into(),
             label: "Print active page".to_string(),
             subtitle: "Open the native print dialog".to_string(),
             action: CommandAction::Print,
@@ -8438,7 +8756,7 @@ pub fn command_palette_items(
 
     if needle.contains("setting") || needle.contains("preference") {
         items.push(CommandPaletteItem {
-            icon: "⚙",
+            icon: ICON_SETTINGS.into(),
             label: "Open Settings".to_string(),
             subtitle: "Theme, search, privacy, and performance".to_string(),
             action: CommandAction::OpenSettings,
@@ -8451,11 +8769,15 @@ pub fn command_palette_items(
 
     if needle.contains("download") {
         items.push(CommandPaletteItem {
-            icon: "⇩",
+            icon: ICON_DOWNLOAD.into(),
             label: "Open Downloads".to_string(),
             subtitle: "Native parallel downloads and history".to_string(),
             action: CommandAction::OpenDownloads,
         });
+    }
+
+    if needle.contains("history") {
+        items.push(history_item());
     }
 
     if needle.contains("bookmark") || needle.contains("save page") {
@@ -8473,7 +8795,7 @@ pub fn command_palette_items(
 
     if needle.contains("incognito") || needle.contains("private") {
         items.push(CommandPaletteItem {
-            icon: "🕶",
+            icon: ICON_VISIBILITY_OFF.into(),
             label: "New Incognito Window (Cmd/Ctrl+Shift+N)".to_string(),
             subtitle: "Private space with no history, cookies, or session writes".to_string(),
             action: CommandAction::NewPrivateWindow,
@@ -8514,6 +8836,7 @@ fn apply_command_item(
         CommandAction::OpenSettings => state.open_settings(),
         CommandAction::OpenBrowserImport => state.open_browser_import(),
         CommandAction::OpenDownloads => state.open_downloads(),
+        CommandAction::OpenHistory => actions.push(UiAction::OpenHistory),
         CommandAction::OpenBookmarkManager => state.open_bookmark_manager(),
         CommandAction::BookmarkActiveTab => {
             if active_tab_is_private(state) {
@@ -8612,6 +8935,66 @@ pub fn filter_bookmarks(bookmarks: &[BookmarkInfo], query: &str) -> Vec<Bookmark
         .collect()
 }
 
+fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.as_bytes().windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle.as_bytes())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
+/// Return matching indices without cloning history rows. The native manager
+/// uses this to lay out only the visible page of a large snapshot.
+pub fn filter_history_indices(history: &[HistoryItem], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return (0..history.len()).collect();
+    }
+    history
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            if needle.is_ascii() {
+                contains_ascii_case_insensitive(&item.title, &needle)
+                    || contains_ascii_case_insensitive(&item.url, &needle)
+            } else {
+                item.title.to_lowercase().contains(&needle)
+                    || item.url.to_lowercase().contains(&needle)
+            }
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Filter history entries by title or URL without changing recency order.
+pub fn filter_history(history: &[HistoryItem], query: &str) -> Vec<HistoryItem> {
+    filter_history_indices(history, query)
+        .into_iter()
+        .map(|index| history[index].clone())
+        .collect()
+}
+
+/// Compact relative timestamp used by the native history manager. `now` is
+/// passed in so the formatting is deterministic in unit tests.
+pub fn format_history_time(last_visited: u64, now: u64) -> String {
+    let elapsed = now.saturating_sub(last_visited);
+    if elapsed < 60 {
+        "just now".to_string()
+    } else if elapsed < 3_600 {
+        format!("{}m ago", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("{}h ago", elapsed / 3_600)
+    } else if elapsed < 172_800 {
+        "yesterday".to_string()
+    } else {
+        format!("{}d ago", elapsed / 86_400)
+    }
+}
+
 /// Normalize a bookmark URL without silently turning plain text into a search.
 pub fn normalize_bookmark_url(input: &str) -> Option<String> {
     let trimmed = input.trim();
@@ -8672,6 +9055,7 @@ pub fn resolve_omnibox_with_search(input: &str, search_url_prefix: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use egui::{pos2, vec2, Color32};
+    use egui_material_icons::icons::ICON_VISIBILITY_OFF;
     use std::path::PathBuf;
 
     use super::{
@@ -8679,15 +9063,16 @@ mod tests {
         bottom_hud_tooltip_anchor, clamp_command_selection, command_palette_click_outside,
         command_palette_items, download_engine_label, download_eta_label, download_rail_badge,
         download_row_uses_progress_bar, download_state_label, downloads_bubble_anchor,
-        downloads_bubble_size, effective_theme, filter_bookmarks, find_bar_geometry,
-        focus_request_after_render, format_download_bytes, loading_spinner_angle,
-        loading_spinner_point, normalize_bookmark_url, page_tooltip_anchor, palette_row_fill,
-        preferred_surface_format, rail_menu_anchor, rail_menu_click_outside, rail_menu_items,
-        rail_menu_metrics, rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled,
-        rail_tooltip_metrics, register_material_icon_font, resolve_omnibox,
-        resolve_omnibox_with_search, tab_close_center, tab_status_center, tooltip_size_for_text,
-        truncate_title, workspace_form_actions, BookmarkInfo, ChromePalette, ChromeRenderer,
-        ChromeState, ChromeTheme, CommandAction, DownloadBadge, DownloadSummary, PermissionPrompt,
+        downloads_bubble_size, effective_theme, filter_bookmarks, filter_history,
+        filter_history_indices, find_bar_geometry, focus_request_after_render,
+        format_download_bytes, format_history_time, loading_spinner_angle, loading_spinner_point,
+        normalize_bookmark_url, page_tooltip_anchor, palette_row_fill, preferred_surface_format,
+        rail_menu_anchor, rail_menu_click_outside, rail_menu_items, rail_menu_metrics,
+        rail_menu_ui_action, rail_status_icon_size, rail_tooltip_enabled, rail_tooltip_metrics,
+        register_material_icon_font, resolve_omnibox, resolve_omnibox_with_search,
+        tab_close_center, tab_status_center, tooltip_size_for_text, truncate_title,
+        workspace_form_actions, BookmarkInfo, ChromePalette, ChromeRenderer, ChromeState,
+        ChromeTheme, CommandAction, DownloadBadge, DownloadSummary, PermissionPrompt,
         PermissionPromptKind, PrintDialogState, RailMenuAction, SettingsTab, TabDisplayState,
         TabInfo, ToastKind, WorkspaceInfo, RAIL_STATUS_HEIGHT, RAIL_STATUS_ICON_COLLAPSED,
         RAIL_STATUS_ICON_EXPANDED, TOOLTIP_HEIGHT_COLLAPSED, TOOLTIP_HEIGHT_EXPANDED,
@@ -8695,13 +9080,14 @@ mod tests {
     };
     use crate::config::{
         BrowserPreferences, SearchEngine, ThemePreference, Workspace, WorkspaceColor,
-        WorkspaceIcon, DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX, RAIL_WIDTH_COLLAPSED,
-        RAIL_WIDTH_EXPANDED,
+        WorkspaceIcon, DEFAULT_HOME_URL, DEFAULT_SEARCH_URL_PREFIX, HISTORY_VISIBLE_PAGE_SIZE,
+        RAIL_WIDTH_COLLAPSED, RAIL_WIDTH_EXPANDED,
     };
     use crate::events::{
         DownloadEngine, DownloadInfo, DownloadNotification, DownloadNotificationKind,
         DownloadState, PrintOptions, PrintPaperSize, UiAction, WebNotification,
     };
+    use crate::storage::db::HistoryItem;
     use crate::storage::import::{BrowserProfile, BrowserSource, ImportReport};
 
     fn tab(id: u64, title: &str, url: &str) -> TabInfo {
@@ -9537,11 +9923,12 @@ mod tests {
         assert_eq!(items[4].action, CommandAction::OpenSettings);
         assert_eq!(items[5].action, CommandAction::OpenBrowserImport);
         assert_eq!(items[6].action, CommandAction::OpenDownloads);
-        assert_eq!(items[7].action, CommandAction::Print);
-        assert_eq!(items[8].action, CommandAction::SelectTab(1));
-        assert_eq!(items[9].action, CommandAction::BookmarkActiveTab);
-        assert_eq!(items[10].action, CommandAction::OpenBookmarkManager);
-        assert_eq!(items[11].action, CommandAction::NewPrivateWindow);
+        assert_eq!(items[7].action, CommandAction::OpenHistory);
+        assert_eq!(items[8].action, CommandAction::Print);
+        assert_eq!(items[9].action, CommandAction::SelectTab(1));
+        assert_eq!(items[10].action, CommandAction::BookmarkActiveTab);
+        assert_eq!(items[11].action, CommandAction::OpenBookmarkManager);
+        assert_eq!(items[12].action, CommandAction::NewPrivateWindow);
     }
 
     #[test]
@@ -9556,9 +9943,10 @@ mod tests {
         private.workspace_id = Workspace::PRIVATE_ID;
         private.workspace_name = Workspace::PRIVATE_NAME.to_string();
         let items = command_palette_items("secret", &[private], None, &prefs);
-        assert!(items
-            .iter()
-            .any(|item| { item.icon == "🕶" && item.action == CommandAction::SelectTab(4) }));
+        assert!(items.iter().any(|item| {
+            item.icon == String::from(ICON_VISIBILITY_OFF)
+                && item.action == CommandAction::SelectTab(4)
+        }));
     }
 
     #[test]
@@ -9567,6 +9955,109 @@ mod tests {
         assert!(items
             .iter()
             .any(|item| item.action == CommandAction::OpenDownloads));
+    }
+
+    #[test]
+    fn palette_icons_are_registered_material_glyphs() {
+        let prefs = BrowserPreferences::default();
+        let mut private = tab(9, "Secret", "https://secret.example");
+        private.workspace_id = Workspace::PRIVATE_ID;
+        let tabs = vec![tab(1, "Docs", "https://docs.example"), private];
+
+        for query in ["", "private", "bookmark", "download", "history", "settings"] {
+            let items = command_palette_items(query, &tabs, Some(1), &prefs);
+            assert!(!items.is_empty(), "no palette rows for {query:?}");
+            for item in items {
+                let is_material_glyph = item.icon.chars().count() == 1
+                    && item.icon.chars().all(|glyph| {
+                        matches!(
+                            glyph,
+                            '\u{E000}'..='\u{F8FF}'
+                                | '\u{F0000}'..='\u{FFFFD}'
+                                | '\u{100000}'..='\u{10FFFD}'
+                        )
+                    });
+                assert!(
+                    is_material_glyph,
+                    "palette icon {:?} for {:?} is not a Material Symbols glyph",
+                    item.icon, item.label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn palette_finds_the_history_manager() {
+        let items = command_palette_items("history", &[], None, &BrowserPreferences::default());
+        assert!(items
+            .iter()
+            .any(|item| item.action == CommandAction::OpenHistory));
+
+        let mut state = ChromeState::default();
+        let mut actions = Vec::new();
+        apply_command_item(&CommandAction::OpenHistory, &mut state, &mut actions);
+        assert_eq!(actions, vec![UiAction::OpenHistory]);
+    }
+
+    #[test]
+    fn history_manager_filters_and_formats_entries() {
+        let items = vec![
+            HistoryItem {
+                url: "https://docs.example/rust".to_string(),
+                title: "Rust docs".to_string(),
+                visit_count: 2,
+                last_visited: 3_600,
+            },
+            HistoryItem {
+                url: "https://news.example".to_string(),
+                title: "News".to_string(),
+                visit_count: 1,
+                last_visited: 100_000,
+            },
+        ];
+
+        assert_eq!(filter_history(&items, "").len(), 2);
+        assert_eq!(filter_history(&items, "RUST").len(), 1);
+        assert_eq!(filter_history(&items, "news.example").len(), 1);
+        assert!(filter_history(&items, "missing").is_empty());
+        assert_eq!(filter_history_indices(&items, "RUST"), vec![0]);
+        assert_eq!(filter_history_indices(&items, ""), vec![0, 1]);
+
+        let mut state = ChromeState::default();
+        assert_eq!(state.history_visible_count, HISTORY_VISIBLE_PAGE_SIZE);
+        state.open_history();
+        state.show_more_history();
+        assert_eq!(state.history_visible_count, HISTORY_VISIBLE_PAGE_SIZE * 2);
+        state.close_history();
+        assert_eq!(state.history_visible_count, HISTORY_VISIBLE_PAGE_SIZE);
+
+        assert_eq!(format_history_time(100_000, 100_000), "just now");
+        assert_eq!(format_history_time(100_000, 100_050), "just now");
+        assert_eq!(format_history_time(100_000, 100_100), "1m ago");
+        assert_eq!(format_history_time(90, 3_600), "58m ago");
+        assert_eq!(format_history_time(0, 7_200), "2h ago");
+        assert_eq!(format_history_time(0, 100_000), "yesterday");
+        assert_eq!(format_history_time(0, 500_000), "5d ago");
+    }
+
+    #[test]
+    fn history_overlay_is_modal_and_exclusive() {
+        let mut state = ChromeState::default();
+        assert!(!state.has_modal_overlay());
+
+        state.open_history();
+        assert!(state.history_open);
+        assert!(state.has_modal_overlay());
+
+        state.open_bookmark_manager();
+        assert!(!state.history_open);
+        assert!(state.bookmark_manager_open);
+
+        state.open_history();
+        state.set_history(Vec::new());
+        state.close_history();
+        assert!(!state.history_open);
+        assert!(!state.has_modal_overlay());
     }
 
     #[test]

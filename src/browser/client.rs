@@ -598,6 +598,7 @@ const VK_N: i32 = 0x4E;
 const VK_P: i32 = 0x50;
 const VK_T: i32 = 0x54;
 const VK_W: i32 = 0x57;
+const VK_Y: i32 = 0x59;
 const VK_Z: i32 = 0x5A;
 const VK_OEM_COMMA: i32 = 0xBC;
 const VK_OEM_PERIOD: i32 = 0xBE;
@@ -663,6 +664,7 @@ pub(crate) fn browser_shortcut(
         VK_B if shift => Some(BrowserShortcut::OpenBookmarkManager),
         VK_C if shift => Some(BrowserShortcut::CopyUrl),
         VK_J if !shift => Some(BrowserShortcut::OpenDownloads),
+        VK_Y if !shift => Some(BrowserShortcut::OpenHistory),
         VK_OEM_COMMA | VK_OEM_PERIOD if !shift => Some(BrowserShortcut::OpenSettings),
         VK_Z if !shift => Some(BrowserShortcut::ReopenClosedTab),
         _ => None,
@@ -730,6 +732,7 @@ fn browser_shortcut_from_char(
             }
         }
         c if c == 'J' as u16 || c == 'j' as u16 => Some(BrowserShortcut::OpenDownloads),
+        c if (c == 'Y' as u16 || c == 'y' as u16) && !shift => Some(BrowserShortcut::OpenHistory),
         c if c == 'Z' as u16 || c == 'z' as u16 => Some(BrowserShortcut::ReopenClosedTab),
         _ => None,
     }
@@ -1266,6 +1269,16 @@ mod tests {
             Some(BrowserShortcut::OpenDownloads)
         );
         assert_eq!(
+            browser_shortcut(true, 0x59, 128),
+            Some(BrowserShortcut::OpenHistory)
+        );
+        assert_eq!(
+            browser_shortcut(true, 0x59, 4),
+            Some(BrowserShortcut::OpenHistory)
+        );
+        // Shift+Y stays with the page so text shortcuts keep working.
+        assert_eq!(browser_shortcut(true, 0x59, 128 | 2), None);
+        assert_eq!(
             browser_shortcut(true, 0x7B, 0),
             Some(BrowserShortcut::OpenDevTools)
         );
@@ -1316,6 +1329,11 @@ mod tests {
             browser_shortcut_from_char(true, 'j' as u16, 128),
             Some(BrowserShortcut::OpenDownloads)
         );
+        assert_eq!(
+            browser_shortcut_from_char(true, 'y' as u16, 128),
+            Some(BrowserShortcut::OpenHistory)
+        );
+        assert_eq!(browser_shortcut_from_char(true, 'Y' as u16, 128 | 2), None);
         assert_eq!(
             browser_shortcut_from_char(true, 'p' as u16, 128),
             Some(BrowserShortcut::Print)

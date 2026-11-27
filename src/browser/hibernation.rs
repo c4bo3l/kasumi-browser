@@ -39,7 +39,9 @@ use crate::events::{
     MediaAccessPermissions, MediaPermissionCallback, ParallelDownloadEvent, PrintOptions, UiAction,
     WebNotification,
 };
-use crate::storage::db::{BookmarkItem, SessionTabSnapshot, SitePermission, StorageHandle};
+use crate::storage::db::{
+    BookmarkItem, HistoryItem, SessionTabSnapshot, SitePermission, StorageHandle,
+};
 use crate::storage::import::{read_profile, BrowserProfile, ImportReport, ImportedBrowserData};
 use crate::ui::chrome::{
     BookmarkInfo, ChromeState, DisplayMediaPicker, Favicon, PermissionPrompt, PermissionPromptKind,
@@ -577,6 +579,8 @@ pub struct TabManager {
     active_tab_by_workspace: HashMap<u64, u64>,
     /// Globally visible bookmarks, grouped by workspace name in `folder`.
     pub bookmarks: Vec<BookmarkItem>,
+    /// Bounded recent history snapshot mirrored from SQLite into native chrome.
+    pub history: Vec<HistoryItem>,
     /// Native download snapshots mirrored from CEF into the downloads bubble.
     downloads: Vec<DownloadInfo>,
     /// Set when a genuinely new transfer starts so the shell can reveal the
@@ -717,6 +721,9 @@ pub struct TabManager {
     // Set when CEF forwards Cmd/Ctrl+Shift+B; consumed by the winit handler.
     bookmark_manager_requested: bool,
 
+    // Set when CEF forwards Cmd/Ctrl+Y; consumed by the winit handler.
+    history_requested: bool,
+
     // Set when CEF forwards Cmd/Ctrl+Shift+C; consumed by the winit handler.
     copy_url_requested: bool,
 
@@ -822,6 +829,7 @@ impl TabManager {
             active_workspace_id,
             active_tab_by_workspace: HashMap::new(),
             bookmarks,
+            history: Vec::new(),
             downloads: Vec::new(),
             download_bubble_requested: false,
             download_notifications: Vec::new(),
@@ -884,6 +892,7 @@ impl TabManager {
             settings_requested: false,
             downloads_requested: false,
             bookmark_manager_requested: false,
+            history_requested: false,
             copy_url_requested: false,
             requested_favicons: HashSet::new(),
             pending_favicon_urls: HashMap::new(),
@@ -3479,6 +3488,65 @@ impl TabManager {
         std::mem::take(&mut self.copy_url_requested)
     }
 
+    /// Consume a Cmd/Ctrl+Y request forwarded from the CEF web view.
+    pub fn consume_history_request(&mut self) -> bool {
+        std::mem::take(&mut self.history_requested)
+    }
+
+    /// Seed the history snapshot loaded synchronously during shell startup.
+    pub fn seed_history(&mut self, history: Vec<HistoryItem>) {
+        self.history = history;
+    }
+
+    /// Ask the SQLite worker for the current bookmark list. Bulk imports commit
+    /// on the worker, so this is the only way to keep the manager in sync.
+    fn request_bookmark_refresh(&self) {
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        let sender = self.event_sender.clone();
+        let spawned = std::thread::Builder::new()
+            .name("bookmark-refresh-worker".to_string())
+            .spawn(move || {
+                let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+                storage.request_bookmarks(reply_tx);
+                match reply_rx.recv_timeout(Duration::from_secs(15)) {
+                    Ok(bookmarks) => {
+                        let _ = sender.send(BrowserEvent::BookmarksReloaded { bookmarks });
+                    }
+                    Err(error) => tracing::warn!("Could not refresh bookmarks: {error}"),
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!("Could not start bookmark refresh: {error}");
+        }
+    }
+
+    /// Ask the SQLite worker for a fresh bounded history snapshot. The reply is
+    /// handled on the UI thread from `BrowserEvent::HistoryLoaded`; no CEF or
+    /// winit callback ever waits on SQLite.
+    pub fn request_history_refresh(&self) {
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        let sender = self.event_sender.clone();
+        let spawned = std::thread::Builder::new()
+            .name("history-refresh-worker".to_string())
+            .spawn(move || {
+                let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+                storage.request_history(reply_tx);
+                match reply_rx.recv_timeout(Duration::from_secs(15)) {
+                    Ok(items) => {
+                        let _ = sender.send(BrowserEvent::HistoryLoaded { items });
+                    }
+                    Err(error) => tracing::warn!("Could not refresh history: {error}"),
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!("Could not start history refresh: {error}");
+        }
+    }
+
     /// Consume a request to reveal the downloads bubble after a new transfer.
     pub fn consume_download_bubble_request(&mut self) -> bool {
         std::mem::take(&mut self.download_bubble_requested)
@@ -4027,6 +4095,9 @@ impl TabManager {
                 BrowserShortcut::OpenBookmarkManager => {
                     self.bookmark_manager_requested = true;
                 }
+                BrowserShortcut::OpenHistory => {
+                    self.history_requested = true;
+                }
                 BrowserShortcut::CopyUrl => {
                     // The shell owns the egui clipboard, so hand the request to
                     // the same deferred path used by the winit shortcut.
@@ -4190,7 +4261,23 @@ impl TabManager {
             }
             BrowserEvent::BrowserImportFinished { report } => {
                 self.browser_import_cancel = None;
-                self.browser_import_report = Some(report);
+                self.browser_import_report = Some(report.clone());
+                // Imported rows are committed on the SQLite worker, so both
+                // in-memory mirrors must be refreshed before the managers can
+                // show them. Replies are awaited off-thread; winit never blocks.
+                if report.success() && report.bookmarks_found > 0 {
+                    self.request_bookmark_refresh();
+                }
+                if report.success() && report.history_found > 0 {
+                    self.request_history_refresh();
+                }
+            }
+            BrowserEvent::BookmarksReloaded { mut bookmarks } => {
+                bookmarks.retain(|bookmark| !Self::is_private_workspace(bookmark.workspace_id));
+                self.bookmarks = bookmarks;
+            }
+            BrowserEvent::HistoryLoaded { items } => {
+                self.history = items;
             }
         }
     }
@@ -4822,6 +4909,26 @@ impl TabManager {
                 // The shell opens the native downloads bubble; TabManager only
                 // owns the download runtime state.
             }
+            UiAction::OpenHistory => {
+                // The shell opens the native history manager; refreshing here
+                // keeps its snapshot current for every shortcut source.
+                self.request_history_refresh();
+            }
+            UiAction::OpenHistoryUrl { url } => {
+                self.create_tab(Some(url), true);
+            }
+            UiAction::DeleteHistory { url } => {
+                if let Some(storage) = &self.storage {
+                    storage.delete_history(url);
+                }
+                self.request_history_refresh();
+            }
+            UiAction::ClearHistory => {
+                if let Some(storage) = &self.storage {
+                    storage.clear_history();
+                }
+                self.request_history_refresh();
+            }
             UiAction::PauseDownload { download_id } => {
                 if self.parallel_downloads.contains_key(&download_id) {
                     self.pause_native_download(download_id);
@@ -5184,6 +5291,7 @@ impl TabManager {
             .collect();
         state.active_workspace_id = self.active_workspace_id;
         state.downloads = self.downloads.clone();
+        state.history = self.history.clone();
         state.bookmarks = self
             .bookmarks
             .iter()
@@ -5292,11 +5400,13 @@ mod tests {
         TAB_IDLE_TIMEOUT_NORMAL, TAB_IDLE_TIMEOUT_PRESSURE,
     };
     use crate::events::{
-        BrowserEvent, DownloadEngine, DownloadInfo, DownloadNotificationKind, DownloadState,
-        MediaAccessPermissions, MediaPermissionCallback, PrintOptions, PrintPaperSize,
-        TestPermissionCallback, UiAction, WebNotification,
+        BrowserEvent, BrowserShortcut, DownloadEngine, DownloadInfo, DownloadNotificationKind,
+        DownloadState, MediaAccessPermissions, MediaPermissionCallback, PrintOptions,
+        PrintPaperSize, TestPermissionCallback, UiAction, WebNotification,
     };
-    use crate::storage::db::{BookmarkItem, DbCommand, SessionTabSnapshot, StorageHandle};
+    use crate::storage::db::{
+        BookmarkItem, DbCommand, HistoryItem, SessionTabSnapshot, StorageHandle,
+    };
     use crate::ui::chrome::{ChromeState, PermissionPromptKind};
     use crate::ui::platform_view::ContentRect;
     use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -7059,5 +7169,66 @@ mod tests {
                 && tab.url != "https://secret.example"));
         assert_ne!(manager.active_workspace_id, Workspace::PRIVATE_ID);
         assert_public_snapshots(&drain_db_commands(&mut db_rx));
+    }
+
+    #[test]
+    fn reloaded_bookmarks_and_history_mirror_into_chrome_state() {
+        let mut manager = permission_test_manager();
+        manager
+            .event_sender
+            .send(BrowserEvent::BookmarksReloaded {
+                bookmarks: vec![
+                    BookmarkItem {
+                        id: 1,
+                        workspace_id: Workspace::DEFAULT_ID,
+                        url: "https://docs.example".to_string(),
+                        title: "Docs".to_string(),
+                        folder: "Personal".to_string(),
+                    },
+                    BookmarkItem {
+                        id: 2,
+                        workspace_id: Workspace::PRIVATE_ID,
+                        url: "https://secret.example".to_string(),
+                        title: "Secret".to_string(),
+                        folder: "Private".to_string(),
+                    },
+                ],
+            })
+            .expect("send bookmark reload");
+        manager
+            .event_sender
+            .send(BrowserEvent::HistoryLoaded {
+                items: vec![HistoryItem {
+                    url: "https://docs.example".to_string(),
+                    title: "Docs".to_string(),
+                    visit_count: 2,
+                    last_visited: 100,
+                }],
+            })
+            .expect("send history load");
+        manager.pump_events();
+
+        let mut state = ChromeState::default();
+        manager.update_chrome_state(&mut state);
+        assert_eq!(state.bookmarks.len(), 1);
+        assert_eq!(state.bookmarks[0].url, "https://docs.example");
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].url, "https://docs.example");
+    }
+
+    #[test]
+    fn history_shortcut_event_is_consumed_once() {
+        let mut manager = permission_test_manager();
+        manager
+            .event_sender
+            .send(BrowserEvent::BrowserShortcut {
+                tab_id: 0,
+                shortcut: BrowserShortcut::OpenHistory,
+            })
+            .expect("send history shortcut");
+        manager.pump_events();
+
+        assert!(manager.consume_history_request());
+        assert!(!manager.consume_history_request());
     }
 }

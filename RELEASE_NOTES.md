@@ -4,7 +4,39 @@ All notable changes to Kasumi Browser are documented here. The project follows S
 
 ---
 
-## v0.15.0 — Unreleased
+## v0.16.0 — Unreleased
+
+### Added
+
+- Native history manager on the shared transparent overlay. `Cmd/Ctrl+Y`, the macOS app menu, and the command palette open a searchable, bounded snapshot of visited pages with titles, URLs, visit counts, relative timestamps, reopen, delete, and a two-click guard around Clear all history. Large snapshots are rendered in pages with a Show more control.
+- Bookmarks and History entries in the macOS app menu, matching the existing bookmark-manager and history keyboard shortcuts.
+- Background SQLite worker commands for loading, deleting, and clearing history, plus fresh bookmark/history snapshots after a successful browser import. Replies are awaited off-thread so winit and CEF never block on SQLite.
+- Regression tests for Material Symbols palette icons, history filtering and timestamps, history shortcut mapping across winit/NSEvent/CEF, history state mirroring, and the new SQLite commands.
+
+### Fixed
+
+- Command-palette icons now use registered Material Symbols private-use glyphs with an explicit font size and chrome colour instead of ad-hoc Unicode characters that could render blank.
+- Imported bookmarks and history now appear in their native managers immediately after the import transaction commits, without requiring an app restart.
+- The macOS About-menu version is derived from the package version instead of being hardcoded.
+
+### Changed
+
+- History snapshots now load on the SQLite worker during startup instead of blocking window resume, and the recent-row query follows the existing `last_visited` index without a secondary sort.
+- History search returns row indices instead of cloning the full snapshot, and only one page of rows is laid out per frame.
+- Bumped the package, bundle, About-menu version, canonical spec, docs, and lockfile from `0.15.0` to `0.16.0`.
+- Browser import remains password-free; Safari history remains unsupported.
+- Manual Windows/Linux verification still needs to cover the new history manager alongside the existing outstanding flows.
+
+### Verification
+
+- `cargo fmt --all -- --check`
+- `cargo check --bins`
+- `cargo test --bins` — 259 browser tests plus 4 bundle tests
+- `cargo build --release`
+
+---
+
+## v0.15.0 — 2026-11-27
 
 ### Added
 

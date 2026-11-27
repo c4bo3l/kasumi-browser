@@ -22,6 +22,16 @@ pub const COMMAND_PALETTE_WIDTH: f32 = 560.0;
 /// Vertical offset of the command palette from the top of the window.
 pub const COMMAND_PALETTE_TOP_OFFSET: f32 = 72.0;
 
+/// Maximum number of recent history rows mirrored into native chrome. Keeping
+/// the snapshot bounded preserves the low-RAM shell goal while still covering
+/// the history manager and import results.
+pub const HISTORY_LOAD_LIMIT: usize = 2000;
+
+/// Number of history rows the native manager lays out at once. Egui's scroll
+/// area still visits every row it is given, so paging keeps large snapshots
+/// from doing thousands of widget allocations on every animation frame.
+pub const HISTORY_VISIBLE_PAGE_SIZE: usize = 100;
+
 /// Height of the transparent native HUD strips painted above the CEF page.
 pub const PAGE_HUD_HEIGHT: f32 = 24.0;
 

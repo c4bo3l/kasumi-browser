@@ -441,6 +441,7 @@ mod native_shortcuts {
             'p' if !shift => Some(BrowserShortcut::Print),
             'l' | 'k' if !shift => Some(BrowserShortcut::OpenCommandPalette),
             'j' if !shift => Some(BrowserShortcut::OpenDownloads),
+            'y' if !shift => Some(BrowserShortcut::OpenHistory),
             ',' | '.' if !shift => Some(BrowserShortcut::OpenSettings),
             'q' if !shift => Some(BrowserShortcut::Quit),
             'z' if !shift => Some(BrowserShortcut::ReopenClosedTab),
@@ -504,6 +505,14 @@ fn setup_mac_application() {
         send_menu_shortcut(BrowserShortcut::OpenDownloads);
     }
 
+    extern "C" fn menu_open_bookmarks(_this: *mut c_void, _cmd: *mut c_void) {
+        send_menu_shortcut(BrowserShortcut::OpenBookmarkManager);
+    }
+
+    extern "C" fn menu_open_history(_this: *mut c_void, _cmd: *mut c_void) {
+        send_menu_shortcut(BrowserShortcut::OpenHistory);
+    }
+
     extern "C" fn menu_print(_this: *mut c_void, _cmd: *mut c_void) {
         send_menu_shortcut(BrowserShortcut::Print);
     }
@@ -548,6 +557,8 @@ fn setup_mac_application() {
             register_action("kasumiCloseTab:", menu_close_tab);
             register_action("kasumiOpenSettings:", menu_open_settings);
             register_action("kasumiOpenDownloads:", menu_open_downloads);
+            register_action("kasumiOpenBookmarks:", menu_open_bookmarks);
+            register_action("kasumiOpenHistory:", menu_open_history);
             register_action("kasumiPrint:", menu_print);
             register_action("kasumiQuitApp:", menu_quit);
 
@@ -595,7 +606,10 @@ fn install_macos_main_menu() {
     let app_menu = NSMenu::new(mtm);
     let app_version = NSMenuItem::new(mtm);
     unsafe {
-        app_version.setTitle(&NSString::from_str("Kasumi Browser 0.15.0"));
+        app_version.setTitle(&NSString::from_str(concat!(
+            "Kasumi Browser ",
+            env!("CARGO_PKG_VERSION")
+        )));
         app_version.setEnabled(false);
     }
     app_menu.addItem(&app_version);
@@ -622,6 +636,10 @@ fn install_macos_main_menu() {
     add_item("Close Tab", objc2::sel!(kasumiCloseTab:), "w");
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
     add_item("Downloads…", objc2::sel!(kasumiOpenDownloads:), "j");
+    // Uppercase B makes AppKit derive Command+Shift+B, matching the native
+    // bookmark-manager shortcut and the command palette label.
+    add_item("Bookmarks…", objc2::sel!(kasumiOpenBookmarks:), "B");
+    add_item("History…", objc2::sel!(kasumiOpenHistory:), "y");
     add_item("Print…", objc2::sel!(kasumiPrint:), "p");
     add_item("Settings…", objc2::sel!(kasumiOpenSettings:), ",");
     app_menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -1463,6 +1481,9 @@ impl KasumiBrowserHandler {
             BrowserShortcut::OpenBookmarkManager => {
                 self.chrome_state.open_bookmark_manager();
             }
+            BrowserShortcut::OpenHistory => {
+                self.handle_ui_actions(vec![UiAction::OpenHistory]);
+            }
             BrowserShortcut::CopyUrl => {
                 // The clipboard write itself happens in the next chrome frame,
                 // where egui owns the platform clipboard.
@@ -1534,6 +1555,9 @@ impl KasumiBrowserHandler {
             }
             if let UiAction::OpenDownloads = &action {
                 self.chrome_state.toggle_downloads();
+            }
+            if let UiAction::OpenHistory = &action {
+                self.chrome_state.open_history();
             }
             if let UiAction::OpenDownloadFile { download_id } = &action {
                 let path = self
@@ -1729,6 +1753,15 @@ fn is_bookmark_manager_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
         && !modifiers.alt_key()
         && modifiers.shift_key()
         && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("b"))
+}
+
+/// `Cmd/Ctrl+Y` opens the native history manager. Shift and Alt are excluded
+/// so page-level redo and text shortcuts keep their normal behavior.
+fn is_history_shortcut(modifiers: ModifiersState, key: &Key) -> bool {
+    is_primary_shortcut_modifier(modifiers)
+        && !modifiers.alt_key()
+        && !modifiers.shift_key()
+        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("y"))
 }
 
 /// `Cmd/Ctrl+Shift+C` copies the active page URL. Shift keeps plain
@@ -1942,6 +1975,9 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             restored_workspaces,
             restored_bookmarks,
         );
+        // History is the largest snapshot we mirror into chrome. Load it on the
+        // SQLite worker so a large imported history cannot delay window resume.
+        tab_manager.request_history_refresh();
         tab_manager.seed_downloads(restored_downloads);
         tab_manager.seed_site_permissions(restored_permissions);
         tab_manager.restore_session(restored_tabs);
@@ -2268,6 +2304,8 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
                     self.request_shutdown();
                 } else if is_bookmark_manager_shortcut(self.modifiers, logical_key) {
                     self.handle_browser_shortcut(BrowserShortcut::OpenBookmarkManager);
+                } else if is_history_shortcut(self.modifiers, logical_key) {
+                    self.handle_browser_shortcut(BrowserShortcut::OpenHistory);
                 } else if is_copy_url_shortcut(self.modifiers, logical_key) {
                     self.handle_browser_shortcut(BrowserShortcut::CopyUrl);
                 } else if is_new_private_window_shortcut(self.modifiers, logical_key) {
@@ -2497,6 +2535,10 @@ impl ApplicationHandler<KasumiEvent> for KasumiBrowserHandler {
             }
             if tm.consume_bookmark_manager_request() {
                 self.chrome_state.open_bookmark_manager();
+            }
+            if tm.consume_history_request() {
+                tm.handle_ui_action(UiAction::OpenHistory);
+                self.chrome_state.open_history();
             }
             if tm.consume_copy_url_request() {
                 self.chrome_state.request_copy_url();
@@ -2803,10 +2845,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_scale_factor, is_copy_url_shortcut, is_new_private_window_shortcut,
-        is_primary_shortcut_modifier, is_print_shortcut, is_quit_shortcut, is_reopen_tab_shortcut,
-        overlay_screen_position, pointer_is_past_rail, web_notification_physical_size,
-        BrowserShortcut,
+        effective_scale_factor, is_copy_url_shortcut, is_history_shortcut,
+        is_new_private_window_shortcut, is_primary_shortcut_modifier, is_print_shortcut,
+        is_quit_shortcut, is_reopen_tab_shortcut, overlay_screen_position, pointer_is_past_rail,
+        web_notification_physical_size, BrowserShortcut,
     };
     use crate::config::rail_width;
     use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -2878,6 +2920,29 @@ mod tests {
         assert!(!is_copy_url_shortcut(
             ModifiersState::SUPER | ModifiersState::SHIFT,
             &Key::Character("v".into())
+        ));
+    }
+
+    #[test]
+    fn history_shortcut_requires_primary_modifier_without_shift_or_alt() {
+        let y: Key = Key::Character("y".into());
+        let upper_y: Key = Key::Character("Y".into());
+
+        assert!(is_history_shortcut(ModifiersState::CONTROL, &y));
+        assert!(is_history_shortcut(ModifiersState::SUPER, &upper_y));
+        assert!(!is_history_shortcut(ModifiersState::empty(), &y));
+        assert!(!is_history_shortcut(ModifiersState::SHIFT, &y));
+        assert!(!is_history_shortcut(
+            ModifiersState::CONTROL | ModifiersState::SHIFT,
+            &y
+        ));
+        assert!(!is_history_shortcut(
+            ModifiersState::SUPER | ModifiersState::ALT,
+            &y
+        ));
+        assert!(!is_history_shortcut(
+            ModifiersState::CONTROL,
+            &Key::Character("h".into())
         ));
     }
 
@@ -3044,6 +3109,11 @@ mod tests {
             shortcut_from_parts('j', 0x26, cmd),
             Some(BrowserShortcut::OpenDownloads)
         );
+        assert_eq!(
+            shortcut_from_parts('y', 0x10, cmd),
+            Some(BrowserShortcut::OpenHistory)
+        );
+        assert_eq!(shortcut_from_parts('y', 0x10, cmd | shift), None);
         assert_eq!(
             shortcut_from_parts('t', 0x11, cmd | shift),
             Some(BrowserShortcut::ReopenClosedTab)
